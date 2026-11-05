@@ -282,6 +282,12 @@ class AppService:
                 self.data, base_weights, start=start_s, end=end_s,
                 top_n=DEFAULT_TOP_N, rebalance_days=REBALANCE_DAYS,
                 cost_buy=COST_BUY, cost_sell=COST_SELL, risk_free_rate=RISK_FREE_RATE)
+            if active is None:
+                # 首次调优前没有生效版本：先登记一份基线版本，保证候选可回滚到"当前策略"
+                baseline_id = self.store.create_version(
+                    weights=base_weights, metrics=base_bt["metrics"],
+                    status="active", source="baseline", parent_id=None)
+                active = self.store.get_version(baseline_id)
             self._publish(job, "tuning_started", {
                 "job_id": job.id, "trials_total": trials,
                 "base_weights": _json_safe(base_weights),
