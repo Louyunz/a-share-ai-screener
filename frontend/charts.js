@@ -241,7 +241,14 @@
         bars.push({ key: 'current', value: item.current, y: centerY - 7, h: baseBarH, fill: '#5C718B', opacity: 0.65 });
         bars.push({ key: 'candidate', value: item.candidate, y: centerY + 2, h: candBarH, fill: 'url(#' + gradId + ')', opacity: 1 });
       } else {
-        bars.push({ key: 'current', value: item.current, y: centerY - 3.5, h: 7, fill: 'url(#' + gradId + ')', opacity: 1 });
+        bars.push({
+          key: 'current',
+          value: item.current,
+          y: centerY - 3.5,
+          h: 7,
+          fill: opts.singleAsCurrent ? '#5C718B' : 'url(#' + gradId + ')',
+          opacity: opts.singleAsCurrent ? 0.62 : 1
+        });
       }
       bars.forEach(function (barSpec) {
         var value = barSpec.value === null ? 0 : barSpec.value;
@@ -250,19 +257,11 @@
         var barW = Math.abs(endX - zeroX);
         group.appendChild(svgEl('rect', {
           x: plotX, y: barSpec.y, width: plotW, height: barSpec.h, rx: barSpec.h / 2,
-          fill: 'rgba(91, 116, 146, 0.1)'
-        }));
-        group.appendChild(svgEl('rect', {
-          x: barSpec.key === 'current' ? plotX : zeroX,
-          y: barSpec.y,
-          width: plotW,
-          height: barSpec.h,
-          rx: barSpec.h / 2,
-          fill: 'rgba(91, 116, 146, 0.07)'
+          fill: 'rgba(91, 116, 146, 0.085)'
         }));
         if (barW > 0.2) {
           var rect = svgEl('rect', {
-            x: barSpec.key === 'current' ? Math.min(plotX, endX) : x,
+            x: x,
             y: barSpec.y,
             width: Math.max(2, barW),
             height: barSpec.h,

@@ -320,6 +320,16 @@ class AppService:
                 self.data, base_weights=base_weights, trials=trials,
                 top_n=DEFAULT_TOP_N, start=start_s, end=end_s,
                 seed=42, progress_cb=on_trial)
+            # 用最优权重再跑一次完整回测，产出调参台的候选净值曲线（供前端对比展示）
+            candidate_bt = selection.run_backtest(
+                self.data, outcome["best_weights"], start=start_s, end=end_s,
+                top_n=DEFAULT_TOP_N, rebalance_days=REBALANCE_DAYS,
+                cost_buy=COST_BUY, cost_sell=COST_SELL, risk_free_rate=RISK_FREE_RATE)
+            nav_payload = {
+                "base_nav": _downsample(base_bt["nav"]),
+                "candidate_nav": _downsample(candidate_bt["nav"]),
+                "dates": [point["date"] for point in _downsample(candidate_bt["nav"])],
+            }
             candidate_id = self.store.create_version(
                 weights=outcome["best_weights"], metrics=outcome["best_metrics"],
                 status="candidate", source="auto_tune",
@@ -333,6 +343,7 @@ class AppService:
                                 "metrics": _json_safe(base_bt["metrics"])},
                     "candidate": {"weights": _json_safe(outcome["best_weights"]),
                                   "metrics": _json_safe(outcome["best_metrics"])},
+                    "nav": nav_payload,
                 },
             })
             self._finish(job, "done")

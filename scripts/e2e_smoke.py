@@ -134,9 +134,14 @@ def main(argv: list[str] | None = None) -> int:
         assert "done" in kinds, f"tuning events={kinds}"
         done = next(data for event, data in tuning if event == "done")
         trials = [d for e, d in tuning if e == "trial"]
+        compare_nav = (done.get("compare") or {}).get("nav") or {}
+        base_nav = compare_nav.get("base_nav") or []
+        candidate_nav = compare_nav.get("candidate_nav") or []
+        assert len(base_nav) > 5 and len(candidate_nav) > 5, "调参 done 事件缺少净值曲线"
         print(f"[e2e] tuning: {len(trials)} trials, candidate={done['candidate_version_id']}, "
               f"best_sharpe={done['compare']['candidate']['metrics']['sharpe']:.3f} "
-              f"(base {done['compare']['current']['metrics']['sharpe']:.3f})")
+              f"(base {done['compare']['current']['metrics']['sharpe']:.3f}), "
+              f"nav_points={len(candidate_nav)}")
 
         status, versions = client.request("GET", "/api/versions")
         active_before = versions["active_id"]

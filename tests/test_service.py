@@ -92,6 +92,10 @@ class ServiceTest(unittest.TestCase):
         self.assertIn("done", kinds, msg=f"事件：{kinds}")
         done = next(data for event, data in events if event == "done")
         candidate_id = done["candidate_version_id"]
+        compare_nav = (done.get("compare") or {}).get("nav") or {}
+        self.assertTrue(compare_nav.get("base_nav"), "tuning done 事件应包含基线净值")
+        self.assertTrue(compare_nav.get("candidate_nav"), "tuning done 事件应包含候选净值")
+        self.assertGreater(len(compare_nav["candidate_nav"]), 5)
         versions = self.service.versions()
         self.assertTrue(any(v["id"] == candidate_id for v in versions["versions"]))
         self.service.activate_version(candidate_id, "test")

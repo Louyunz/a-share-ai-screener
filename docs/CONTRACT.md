@@ -120,6 +120,16 @@ def run_tuning(data, base_weights=None, trials=60, top_n=10, start=None, end=Non
 | POST | `/api/versions/{vid}/activate` | `{reason}` | `{active_id}` |
 | POST | `/api/versions/{vid}/rollback` | `{reason}` | `{active_id}` |
 
+`done` 事件中的 `compare` 额外携带调参净值曲线（真实回测数据，非前端模拟）：
+
+```json
+{"nav": {"dates": ["2023-01-03", "..."],
+         "base_nav": [{"date": "2023-01-03", "value": 1.0}, "..."],
+         "candidate_nav": [{"date": "2023-01-03", "value": 1.0}, "..."]}}
+```
+
+无 `nav` 字段时，调参台右栏显示空态“本次结果未返回调参净值曲线”，不伪造曲线。
+
 画像槽位（`slots`，均字符串）：`risk_level`(conservative/balanced/aggressive)、`horizon`、`drawdown_tolerance`、`goal`、`experience`、`excluded_industries`（逗号分隔）、`capital`。`complete` 判定：`risk_level/horizon/drawdown_tolerance` 非空。
 
 ## 4. 前端契约（frontend-dev 实现）

@@ -47,6 +47,7 @@
   var toastTimer = null;
   var tuneElapsedTimer = null;
   var tuneRenderHandle = null;
+  var resizeTimer = null;
   var interpretationTyper = null;
 
   function $(id) { return document.getElementById(id); }
@@ -430,11 +431,16 @@
     if (typeof stock === 'string') stock = { code: stock };
     stock = stock || {};
     var factors = {};
+    var contributions = {};
+    var nestedFactors = stock.factors && typeof stock.factors === 'object' ? stock.factors : {};
+    var nestedContributions = stock.contributions && typeof stock.contributions === 'object' ? stock.contributions : {};
     FACTOR_KEYS.forEach(function (key) {
       var value = stock['z_' + key];
       if (value === undefined && stock.z && typeof stock.z === 'object') value = stock.z[key];
+      if (value === undefined) value = nestedFactors[key];
       if (value === undefined && Array.isArray(stock.z_values)) value = stock.z_values[FACTOR_KEYS.indexOf(key)];
       factors[key] = toNum(value);
+      contributions[key] = toNum(nestedContributions[key]);
     });
     var rawCode = stock.code || stock.ts_code || stock.symbol || '';
     return {
@@ -443,6 +449,7 @@
       industry: stock.industry || stock.industry_name || '—',
       score: firstNum(stock.score, stock.factor_score, stock.total_score, stock.composite_score),
       factors: factors,
+      contributions: contributions,
       raw: stock
     };
   }
@@ -468,10 +475,17 @@
     var rawMetrics = payload.metrics || (payload.backtest && payload.backtest.metrics) || {};
     var metrics = normalizeMetrics(rawMetrics);
     var navRaw = payload.nav || (payload.backtest && payload.backtest.nav) || null;
+    // 后端当前把 nav / benchmark_nav 作为两个并列数组返回，前端合并成统一曲线。
+    if (Array.isArray(navRaw) && payload.benchmark_nav) {
+      navRaw = { nav: navRaw, benchmark_nav: payload.benchmark_nav };
+    } else if (navRaw && typeof navRaw === 'object' && !Array.isArray(navRaw) &&
+      !navRaw.benchmark && !navRaw.benchmark_nav && payload.benchmark_nav) {
+      navRaw = Object.assign({}, navRaw, { benchmark_nav: payload.benchmark_nav, benchmark_name: payload.benchmark_name });
+    }
     var nav = normalizeSelectionNav(navRaw);
     var embedded = firstText(
-      payload.interpretation, payload.ai_interpretation, payload.ai_commentary,
-      payload.commentary, payload.summary, raw && raw.interpretation, raw && raw.summary
+      payload.explanation, payload.interpretation, payload.ai_interpretation, payload.ai_commentary,
+      payload.commentary, payload.summary, raw && raw.explanation, raw && raw.interpretation, raw && raw.summary
     );
     return {
       top: top,
@@ -590,10 +604,15 @@
             : compare.candidate_nav !== undefined ? compare.candidate_nav
               : compare.best_nav;
     if (!labels.length && Array.isArray(source.series)) {
-      labels = source.series[0] && (source.series[0].labels || []);
+      labels = source.series[0] && (source.series[0].labels || source.series[0].dates || []);
     }
     var base = axisSeries(baseRaw);
     var candidate = axisSeries(candidateRaw);
+    // 兼容未来后端以 compare.nav.series = [{name,values}, ...] 返回的情况。
+    if (!base && !candidate && Array.isArray(source.series) && source.series.length) {
+      base = axisSeries(source.series[0] && (source.series[0].values || source.series[0].data));
+      candidate = axisSeries(source.series[1] && (source.series[1].values || source.series[1].data));
+    }
     if (!base && !candidate) return null;
     var benchmark = axisSeries(source.benchmark !== undefined ? source.benchmark : source.benchmark_nav);
     if (!labels.length) labels = (base && base.labels) || (candidate && candidate.labels) || [];
@@ -730,6 +749,7 @@
     setHealth('warn', 'Mock 预览');
     var healthPill = $('health-pill');
     if (healthPill) healthPill.title = '开发预览：所有数据来自 frontend/mock-data.js';
+    setText($('footer-data-source'), 'DATA · DEV-ONLY MOCK');
     updateSessionLabel();
     renderMessages();
     renderProfile();
@@ -746,10 +766,13 @@
       return response.json();
     }).then(function (payload) {
       state.health = payload || {};
-      var llmOk = !payload || !payload.llm || payload.llm === 'ok';
+      var llmValue = payload.llm;
+      // 契约示例为 "ok"；当前后端返回 LLM 客户端类名，因此类名同样视为可用。
+      var llmOk = !llmValue || llmValue === 'ok' || /llm|fake|client/i.test(String(llmValue));
       setHealth(llmOk ? 'ok' : 'warn', llmOk ? '服务在线' : 'LLM 异常');
       var pill = $('health-pill');
       if (pill) pill.title = '数据源：' + (payload.source || '—') + ' · 截至 ' + (payload.as_of || '—') + ' · LLM：' + (payload.llm || '—');
+      setText($('footer-data-source'), 'DATA · CSI 800 / ' + String(payload.source || 'SAMPLE').toUpperCase());
     }).catch(function () {
       setHealth('error', '服务离线');
     });
@@ -770,8 +793,13 @@
       node.textContent = 'SESSION —';
       return;
     }
+    if (state.mock) {
+      node.textContent = 'MOCK · DEMO';
+      node.title = state.sessionId;
+      return;
+    }
     var suffix = state.sessionId.length > 8 ? state.sessionId.slice(-8) : state.sessionId;
-    node.textContent = (state.mock ? 'MOCK · ' : 'SESSION · ') + suffix.toUpperCase();
+    node.textContent = 'SESSION · ' + suffix.toUpperCase();
     node.title = state.sessionId;
   }
 
@@ -1177,9 +1205,15 @@
       try { payload = JSON.parse(dataText); } catch (err) { payload = dataText; }
       eventCount += 1;
       if (eventName === 'token') {
+        // 不用 firstText：token 可能是纯空格或换行，需要原样拼入。
         var token = '';
         if (typeof payload === 'string') token = payload;
-        else if (payload && typeof payload === 'object') token = firstText(payload.text, payload.token, payload.delta, payload.content);
+        else if (payload && typeof payload === 'object') {
+          var tokenKeys = ['text', 'token', 'delta', 'content'];
+          for (var t = 0; t < tokenKeys.length; t += 1) {
+            if (typeof payload[tokenKeys[t]] === 'string') { token = payload[tokenKeys[t]]; break; }
+          }
+        }
         if (token && handlers.onToken) handlers.onToken(token);
       } else if (eventName === 'slots') {
         var slots = payload && payload.slots ? payload.slots : payload;
@@ -1311,7 +1345,7 @@
     state.profileEditing = true;
     renderProfile();
     var first = $('slot-risk_level');
-    if (first) first.focus();
+    if (first && typeof first.focus === 'function') first.focus();
   }
 
   function closeProfileEditor() {
@@ -1399,9 +1433,9 @@
     setHidden($('selection-content'), !hasResult);
     setHidden($('selection-empty'), running || hasResult);
     if (runButton) {
-      runButton.disabled = running || !state.booted;
+      runButton.disabled = running || !state.booted || !state.profile.confirmed;
       var runSpan = runButton.querySelector('span');
-      if (runSpan) runSpan.textContent = running ? '选股中…' : '重新选股';
+      if (runSpan) runSpan.textContent = running ? '选股中…' : (hasResult ? '重新选股' : '开始选股');
     }
     if (emptyButton) {
       emptyButton.disabled = running || !state.booted || !state.profile.confirmed;
@@ -1546,7 +1580,7 @@
       }
       var rankClass = index < 3 ? ' rank-' + (index + 1) : '';
       var displayName = stock.name || stock.code || '—';
-      var subCode = stock.name ? stock.code : '股票代码';
+      var subCode = stock.name ? stock.code : 'A 股标的';
       return '<tr>' +
         '<td><span class="rank-badge' + rankClass + '">' + String(index + 1).padStart(2, '0') + '</span></td>' +
         '<td><div class="stock-id"><strong>' + esc(displayName) + '</strong><span>' + esc(subCode) + '</span></div></td>' +
@@ -1562,14 +1596,20 @@
   function renderSelectionFactorChart(top) {
     var container = $('selection-factor-chart');
     if (!container) return;
+    var hasContributions = (top || []).some(function (stock) {
+      return stock.contributions && FACTOR_KEYS.some(function (key) { return stock.contributions[key] !== null; });
+    });
     var sums = {};
     var counts = {};
     FACTOR_KEYS.forEach(function (key) { sums[key] = 0; counts[key] = 0; });
     (top || []).forEach(function (stock) {
       FACTOR_KEYS.forEach(function (key) {
-        var value = stock.factors && stock.factors[key];
-        if (value !== null && value !== undefined && Number.isFinite(Number(value))) {
-          sums[key] += Number(value);
+        var raw = hasContributions
+          ? (stock.contributions && stock.contributions[key])
+          : (stock.factors && stock.factors[key]);
+        var value = toNum(raw);
+        if (value !== null) {
+          sums[key] += value;
           counts[key] += 1;
         }
       });
@@ -1577,6 +1617,12 @@
     var items = FACTOR_KEYS.filter(function (key) { return counts[key] > 0; }).map(function (key) {
       return { label: FACTOR_LABELS[key], current: sums[key] / counts[key] };
     });
+    var note = $('selection-factor-note');
+    var caption = $('selection-factor-caption');
+    if (note) note.textContent = hasContributions ? '权重加权贡献' : '组合平均 z';
+    if (caption) caption.textContent = hasContributions
+      ? '贡献 = 行业中性化 z × 当前因子权重，按入选组合取均值。'
+      : '当前结果未返回 contributions，以方向对齐后的平均 z 暴露展示。';
     if (!items.length) {
       chartEmpty(container, '等待因子暴露数据');
       return;
@@ -1590,8 +1636,10 @@
       rowHeight: 27,
       labelWidth: 75,
       showValues: true,
-      valueFormatter: function (value) { return (value > 0 ? '+' : '') + fmtNum(value, 2) + 'z'; },
-      ariaLabel: '入选组合因子平均暴露'
+      valueFormatter: function (value) {
+        return (value > 0 ? '+' : '') + fmtNum(value, hasContributions ? 3 : 2) + (hasContributions ? '' : 'z');
+      },
+      ariaLabel: hasContributions ? '入选组合因子权重加权贡献' : '入选组合因子平均暴露'
     });
   }
 
@@ -1715,6 +1763,7 @@
     hideError();
     switchView('selection');
     renderSelectionView();
+    renderProfile();
     try {
       if (state.mock) {
         mockStartSelection(topN, runSeq);
@@ -1774,6 +1823,7 @@
       var payload;
       try { payload = parseEventData(event.data, null); }
       catch (err) { fail('选股结果解析失败。'); return; }
+      if (!payload || typeof payload !== 'object') { fail('选股结果事件为空或格式非法。'); return; }
       settled = true;
       source.close();
       handleSelectionResult(payload, runSeq);
@@ -1817,7 +1867,7 @@
     renderProfile();
     if (state.activeView === 'selection') window.requestAnimationFrame(function () {
       var title = $('selection-title');
-      if (title) title.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (title && typeof title.scrollIntoView === 'function') title.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
     showToast('选股完成：已生成 Top ' + (result.top_n || result.top.length) + ' 组合。');
   }
@@ -1830,6 +1880,7 @@
     state.selection.progress = 0;
     state.selection.finishedAt = Date.now();
     renderSelectionView();
+    renderProfile();
     showError('选股失败：' + state.selection.error, function () {
       hideError();
       startSelection();
@@ -2000,7 +2051,7 @@
         rows.map(function (row) { return '<div class="snapshot-row"><span>' + esc(row[0]) + '</span><b>' + esc(row[1]) + '</b></div>'; }).join('') +
       '</div>' +
       top.map(function (stock, index) {
-        return '<div class="snapshot-stock"><i>' + String(index + 1).padStart(2, '0') + '</i><span class="snap-name">' + esc(stock.name || stock.code) + '</span><span class="snap-code">' + esc(stock.code) + '</span></div>';
+        return '<div class="snapshot-stock"><i>' + String(index + 1).padStart(2, '0') + '</i><span class="snap-name">' + esc(stock.name || stock.code) + '</span><span class="snap-code">' + esc(stock.name ? stock.code : (stock.industry || stock.code)) + '</span></div>';
       }).join('');
   }
 
@@ -2156,10 +2207,25 @@
     var typer = createTypewriter(info.textEl);
     interpretationTyper = typer;
     state.interpretation.typer = typer;
+    var status = $('interpret-status');
+    if (status) { status.textContent = '追问生成中'; status.classList.add('ready'); }
+    var input = $('followup-input');
+    var sendButton = $('followup-send');
+    if (input) input.disabled = true;
+    if (sendButton) sendButton.disabled = true;
     var collected = '';
+    var firstToken = false;
     try {
       await runConversationStream(content, 'followup', {
-        onToken: function (token) { collected += token; typer.push(token); },
+        onToken: function (token) {
+          if (!firstToken) {
+            firstToken = true;
+            if (info.dots) info.dots.remove();
+            if (info.caret) info.caret.hidden = false;
+          }
+          collected += token;
+          typer.push(token);
+        },
         onSlots: handleSlotsUpdate,
         onProfileReady: handleProfileReady
       });
@@ -2245,9 +2311,10 @@
     }
     var candidateBadge = $('candidate-badge');
     if (candidateBadge) {
+      var candidateActive = done && tune.candidateVersionId && state.activeVersionId === tune.candidateVersionId;
       candidateBadge.classList.toggle('is-on', !!tune.bestWeights);
       var versionSuffix = tune.candidateVersionId ? ' ' + esc(versionLabel(tune.candidateVersionId)) : '';
-      candidateBadge.innerHTML = '<i></i>候选' + versionSuffix;
+      candidateBadge.innerHTML = '<i></i>' + (candidateActive ? '已启用' : '候选') + versionSuffix;
     }
     var metricLabel = $('tune-metric-label');
     if (metricLabel) {
@@ -2268,7 +2335,25 @@
 
   function versionLabel(id) {
     if (!id) return '';
-    return String(id);
+    var raw = String(id);
+    // 后端真实 ID 形如 v3fa2b1c9de，界面使用稳定的短标识，完整 ID 保留在 title 中。
+    return raw.length > 9 ? raw.slice(0, 7) : raw;
+  }
+
+  function getRollbackTarget() {
+    var versions = state.versions || [];
+    var activeId = state.activeVersionId || ((versions.find(function (version) { return version.status === 'active'; }) || {}).id || '');
+    var active = versions.find(function (version) { return version.id === activeId; });
+    if (active && active.parent_id) {
+      var parent = versions.find(function (version) { return version.id === active.parent_id; });
+      if (parent && parent.id !== activeId) return parent;
+    }
+    var sorted = versions.slice().sort(function (a, b) {
+      return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+    });
+    var index = sorted.findIndex(function (version) { return version.id === activeId; });
+    if (index > 0) return sorted[index - 1];
+    return null;
   }
 
   function renderTuneTimeline() {
@@ -2292,7 +2377,8 @@
       tune.bestMetrics ? '对比新旧指标 · 候选 Sharpe ' + bestSharpe : '对比新旧指标，确认样本内 / 样本外稳健性',
       tune.candidateVersionId ? '候选 ' + versionLabel(tune.candidateVersionId) + ' 已就绪，等待人工启用' : '候选完成后等待人工启用'
     ];
-    var labels = ['诊断基线', '生成候选参数', '候选回测', '对比新旧指标', '建议启用候选'];
+    var labels = ['诊断基线', '生成候选参数', '候选回测', '对比新旧指标',
+      tune.candidateVersionId ? '建议启用候选 ' + versionLabel(tune.candidateVersionId) : '建议启用候选'];
     var icons = ['01', '02', '03', '04', '05'];
     box.innerHTML = labels.map(function (label, index) {
       var step = index + 1;
@@ -2303,6 +2389,7 @@
       else stepState = step < currentStep ? 'done' : (step === currentStep ? 'active' : 'waiting');
       var statusLabel = stepState === 'done' ? (step === 5 ? '待启用' : '已完成') : stepState === 'active' ? '进行中' : '等待';
       if (done && step === 5) statusLabel = '待启用';
+      if (tune.status === 'error' && stepState === 'active') statusLabel = '已中断';
       return '<div class="timeline-step is-' + stepState + '"' + (stepState === 'active' ? ' aria-current="step"' : '') + '>' +
         '<span class="step-index">' + (stepState === 'done' ? '<svg class="icon" style="width:11px;height:11px"><use href="#i-check"></use></svg>' : icons[index]) + '</span>' +
         '<div class="step-body">' +
@@ -2345,6 +2432,7 @@
           rowHeight: 27,
           labelWidth: 86,
           valueFormatter: function (value) { return fmtPct(value, 1); },
+          singleAsCurrent: !hasBest,
           animate: !tune.weightChartRendered,
           ariaLabel: '当前与候选因子权重对比'
         });
@@ -2417,7 +2505,7 @@
       return;
     }
     var defs = [
-      { key: 'sharpe', label: 'Sharpe 比率', short: 'Sharpe', digits: 2, percent: false },
+      { key: 'sharpe', label: '风险调整', short: 'Sharpe', digits: 2, percent: false },
       { key: 'cagr', label: '年化收益', short: 'CAGR', digits: 1, percent: true },
       { key: 'mdd', label: '最大回撤', short: 'MDD', digits: 1, percent: true, inverse: true },
       { key: 'ir', label: '信息比率', short: 'IR', digits: 2, percent: false }
@@ -2512,15 +2600,22 @@
     var display = versions.slice(-4);
     var active = versions.find(function (version) { return version.id === state.activeVersionId; }) ||
       versions.find(function (version) { return version.status === 'active'; });
-    setText($('version-active-label'), active ? '线上 · ' + active.id : '—');
+    var candidateId = '';
+    if (state.tune.candidateVersionId && state.tune.candidateVersionId !== state.activeVersionId) {
+      candidateId = state.tune.candidateVersionId;
+    } else if (!state.tune.candidateVersionId) {
+      var candidateVersions = versions.filter(function (version) { return version.status === 'candidate'; });
+      if (candidateVersions.length) candidateId = candidateVersions[candidateVersions.length - 1].id;
+    }
+    setText($('version-active-label'), active ? '线上 · ' + versionLabel(active.id) : '—');
     box.innerHTML = display.map(function (version) {
       var isActive = version.id === state.activeVersionId || version.status === 'active';
-      var isCandidate = !isActive && (version.id === state.tune.candidateVersionId || version.status === 'candidate');
+      var isCandidate = !isActive && version.id === candidateId;
       var cls = isActive ? 'is-active' : isCandidate ? 'is-candidate' : 'is-history';
       var sub = isActive ? '当前' : isCandidate ? '候选' : '历史';
       return '<div class="version-node ' + cls + '" title="' + esc(version.id + ' · ' + (version.status || 'history')) + '">' +
         '<span class="version-dot"></span>' +
-        '<span class="version-label">' + esc(version.id) + '</span>' +
+        '<span class="version-label">' + esc(versionLabel(version.id)) + '</span>' +
         '<span class="version-sub">' + sub + '</span>' +
       '</div>';
     }).join('');
@@ -2533,17 +2628,20 @@
     var rollback = $('tune-rollback');
     var hint = $('tune-action-hint');
     var activeIsCandidate = done && tune.candidateVersionId && state.activeVersionId === tune.candidateVersionId;
+    var rollbackTarget = getRollbackTarget();
     if (activate) {
       activate.disabled = !done || !tune.candidateVersionId || activeIsCandidate || tune.actionBusy;
-      activate.innerHTML = '<svg class="icon"><use href="#i-' + (activeIsCandidate ? 'check' : 'check') + '"></use></svg>' +
+      activate.innerHTML = '<svg class="icon"><use href="#i-check"></use></svg>' +
         (activeIsCandidate ? '候选已启用' : '启用候选版本');
+      activate.title = tune.candidateVersionId ? '启用 ' + tune.candidateVersionId : '';
     }
     if (rollback) {
-      rollback.disabled = !done || !state.activeVersionId || tune.actionBusy;
+      rollback.disabled = !done || !rollbackTarget || tune.actionBusy;
+      rollback.title = rollbackTarget ? '回滚至 ' + rollbackTarget.id : '暂无可回滚版本';
     }
     if (hint) {
       if (tune.status === 'running' || tune.status === 'starting') hint.textContent = '调参进行中 · 完成后可人工启用候选版本';
-      else if (activeIsCandidate) hint.textContent = '候选 ' + versionLabel(tune.candidateVersionId) + ' 已启用 · 可按需回滚到上一版本';
+      else if (activeIsCandidate) hint.textContent = '候选 ' + versionLabel(tune.candidateVersionId) + ' 已启用 · 可回滚至 ' + (rollbackTarget ? versionLabel(rollbackTarget.id) : '上一版本');
       else if (done && tune.candidateVersionId) hint.textContent = '候选 ' + versionLabel(tune.candidateVersionId) + ' 已通过回测 · 所有变更需人工确认';
       else if (tune.status === 'error') hint.textContent = '调参中断 · 可重新启动或稍后重试';
       else hint.textContent = '所有变更需人工确认 · 历史版本可回滚';
@@ -2659,6 +2757,7 @@
     source.addEventListener('tuning_started', function (event) {
       if (!isCurrent()) return;
       var payload = parseEventData(event.data, {});
+      if (!payload || typeof payload !== 'object') { fail('调参启动事件格式非法。'); return; }
       handleTuneStarted(payload, runSeq);
     });
     source.addEventListener('trial', function (event) {
@@ -2666,16 +2765,19 @@
       var payload;
       try { payload = parseEventData(event.data, null); }
       catch (err) { fail('调参 trial 数据解析失败。'); return; }
+      if (!payload || typeof payload !== 'object') { fail('调参 trial 事件格式非法。'); return; }
       handleTuneTrial(payload, runSeq);
     });
     source.addEventListener('best_update', function (event) {
       if (!isCurrent()) return;
       var payload = parseEventData(event.data, {});
+      if (!payload || typeof payload !== 'object') { fail('调参最优更新事件格式非法。'); return; }
       handleBestUpdate(payload, runSeq);
     });
     source.addEventListener('done', function (event) {
       if (settled || !isCurrent()) return;
       var payload = parseEventData(event.data, {});
+      if (!payload || typeof payload !== 'object') { fail('调参完成事件格式非法。'); return; }
       settled = true;
       source.close();
       handleTuneDone(payload, runSeq);
@@ -2737,6 +2839,11 @@
     if (!trial.trial_index) trial.trial_index = state.tune.trials.length + 1;
     state.tune.trials.push(trial);
     if (trial.is_best) {
+      // is_best 表示这组刷新了当时最优，不代表历史组一直是最优；
+      // 清除旧标记，让散点与指标卡始终高亮最终的最优 trial。
+      state.tune.trials.forEach(function (item, index) {
+        if (index !== state.tune.trials.length - 1) item.is_best = false;
+      });
       if (trial.weights) state.tune.bestWeights = trial.weights;
       state.tune.bestMetrics = trial.metrics;
       state.tune.bestTrialIndex = state.tune.trials.length - 1;
@@ -2801,10 +2908,13 @@
     if (!tune.total) tune.total = tune.trials.length;
     if (!tune.bestWeights) {
       var compare = payload.compare || {};
-      tune.bestWeights = normalizeWeights(compare.best_weights || compare.candidate_weights) || tune.bestWeights;
+      var competitor = compare.candidate || compare.best || {};
+      tune.bestWeights = normalizeWeights(compare.best_weights || compare.candidate_weights || competitor.weights) || tune.bestWeights;
     }
     if (!tune.bestMetrics) {
-      var compareMetrics = (payload.compare || {}).candidate_metrics || (payload.compare || {}).best_metrics;
+      var compareMetrics = (payload.compare || {}).candidate_metrics ||
+        (payload.compare || {}).best_metrics ||
+        ((payload.compare || {}).candidate || {}).metrics;
       if (compareMetrics) tune.bestMetrics = normalizeMetrics(compareMetrics);
     }
     upsertCandidateVersion();
@@ -2917,8 +3027,10 @@
       target = state.tune.candidateVersionId;
       if (!target) { showToast('候选版本尚未就绪。'); return; }
     } else {
-      target = state.activeVersionId;
-      if (!target) { showToast('当前没有可回滚的线上版本。'); return; }
+      // 后端 /versions/{vid}/rollback 的语义是“回滚到 vid”。
+      var rollbackTarget = getRollbackTarget();
+      target = rollbackTarget && rollbackTarget.id;
+      if (!target) { showToast('当前没有可回滚的历史版本。'); return; }
     }
     state.tune.actionBusy = true;
     renderTuneActions();
@@ -2930,7 +3042,7 @@
       } else {
         payload = await request('/versions/' + encodeURIComponent(target) + '/' + (action === 'activate' ? 'activate' : 'rollback'), {
           method: 'POST',
-          body: { reason: action === 'activate' ? '用户在 AI 调参台人工启用候选版本' : '用户在 AI 调参台人工回滚当前线上版本' }
+          body: { reason: action === 'activate' ? '用户在 AI 调参台人工启用候选版本' : '用户在 AI 调参台人工回滚至历史版本' }
         });
       }
       if (payload && payload.active_id) state.activeVersionId = String(payload.active_id);
@@ -2941,7 +3053,7 @@
         state.versionsLoaded = false;
         await ensureVersions(true);
       }
-      showToast(action === 'activate' ? '候选版本已启用。' : '已回滚到上一版本。');
+      showToast(action === 'activate' ? '候选版本已启用。' : '已回滚至 ' + versionLabel(target) + '。');
     } catch (err) {
       showError((action === 'activate' ? '启用失败：' : '回滚失败：') + friendlyError(err), function () {
         hideError();
@@ -3067,30 +3179,14 @@
 
   async function mockVersionAction(action, target) {
     await sleep(320);
-    if (action === 'activate') {
-      var previousActive = state.activeVersionId;
-      state.versions.forEach(function (version) {
-        if (version.id === previousActive) version.status = 'archived';
-        if (version.id === target) version.status = 'active';
-      });
-      state.activeVersionId = target;
-      return { active_id: target };
-    }
-    var current = state.versions.find(function (version) { return version.id === target; });
-    var parentId = current && current.parent_id;
-    var parent = parentId ? state.versions.find(function (version) { return version.id === parentId; }) : null;
-    if (!parent) {
-      var sorted = state.versions.slice().sort(function (a, b) { return String(a.created_at || '').localeCompare(String(b.created_at || '')); });
-      var idx = sorted.findIndex(function (version) { return version.id === target; });
-      parent = sorted[Math.max(0, idx - 1)];
-    }
-    if (!parent) return { active_id: target };
+    // 与后端 store.rollback 语义一致：activate 与 rollback 都是把目标版本设为 active。
+    var previousActive = state.activeVersionId;
     state.versions.forEach(function (version) {
-      if (version.id === target) version.status = 'archived';
-      if (version.id === parent.id) version.status = 'active';
+      if (version.id === previousActive) version.status = 'archived';
+      if (version.id === target) version.status = 'active';
     });
-    state.activeVersionId = parent.id;
-    return { active_id: parent.id };
+    state.activeVersionId = target;
+    return { active_id: target };
   }
 
   /* ------------------------------------------------------------- 事件绑定 */
@@ -3110,6 +3206,13 @@
     });
     window.addEventListener('online', function () {
       if (!state.mock) loadHealth();
+    });
+    window.addEventListener('resize', function () {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function () {
+        if (state.activeView === 'selection' && state.selection.result) renderSelectionView();
+        else if (state.activeView === 'tune') renderTuneView();
+      }, 220);
     });
 
     var errorRetry = $('error-retry');
