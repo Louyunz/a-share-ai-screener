@@ -27,18 +27,10 @@ from backend.engine.factors import (
     weights_for,
 )
 from backend.engine.selection import build_portfolio, run_backtest, screen
-from backend.engine.tuner import run_tuning
 
 N_STOCKS = 60
 N_DAYS = 400
 SEED = 20240601
-
-
-def _objective(metrics: dict) -> float:
-    """复算契约目标函数，用于断言 tuner 输出。"""
-    return float(
-        metrics["sharpe"] - 0.5 * abs(metrics["mdd"]) + 0.2 * metrics["ir"]
-    )
 
 
 def _build_synthetic_data() -> dict:
@@ -480,85 +472,6 @@ class EngineTest(unittest.TestCase):
         np.testing.assert_allclose(result["nav"].to_numpy(), 1.0)
 
     # ------------------------------------------------------------------
-    # 调参
-    # ------------------------------------------------------------------
-    def test_tuner_constraints_and_progress_callback(self) -> None:
-        calls: list[dict] = []
-        base_weights = weights_for("balanced")
-        result = run_tuning(
-            self.bundle,
-            base_weights=base_weights,
-            trials=3,
-            top_n=6,
-            start=self.dates[130],
-            end=self.dates[-1],
-            seed=123,
-            progress_cb=calls.append,
-        )
-
-        self.assertEqual(
-            set(result),
-            {"best_weights", "base_metrics", "best_metrics", "objective", "trials"},
-        )
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(len(result["trials"]), 3)
-
-        for index, trial in enumerate(calls):
-            self.assertEqual(
-                set(trial),
-                {"trial_index", "weights", "metrics", "objective", "is_best"},
-            )
-            self.assertEqual(trial["trial_index"], index)
-            self.assertEqual(set(trial["weights"]), set(FACTOR_NAMES))
-            self.assertAlmostEqual(sum(trial["weights"].values()), 1.0, places=9)
-            for weight in trial["weights"].values():
-                self.assertGreaterEqual(weight, 0.0)
-                self.assertLessEqual(weight, MAX_WEIGHT + 1e-12)
-            self.assertEqual(set(trial["metrics"]), {"cagr", "sharpe", "mdd", "ir"})
-            for value in trial["metrics"].values():
-                self.assertTrue(math.isfinite(float(value)))
-            self.assertAlmostEqual(
-                float(trial["objective"]), _objective(trial["metrics"]), places=10
-            )
-            self.assertIsInstance(trial["is_best"], bool)
-            self.assertEqual(result["trials"][index]["trial_index"], index)
-
-        validate_weights(result["best_weights"])
-        self.assertTrue(math.isfinite(float(result["objective"])))
-        for key in ("cagr", "sharpe", "mdd", "ir"):
-            self.assertIn(key, result["base_metrics"])
-            self.assertIn(key, result["best_metrics"])
-        self.assertAlmostEqual(
-            float(result["objective"]), _objective(result["best_metrics"]), places=10
-        )
-
-        best_trials = [trial for trial in calls if trial["is_best"]]
-        if best_trials:
-            last_best = best_trials[-1]
-            self.assertEqual(result["best_weights"], last_best["weights"])
-            self.assertAlmostEqual(
-                float(result["objective"]), float(last_best["objective"]), places=10
-            )
-        else:
-            self.assertEqual(result["best_weights"], base_weights)
-            self.assertAlmostEqual(
-                float(result["objective"]), _objective(result["base_metrics"]), places=10
-            )
-
-        # 默认 start=None：自动留出 120 日预热
-        default_calls: list[dict] = []
-        default_result = run_tuning(
-            self.data, trials=1, top_n=5, progress_cb=default_calls.append
-        )
-        self.assertEqual(len(default_calls), 1)
-        self.assertEqual(len(default_result["trials"]), 1)
-
-        with self.assertRaises(ValueError):
-            run_tuning(self.data, trials=0)
-        with self.assertRaises(ValueError):
-            run_tuning(self.data, trials=1, progress_cb=123)
-
-    # ------------------------------------------------------------------
     # 包导出
     # ------------------------------------------------------------------
     def test_package_exports(self) -> None:
@@ -568,7 +481,6 @@ class EngineTest(unittest.TestCase):
             "FACTOR_NAMES", "FACTOR_DIRECTION", "RISK_WEIGHTS", "DEFAULT_WEIGHTS",
             "WEIGHT_PRESETS", "weights_for", "validate_weights", "register_preset",
             "compute_factor_scores", "screen", "build_portfolio", "run_backtest",
-            "run_tuning",
         ):
             self.assertTrue(hasattr(engine, name), msg=name)
 

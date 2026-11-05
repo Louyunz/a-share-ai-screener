@@ -47,6 +47,33 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+def _apply_score_transform(scores: pd.DataFrame, weights: dict, score_transform) -> pd.DataFrame:
+    """用自定义模型（AI 生成代码）的 transform 覆盖因子综合分。"""
+    if score_transform is None:
+        return scores
+    z_columns = [f"z_{name}" for name in FACTOR_NAMES]
+    missing = [column for column in z_columns if column not in scores.columns]
+    if missing:
+        raise ValueError(f"因子分数缺少列：{missing}")
+    try:
+        result = score_transform(scores.loc[:, z_columns].copy(), dict(weights))
+    except Exception as exc:  # noqa: BLE001 - 把自定义模型错误转成业务错误
+        raise ValueError(f"自定义模型打分失败：{exc}") from exc
+    if isinstance(result, pd.Series):
+        series = result.reindex(scores.index)
+    else:
+        values = np.asarray(result, dtype=float)
+        if values.shape != (len(scores),):
+            raise ValueError("自定义模型返回长度与股票数量不一致")
+        series = pd.Series(values, index=scores.index)
+    values = series.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("自定义模型打分包含非有限值")
+    output = scores.copy()
+    output["factor_score"] = values
+    return output.sort_values("factor_score", ascending=False)
+
+
 def _get(data, name: str):
     """从 DataBundle 对象或 dict 中读取字段（duck typing）。"""
     if isinstance(data, Mapping):
@@ -195,6 +222,7 @@ def screen(
     top_n: int = 10,
     asof=None,
     exclude_codes=None,
+    score_transform=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """按因子权重筛选 Top N 股票。
 
@@ -210,6 +238,9 @@ def screen(
         截止日（含）；None 表示最新交易日。
     exclude_codes:
         需排除的代码集合，也接受逗号分隔字符串（画像里的“排除行业/股票”）。
+    score_transform:
+        可选的自定义打分函数 ``transform(z_df, weights) -> Series``，
+        用于 AI 生成的模型代码接管最终打分。
 
     Returns
     -------
@@ -234,6 +265,7 @@ def screen(
         weights=weights,
         asof=asof,
     )
+    scores = _apply_score_transform(scores, weights, score_transform)
 
     excluded = _normalize_exclude(exclude_codes)
     if excluded:
@@ -417,6 +449,7 @@ def run_backtest(
     cost_buy: float = 0.0003,
     cost_sell: float = 0.0013,
     risk_free_rate: float = 0.02,
+    score_transform=None,
 ) -> dict:
     """按 A 股交易规则回测因子选股策略。
 
@@ -597,6 +630,7 @@ def run_backtest(
             weights=weights,
             asof=all_dates[pos],
         )
+        scores = _apply_score_transform(scores, weights, score_transform)
         top_codes = list(scores.head(top_n).index)
         if not top_codes:
             raise ValueError("调仓日没有可用股票，无法生成组合")

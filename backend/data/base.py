@@ -3,7 +3,7 @@
 
 DataBundle 是引擎、服务与适配器之间唯一的数据交换格式；字段语义见 docs/CONTRACT.md。
 
-缓存格式：有 pyarrow 时写 parquet（生产推荐）；否则自动降级为 csv（沙箱/无 pyarrow 环境可跑）。
+缓存格式：有 pyarrow 时写 parquet（生产推荐）；否则自动改用 csv（无 pyarrow 环境可跑）。
 """
 from __future__ import annotations
 
@@ -94,7 +94,11 @@ def _read_frame(base: Path, *, index_is_date: bool = False) -> pd.DataFrame:
     parquet_path = base.with_suffix(PARQUET_SUFFIX)
     csv_path = base.with_suffix(CSV_SUFFIX)
     if parquet_path.exists():
-        return pd.read_parquet(parquet_path)
+        try:
+            return pd.read_parquet(parquet_path)
+        except (ImportError, ValueError, OSError):
+            if not csv_path.exists():
+                raise DataError(f"缓存文件无法读取：{parquet_path}")
     if csv_path.exists():
         return pd.read_csv(csv_path, index_col=0,
                            parse_dates=index_is_date, encoding="utf-8-sig")

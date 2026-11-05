@@ -1,141 +1,136 @@
 # -*- coding: utf-8 -*-
-"""Agent 门面：多轮对话画像、解读生成与合规校验。
+"""对话 Agent：理解用户、决定下一步动作、用普通人听得懂的话回复。
 
-设计要点：
-- 不降级：LLM/校验失败直接抛异常，由接口层转成 SSE error；
-- 画像只走对话：LLM 抽取槽位，缺失项由回复追问，没有问卷路径；
-- 合规校验：拦截收益承诺、买卖点等敏感表述。
+Agent 不直接碰数据库和回测；它输出 ``Plan``，由 service 执行并生成卡片。
 """
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterator
 
-from .llm import LLMClient
-from .schemas import (
-    REQUIRED_SLOTS,
-    normalize_slots,
-    profile_complete,
-    profile_payload,
-    risk_level,
-)
-from .store import Store
+from .llm import LLMClient, LLMError
+from .schemas import Plan, SLOT_DEFS
 
-PROMPT_PROFILE = """你是 A 股智能选股助手的画像抽取器。
-根据对话历史与用户最新发言，抽取以下画像槽位（全部为字符串）：
-- risk_level：conservative / balanced / aggressive 三选一，依据风险偏好与回撤容忍判断；
-- horizon：投资期限，例如“3-5 年”；
-- drawdown_tolerance：可接受的最大回撤，例如“20%”；
-- goal：投资目标，例如“稳健增值”“长期成长”；
-- experience：投资经验，例如“新手”“3-5 年”；
-- excluded_industries：不投资的行业，多个用“、”连接；
-- capital：计划投入资金，例如“50 万”。
-只输出 JSON，格式：{"slots": {...}}。未提及的槽位不要编造，直接省略。
-若用户的表述模糊（如只说“稳一点”），不要自行猜测风险等级。"""
+ACTION_NAMES = {
+    "confirm_profile",
+    "run_selection",
+    "explain_results",
+    "analyze_model",
+    "apply_pending_change",
+    "rollback_version",
+}
 
-PROMPT_REPLY = """你是“智投罗盘”A 股智能选股助手，语气专业、简洁、克制。
-当前已收集的画像槽位：{slots}
-仍缺失的必填项：{missing}
-规则：
-1. 若仍有缺失项，用自然语言追问（一次最多问两个），不要罗列清单式问卷；
-2. 若信息齐全，用一两句话总结画像并请用户确认画像卡；
-3. 不预测涨跌、不承诺收益、不给出个股买卖点；
-4. 回复控制在 120 字以内，中文。"""
+BANNED_WORDS = ("稳赚", "必涨", "保证收益", "推荐买入", "满仓干", "包赚", "翻倍牛股")
 
-PROMPT_EXPLAIN = """你是 A 股投研解读助手。只根据给定事实写一段解读，不得引入外部数据。
-事实：{facts}
-用户追问：{question}
-规则：
-1. 每个数字必须来自事实，否则不要使用；
-2. 必须包含至少一条风险提示；
-3. 禁止出现“稳赚 / 必涨 / 保证收益 / 推荐买入 / 满仓”等表述；
-4. 结尾注明“历史模拟不代表未来收益，不构成投资建议”；
-5. 控制在 220 字以内。"""
+PLANNER_SYSTEM = f"""你是一个面向普通人的 A 股投资助手，名字叫“小罗”。你不是冷冰冰的问卷机器人，先理解人、再谈投资。
 
-BANNED_WORDS = ("稳赚", "必涨", "保证收益", "推荐买入", "满仓", "包赚")
+你的说话方式：
+- 用大白话，像朋友聊天；不用“夏普比率、因子暴露、风险溢价”这类词，必须用时立刻用生活化比喻解释。
+- 一次只问一个问题；先回应对方上一句，再顺着往下问；不要像审问，不要连续抛问题。
+- 不承诺收益、不推荐具体买卖、不制造焦虑；可以说明历史回测的局限。
+
+你的任务：根据【当前状态】和【用户这句话】，决定回应什么、以及要不要执行动作。
+
+画像槽位（全部用生活化语言）：
+{json.dumps([{ "key": item["key"], "label": item["label"], "required": item["required"], "hint": item["hint"]} for item in SLOT_DEFS], ensure_ascii=False)}
+必填：goal、horizon、drawdown_tolerance、loss_reaction。风险等级不要直接问，由这些信息推导。
+追问策略：从缺失的必填项里挑一个最自然的先问；用户已经说过的不要重复问；信息足够时先简洁复述画像再请用户确认。
+
+可执行动作（actions 数组，按需输出；不带动作就输出空数组）：
+- confirm_profile：用户明确同意画像时执行（“可以/确认/没问题/就按这个来”）；必须同时满足必填齐全。
+- run_selection：画像确认后开始选股；用户说“开始/帮我选股/可以”时连同 confirm_profile 一起输出。
+- explain_results：最近有选股结果、用户在问“为什么/风险/怎么看”时使用。
+- analyze_model：用户想优化模型/效果不好/想调参时使用；系统会自动分析、尝试改模型，过程展示给用户，不会直接启用。
+- apply_pending_change：存在待审批方案（state.pending 非空）且用户明确同意（“同意/启用/应用/就这样”）时使用。
+- rollback_version：用户明确要求回滚时使用。
+权限：低风险动作也要在用户本轮明确确认后执行；高影响动作（应用模型变更、回滚）必须有本轮明确同意。绝不假装动作已经完成。
+
+【输出】只输出 JSON 对象，不要代码块、不要多余文字：
+{{"reply": "给用户看的自然语言，≤120字，口语化", "actions": [{{"name": "动作名", "args": {{}}}}], "profile_delta": {{"槽位key": "用户新提供的信息"}}}}
+profile_delta 只放用户这轮新说出的信息，不要编造；没有就给空对象。"""
+
+EXPLAIN_SYSTEM = """你是 A 股投资助手“小罗”。请基于给定的事实，用普通人能懂的话回答用户问题：
+- 先直接回答，再解释；可以用生活化比喻，但不要编造事实或数字；事实里没有的数据不要说。
+- 不要预测涨跌、不要承诺收益、不要给具体买卖建议；结尾用一句话说明历史回测不代表未来，不构成投资建议。
+- 控制在 300 字以内，语气平和。"""
 
 
 class AgentError(RuntimeError):
-    """Agent 业务错误。"""
+    """对话或计划生成失败。"""
 
 
 class ComplianceError(AgentError):
-    """合规校验未通过。"""
+    """输出包含违规承诺或荐股措辞。"""
 
 
-class GuardChain:
-    """两层校验：槽位结构校验 + 输出合规校验。"""
-
-    def validate_slots(self, slots: dict[str, str]) -> dict[str, str]:
-        normalized = normalize_slots(slots)
-        unknown_risk = normalized.get("risk_level") and normalized["risk_level"] not in (
-            "conservative", "balanced", "aggressive")
-        if unknown_risk:
-            normalized.pop("risk_level")
-        return normalized
-
-    def missing_required(self, slots: dict[str, str]) -> list[str]:
-        return [key for key in REQUIRED_SLOTS if not slots.get(key)]
-
-    def check_compliance(self, text: str) -> str:
-        hits = [word for word in BANNED_WORDS if word in (text or "")]
-        if hits:
-            raise ComplianceError(f"输出包含违规表述：{'、'.join(hits)}")
-        if len(text or "") > 2000:
-            raise AgentError("解读过长，已拒绝返回")
-        return text
+def ensure_compliance(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        raise AgentError("模型返回空回复")
+    for word in BANNED_WORDS:
+        if word in text:
+            raise ComplianceError("回复包含不合规措辞，已拦截")
+    return text
 
 
-class AgentFacade:
-    def __init__(self, llm: LLMClient, store: Store) -> None:
+def chunk_text(text: str, size: int = 12) -> Iterator[str]:
+    """把完整回复切成小片，模拟逐字输出（内容本身来自模型）。"""
+    cleaned = text.strip()
+    for start in range(0, len(cleaned), size):
+        yield cleaned[start:start + size]
+
+
+class Agent:
+    def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
-        self.store = store
-        self.guard = GuardChain()
 
     # ------------------------------------------------------------------
-    def stream_chat(self, session_id: str, content: str) -> Iterator[tuple[str, dict[str, Any]]]:
-        """处理一轮对话，产出 (event, payload)：slots / token / profile_ready。"""
-        history = self.store.get_messages(session_id, limit=12)
-        self.store.add_message(session_id, "user", content)
-
-        previous = self.store.get_profile(session_id) or {"slots": {}}
-        extraction = self.llm.chat_json(
-            PROMPT_PROFILE,
-            [*history, {"role": "user", "content": content}],
-        )
-        slot_delta = extraction.get("slots") if isinstance(extraction.get("slots"), dict) else {}
-        slots = self.guard.validate_slots({**(previous.get("slots") or {}), **slot_delta})
-        missing = self.guard.missing_required(slots)
-        if slots:
-            self.store.save_profile(session_id, slots, risk_level(slots), confirmed=False)
-        yield "slots", {"slots": slots, "missing": missing}
-
-        system = PROMPT_REPLY.format(
-            slots=json.dumps(slots, ensure_ascii=False),
-            missing="、".join(missing) if missing else "无",
-        )
-        reply_parts: list[str] = []
-        for chunk in self.llm.chat_stream(system, [{"role": "user", "content": content}]):
-            reply_parts.append(chunk)
-            yield "token", {"text": chunk}
-        reply = "".join(reply_parts).strip()
-        self.guard.check_compliance(reply)
-        self.store.add_message(session_id, "assistant", reply or "(空)")
-        if not missing:
-            yield "profile_ready", profile_payload(slots)
+    def plan(self, state: dict[str, Any], history: list[dict[str, str]],
+             message: str) -> Plan:
+        payload = json.dumps(
+            {"state": state, "user_message": message, "recent_history": history[-8:]},
+            ensure_ascii=False)
+        try:
+            raw = self.llm.chat_json(
+                PLANNER_SYSTEM, [{"role": "user", "content": payload}])
+        except LLMError as exc:
+            raise AgentError(f"AI 暂时没理解这句话：{exc}") from exc
+        reply = str(raw.get("reply", "")).strip()
+        if not reply:
+            reply = "我在听，你可以再多说一点。"
+        ensure_compliance(reply)
+        actions = self._parse_actions(raw.get("actions"))
+        delta = raw.get("profile_delta")
+        if not isinstance(delta, dict):
+            delta = {}
+        return Plan(reply=reply, actions=actions, profile_delta=delta)
 
     # ------------------------------------------------------------------
     def explain(self, facts: dict[str, Any], question: str = "") -> str:
-        prompt = PROMPT_EXPLAIN.format(
-            facts=json.dumps(facts, ensure_ascii=False), question=question or "无")
-        text = self.llm.chat_text("你是专业的 A 股投研解读助手。", [{"role": "user", "content": prompt}])
-        return self.guard.check_compliance(text)
+        payload = json.dumps({"facts": facts, "question": question}, ensure_ascii=False)
+        try:
+            text = self.llm.chat_text(EXPLAIN_SYSTEM, [{"role": "user", "content": payload}])
+        except LLMError as exc:
+            raise AgentError(f"解读生成失败：{exc}") from exc
+        return ensure_compliance(text)
 
-    def confirm_profile(self, session_id: str, slots: dict[str, str]) -> dict[str, Any]:
-        normalized = self.guard.validate_slots(slots)
-        missing = self.guard.missing_required(normalized)
-        if missing:
-            raise AgentError(f"画像缺少必填项：{'、'.join(missing)}")
-        self.store.save_profile(session_id, normalized, risk_level(normalized), confirmed=True)
-        self.store.audit("confirm_profile", to_version=None, reason="user_confirmed")
-        return profile_payload(normalized, confirmed=True)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_actions(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        actions: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name not in ACTION_NAMES:
+                continue
+            args = item.get("args") if isinstance(item.get("args"), dict) else {}
+            actions.append({"name": name, "args": args})
+        return actions
+
+
+def safe_question(text: str) -> str:
+    """把用户问题压成一段短文本，避免把超长内容塞进提示词。"""
+    return re.sub(r"\s+", " ", text.strip())[:500]

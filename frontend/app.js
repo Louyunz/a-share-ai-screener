@@ -1,3314 +1,1609 @@
 /* =========================================================================
- * 智投罗盘 · 前端状态与 API 编排
- * 零构建、零外部依赖；SSE 对话使用 fetch + ReadableStream，进度使用 EventSource。
- * 契约：docs/CONTRACT.md 第 3 / 4 节。
+ * 智投罗盘 · AI 选股助手（单对话页 + AI 工作台）
+ * 全部操作通过聊天完成：SSE 流式回复 + 富卡片按 id upsert + 右侧工作台自动更新
  * ========================================================================= */
 (function () {
   'use strict';
 
-  /* ----------------------------------------------------------- 常量与工具 */
-  var API_BASE = '/api';
-  var SESSION_KEY = 'session_id';
-  var DEV_MOCK = !!window.__MOCK_MODE__;
-  var VIEWS = ['chat', 'selection', 'interpretation', 'tune'];
-  var FACTOR_KEYS = ['ep', 'bp', 'roe', 'ocf_to_profit', 'revenue_growth', 'momentum_60', 'reversal_5', 'volatility_60', 'liquidity_20', 'size'];
+  /* ============================== 常量 ============================== */
+  var SESSION_KEY = 'zhitou.screener.session';
+  var MAX_ACTIVITY = 12;
+
+  var METRIC_META = {
+    cagr: { label: '年化收益', note: '过去几年平均每年涨多少', type: 'pct', tone: 'green' },
+    sharpe: { label: '夏普比率', note: '同样的波动下，赚得多不多', type: 'num', tone: 'cyan' },
+    mdd: { label: '最大回撤', note: '最难受的时候从高点亏多少', type: 'pct', tone: 'red' },
+    ir: { label: '信息比率', note: '相对大盘的超额收益稳不稳', type: 'num', tone: 'orange' },
+    win_rate: { label: '胜率', note: '持有期间赚钱的时间占比', type: 'pct', tone: 'cyan' }
+  };
+  var METRIC_ORDER = ['cagr', 'sharpe', 'mdd', 'ir', 'win_rate'];
+
   var FACTOR_LABELS = {
-    ep: '价值 EP',
-    bp: '账面价值',
-    roe: 'ROE 质量',
-    ocf_to_profit: '现金流质量',
-    revenue_growth: '营收成长',
-    momentum_60: '60 日动量',
-    reversal_5: '5 日反转',
+    ep: '估值便宜',
+    bp: '账面便宜',
+    roe: '盈利能力强',
+    ocf_to_profit: '现金流实在',
+    revenue_growth: '营收在增长',
+    momentum_60: '趋势走强',
+    reversal_5: '短期反转',
     volatility_60: '低波动',
     liquidity_20: '流动性',
     size: '小市值'
   };
-  var FACTOR_SHORT = {
-    ep: '价值', bp: '账面', roe: '质量', ocf_to_profit: '现金', revenue_growth: '成长',
-    momentum_60: '动量', reversal_5: '反转', volatility_60: '低波', liquidity_20: '流动', size: '规模'
-  };
-  var RISK_LABELS = { conservative: '保守型', balanced: '平衡型', aggressive: '积极型' };
-  var SLOT_KEYS = ['risk_level', 'horizon', 'drawdown_tolerance', 'goal', 'experience', 'excluded_industries', 'capital'];
-  var REQUIRED_SLOTS = ['risk_level', 'horizon', 'drawdown_tolerance'];
-  var SLOT_DEFS = [
-    { key: 'risk_level', label: '风险偏好', required: true, formatter: riskLabel },
-    { key: 'horizon', label: '投资期限', required: true },
-    { key: 'drawdown_tolerance', label: '回撤容忍', required: true },
-    { key: 'goal', label: '投资目标' },
-    { key: 'experience', label: '投资经验' },
-    { key: 'excluded_industries', label: '排除行业' },
-    { key: 'capital', label: '可投资金' }
-  ];
-  var METHOD_LABELS = { equal_weight: '等权', risk_parity: '风险平价' };
-  var ALLOCATION_COLORS = ['#22D3EE', '#34D399', '#F59E0B', '#60A5FA', '#A78BFA', '#FB7185', '#2DD4BF', '#FBBF24', '#38BDF8', '#818CF8', '#F472B6', '#4ADE80'];
-  var MOCK_SELECTION_TIMERS = [];
-  var MOCK_TUNE_TIMERS = [];
-  var toastTimer = null;
-  var tuneElapsedTimer = null;
-  var tuneRenderHandle = null;
-  var resizeTimer = null;
-  var interpretationTyper = null;
 
-  function $(id) { return document.getElementById(id); }
-  function all(selector, root) { return Array.prototype.slice.call((root || document).querySelectorAll(selector)); }
-  function setText(node, value) { if (node) node.textContent = value == null ? '' : String(value); }
-  function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
-  function deepClone(value) {
-    try { return JSON.parse(JSON.stringify(value)); } catch (err) { return value; }
+  var FACTOR_SHORT = {
+    ep: '估值',
+    bp: '账面',
+    roe: '盈利',
+    ocf_to_profit: '现金流',
+    revenue_growth: '成长',
+    momentum_60: '动量',
+    reversal_5: '反转',
+    volatility_60: '低波',
+    liquidity_20: '流动',
+    size: '市值'
+  };
+
+  var SLOT_LABELS = {
+    goal: '投资目标',
+    horizon: '投资期限',
+    capital: '大致投入',
+    liquidity_need: '多久要用钱',
+    loss_reaction: '亏钱时的反应',
+    drawdown_tolerance: '能接受亏多少',
+    income_stability: '收入稳定程度',
+    experience: '投资经验',
+    preferred_industries: '偏好行业',
+    excluded_industries: '不碰行业',
+    trade_frequency: '调整频率',
+    concerns: '最担心什么'
+  };
+
+  var STEP_KIND_LABELS = {
+    analysis: '分析',
+    data: '数据',
+    plan: '方案',
+    code: '改代码',
+    check: '检查',
+    backtest: '回测',
+    compare: '对比',
+    wait: '等待确认',
+    version: '版本',
+    selection: '选股',
+    profile: '画像',
+    risk: '风险',
+    work: '执行'
+  };
+
+  var ACTIVITY_ICONS = {
+    analysis: 'pulse',
+    data: 'chart',
+    plan: 'spark',
+    code: 'code',
+    check: 'check',
+    backtest: 'chart',
+    compare: 'chart',
+    wait: 'shield',
+    version: 'layers',
+    selection: 'target',
+    profile: 'user',
+    alert: 'alert',
+    ai: 'spark',
+    work: 'spark'
+  };
+
+  var STARTERS = [
+    { label: '稳健一点，能接受 10% 左右回撤', message: '我想稳健一点，能接受 10% 左右回撤，计划投资 3 年以上。' },
+    { label: '帮我看看现在适合什么模型', message: '帮我看看现在适合什么模型' },
+    { label: '我比较积极，想抓成长机会', message: '我比较积极，能接受 20% 左右的回撤，希望抓住成长股的长期机会。' },
+    { label: '不想碰的行业怎么排除？', message: '我不想碰白酒和房地产行业，选股时帮我排除掉。' }
+  ];
+
+  /* ============================== 状态 ============================== */
+  var state = {
+    sessionId: '',
+    streaming: false,
+    activeTurn: null,
+    cardNodes: new Map(),
+    profile: null,
+    activeModel: null,
+    versions: [],
+    pendingProposal: null,
+    lastSelection: null,
+    lastUserMessage: '',
+    lastMessageId: null,
+    activity: [],
+    stateError: null,
+    following: true
+  };
+
+  var dom = {};
+  var composing = false;
+
+  /* ============================== 工具函数 ============================== */
+  function $(selector, root) {
+    return (root || document).querySelector(selector);
   }
-  function sleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
   function esc(value) {
-    return String(value == null ? '' : value).replace(/[&<>"']/g, function (char) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char];
+    return String(value === null || value === undefined ? '' : value).replace(/[&<>"']/g, function (ch) {
+      if (ch === '&') return '&amp;';
+      if (ch === '<') return '&lt;';
+      if (ch === '>') return '&gt;';
+      if (ch === '"') return '&quot;';
+      return '&#39;';
     });
   }
-  function toNum(value) {
-    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-    if (typeof value === 'string') {
-      var raw = value.trim().replace(/,/g, '');
-      if (!raw) return null;
-      var isPercent = raw.charAt(raw.length - 1) === '%';
-      if (isPercent) raw = raw.slice(0, -1);
-      var parsed = Number(raw);
-      if (!Number.isFinite(parsed)) return null;
-      return isPercent ? parsed / 100 : parsed;
-    }
-    return null;
+
+  function icon(name, className) {
+    return '<svg class="icon' + (className ? ' ' + className : '') + '" aria-hidden="true"><use href="#i-' + name + '"></use></svg>';
   }
-  function firstNum() {
-    for (var i = 0; i < arguments.length; i += 1) {
-      var value = toNum(arguments[i]);
-      if (value !== null) return value;
-    }
-    return null;
+
+  function num(value) {
+    if (value === null || value === undefined || value === '') return null;
+    var n = typeof value === 'number' ? value : parseFloat(value);
+    return Number.isFinite(n) ? n : null;
   }
-  function firstText() {
-    for (var i = 0; i < arguments.length; i += 1) {
-      if (arguments[i] !== null && arguments[i] !== undefined && String(arguments[i]).trim() !== '') return String(arguments[i]);
-    }
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function fmtNum(value, digits) {
+    var n = num(value);
+    return n === null ? '—' : n.toFixed(digits === undefined ? 2 : digits);
+  }
+
+  function fmtPct(value, digits) {
+    var n = num(value);
+    return n === null ? '—' : (n * 100).toFixed(digits === undefined ? 1 : digits) + '%';
+  }
+
+  function metricMeta(key) {
+    return METRIC_META[key] || { label: String(key), note: '', type: 'num', tone: 'cyan' };
+  }
+
+  function formatMetric(key, value) {
+    var meta = metricMeta(key);
+    return meta.type === 'pct' ? fmtPct(value, 1) : fmtNum(value, 2);
+  }
+
+  function truncate(text, max) {
+    var chars = Array.from(String(text === null || text === undefined ? '' : text));
+    return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : chars.join('');
+  }
+
+  function shortId(id) {
+    var text = String(id || '');
+    return text.length > 10 ? text.slice(0, 8) : text;
+  }
+
+  function shortDate(value) {
+    return value ? String(value).slice(0, 10) : '';
+  }
+
+  function shortDateLabel(label) {
+    var text = String(label === null || label === undefined ? '' : label);
+    var iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return iso[1].slice(2) + '/' + iso[2];
+    return text.length >= 10 ? text.slice(5, 10) : text;
+  }
+
+  function pad2(value) {
+    return value < 10 ? '0' + value : String(value);
+  }
+
+  function nowClock() {
+    var date = new Date();
+    return pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' + pad2(date.getSeconds());
+  }
+
+  function formatClock(value) {
+    if (!value) return nowClock();
+    var text = String(value);
+    var iso = text.match(/T(\d{2}:\d{2})/);
+    if (iso) return iso[1];
+    var plain = text.match(/\b(\d{2}:\d{2})\b/);
+    if (plain) return plain[1];
     return '';
   }
-  function fmtNum(value, digits) {
-    var number = toNum(value);
-    return number === null ? '—' : number.toFixed(digits === undefined ? 2 : digits);
+
+  /* ============================== DOM 引用 ============================== */
+  function cacheDom() {
+    dom.stream = $('#chat-stream');
+    dom.scroll = $('#chat-scroll');
+    dom.composer = $('#composer');
+    dom.input = $('#composer-input');
+    dom.sendBtn = $('#send-btn');
+    dom.healthPill = $('#health-pill');
+    dom.healthDot = $('#health-dot');
+    dom.healthText = $('#health-text');
+    dom.sessionChip = $('#session-chip');
+    dom.wbToggle = $('#wb-toggle');
+    dom.wbToggleLabel = $('#wb-toggle-label');
+    dom.workbench = $('#workbench');
+    dom.wbAlert = $('#wb-alert');
+    dom.profile = $('#wb-profile');
+    dom.activity = $('#wb-activity');
+    dom.model = $('#wb-model');
+    dom.result = $('#wb-result');
+    dom.chatModelChip = $('#chat-model-chip');
+    dom.footerMeta = $('#footer-meta');
   }
-  function fmtPct(value, digits, signed) {
-    var number = toNum(value);
-    if (number === null) return '—';
-    var text = Math.abs(number * 100).toFixed(digits === undefined ? 1 : digits) + '%';
-    if (number < 0) return '−' + text;
-    if (signed && number > 0) return '+' + text;
-    return text;
+
+  /* ============================== 网络请求 ============================== */
+  async function api(path, options) {
+    var opts = options || {};
+    var response = await fetch(path, {
+      method: opts.method || 'GET',
+      headers: Object.assign({ Accept: 'application/json', 'Content-Type': 'application/json' }, opts.headers || {}),
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
+    });
+    var raw = await response.text();
+    var data = null;
+    if (raw) {
+      try {
+        data = JSON.parse(raw);
+      } catch (err) {
+        data = null;
+      }
+    }
+    if (!response.ok) {
+      var detail = data && (data.detail || data.message || data.error);
+      if (Array.isArray(detail)) {
+        detail = detail.map(function (item) {
+          return item && (item.msg || item.message) ? (item.msg || item.message) : '';
+        }).filter(Boolean).join('；');
+      }
+      var error = new Error(detail ? String(detail) : '请求失败（HTTP ' + response.status + '）');
+      error.status = response.status;
+      throw error;
+    }
+    return data === null ? {} : data;
   }
-  function fmtPp(value, digits) {
-    var number = toNum(value);
-    if (number === null) return '—';
-    var text = Math.abs(number * 100).toFixed(digits === undefined ? 1 : digits) + 'pp';
-    if (number < 0) return '−' + text;
-    if (number > 0) return '+' + text;
-    return text;
-  }
-  function fmtMoney(value) {
-    var number = toNum(value);
-    if (number === null) return '—';
+
+  async function checkHealth() {
     try {
-      return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 0 }).format(number);
-    } catch (err) {
-      return '¥' + Math.round(number).toLocaleString('zh-CN');
-    }
-  }
-  function riskLabel(value) {
-    var key = String(value || '').toLowerCase();
-    return RISK_LABELS[key] || (value || '未填写');
-  }
-  function methodLabel(value) {
-    return METHOD_LABELS[value] || value || '—';
-  }
-  function normalizeCode(code) {
-    var raw = String(code == null ? '' : code).trim();
-    if (/^\d{1,6}$/.test(raw)) return raw.padStart(6, '0');
-    return raw;
-  }
-  function timeText(value) {
-    if (!value) return '';
-    var date = new Date(value);
-    if (Number.isNaN(date.getTime())) {
-      var match = String(value).match(/\d{2}:\d{2}/);
-      return match ? match[0] : '';
-    }
-    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-  }
-  function shortDate(value) {
-    if (!value) return '—';
-    return String(value).replace(/-/g, '.').slice(0, 10);
-  }
-  function formatElapsed(ms) {
-    var total = Math.max(0, Math.floor(ms / 1000));
-    var minutes = Math.floor(total / 60);
-    var seconds = total % 60;
-    return String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
-  }
-  function nowIso() { return new Date().toISOString(); }
-  function mockChunkText(text, size) {
-    var chars = Array.from(String(text || ''));
-    var chunks = [];
-    for (var i = 0; i < chars.length; i += size) chunks.push(chars.slice(i, i + size).join(''));
-    return chunks;
-  }
-  function clearTimers(list) {
-    while (list.length) clearTimeout(list.pop());
-  }
-  function setHidden(node, hidden) { if (node) node.hidden = !!hidden; }
-  function scrollChat(force) {
-    var box = $('chat-messages');
-    if (!box) return;
-    var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 180;
-    if (force || nearBottom) box.scrollTop = box.scrollHeight;
-  }
-  function autoGrow(textarea) {
-    if (!textarea) return;
-    textarea.style.height = 'auto';
-    textarea.style.height = Math.min(textarea.scrollHeight, 140) + 'px';
-  }
-  function chartWidth(node, fallback) {
-    if (!node) return fallback || 360;
-    var width = node.clientWidth || (node.parentElement && node.parentElement.clientWidth) || 0;
-    return Math.round(Math.max(250, width - 24) || fallback || 360);
-  }
-  function chartEmpty(node, message) {
-    if (!node) return;
-    node.innerHTML = '';
-    var box = document.createElement('div');
-    box.className = 'chart-empty small';
-    box.textContent = message || '暂无图表数据';
-    node.appendChild(box);
-  }
-
-  /* ------------------------------------------------------------- 全局状态 */
-  var state = {
-    mock: DEV_MOCK,
-    sessionId: '',
-    booted: false,
-    activeView: 'chat',
-    health: null,
-    profile: emptyProfile(),
-    profileEditing: false,
-    profileBusy: false,
-    messages: [],
-    chatBusy: false,
-    selection: {
-      status: 'idle',
-      result: null,
-      taskId: '',
-      progress: 0,
-      stage: '',
-      message: '',
-      error: '',
-      startedAt: 0,
-      finishedAt: 0,
-      source: null,
-      runSeq: 0
-    },
-    interpretation: {
-      text: '',
-      status: 'idle',
-      busy: false,
-      busyKind: '',
-      followups: [],
-      typer: null
-    },
-    tune: {
-      status: 'idle',
-      jobId: '',
-      total: 0,
-      trials: [],
-      baseWeights: null,
-      bestWeights: null,
-      baseMetrics: null,
-      bestMetrics: null,
-      compare: null,
-      candidateVersionId: '',
-      bestTrialIndex: -1,
-      startedAt: 0,
-      finishedAt: 0,
-      elapsedMs: 0,
-      error: '',
-      source: null,
-      runSeq: 0,
-      renderQueued: false,
-      weightChartRendered: false,
-      actionBusy: false,
-      currentStep: 0
-    },
-    versions: [],
-    activeVersionId: '',
-    versionsLoaded: false,
-    versionsLoading: false,
-    versionError: '',
-    retryAction: null
-  };
-
-  function emptyProfile() {
-    return { slots: {}, confirmed: false, complete: false, risk_level: 'balanced' };
-  }
-
-  /* ------------------------------------------------------------- 错误与提示 */
-  function AppError(message, status) {
-    this.name = 'AppError';
-    this.message = message;
-    this.status = status || 0;
-  }
-  AppError.prototype = Object.create(Error.prototype);
-  AppError.prototype.constructor = AppError;
-
-  function extractApiError(payload, status) {
-    if (payload && typeof payload === 'object') {
-      if (typeof payload.detail === 'string' && payload.detail.trim()) return payload.detail;
-      if (Array.isArray(payload.detail) && payload.detail.length) {
-        return payload.detail.map(function (item) { return item && (item.msg || item.message || String(item)); }).join('；');
+      var data = await api('/api/health');
+      var ok = data.ok !== false;
+      var title = [];
+      if (data.source) title.push('数据源 ' + data.source);
+      if (data.as_of) title.push('截至 ' + data.as_of);
+      if (data.universe) title.push('股票池 ' + data.universe + ' 只');
+      if (data.llm) title.push('LLM ' + data.llm);
+      setHealth(ok ? 'ok' : 'warn', ok ? '服务正常' : '服务异常', title.join(' · '));
+      if (ok && data.as_of) {
+        dom.footerMeta.textContent = '数据截至 ' + data.as_of + (data.source ? ' · ' + data.source : '');
       }
-      if (typeof payload.message === 'string' && payload.message.trim()) return payload.message;
-      if (typeof payload.error === 'string' && payload.error.trim()) return payload.error;
+      return data;
+    } catch (error) {
+      setHealth('error', '服务离线', error.message || '后端服务不可用');
+      dom.footerMeta.textContent = '演示原型 · 后端未响应';
+      return null;
     }
-    if (typeof payload === 'string' && payload.trim()) return payload.trim().slice(0, 300);
-    return '请求失败（HTTP ' + status + '）';
   }
 
-  function friendlyError(err) {
-    if (!err) return '未知错误，请重试。';
-    if (err.status === 404) return '请求的资源不存在或会话已失效，请刷新后重试。';
-    var message = err.message || String(err);
-    if (/Failed to fetch|NetworkError|Load failed|fetch failed|Network request failed/i.test(message)) {
-      return '无法连接后端服务，请确认 dev_server / FastAPI 已启动，然后重试。';
-    }
-    return message;
+  function setHealth(level, text, title) {
+    dom.healthDot.className = 'health-dot is-' + level;
+    dom.healthText.textContent = text;
+    dom.healthPill.title = title || '后端与数据服务状态';
   }
 
-  function showError(message, retryAction) {
-    var banner = $('error-banner');
-    if (!banner) return;
-    setText($('error-message'), message || '操作失败，请重试。');
-    state.retryAction = typeof retryAction === 'function' ? retryAction : null;
-    var retry = $('error-retry');
-    retry.hidden = !state.retryAction;
-    banner.hidden = false;
-    banner.style.animation = 'none';
-    window.requestAnimationFrame(function () { banner.style.animation = ''; });
-  }
-
-  function hideError() {
-    var banner = $('error-banner');
-    if (banner) banner.hidden = true;
-    state.retryAction = null;
-  }
-
-  function showToast(message) {
-    var node = $('toast');
-    if (!node) return;
-    clearTimeout(toastTimer);
-    node.textContent = message;
-    node.hidden = false;
-    toastTimer = setTimeout(function () { node.hidden = true; }, 3600);
-  }
-
-  /* ---------------------------------------------------------------- API 层 */
-  async function request(path, options) {
-    var opts = Object.assign({ method: 'GET' }, options || {});
-    var headers = Object.assign({ Accept: 'application/json' }, opts.headers || {});
-    if (opts.body !== undefined && opts.body !== null && typeof opts.body !== 'string') {
-      headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(opts.body);
-    }
-    opts.headers = headers;
-    var response;
+  async function fetchMessages(sessionId) {
     try {
-      response = await fetch(API_BASE + path, opts);
-    } catch (err) {
-      throw new AppError('无法连接后端服务，请确认服务已启动。', 0);
+      var data = await api('/api/sessions/' + encodeURIComponent(sessionId) + '/messages');
+      return { ok: true, messages: Array.isArray(data.messages) ? data.messages : [] };
+    } catch (error) {
+      return { ok: false, notFound: error.status === 404, error: error };
     }
-    var rawText = await response.text();
-    var payload = null;
-    if (rawText) {
-      try { payload = JSON.parse(rawText); } catch (err) { payload = rawText; }
+  }
+
+  async function loadState() {
+    try {
+      var data = await api('/api/sessions/' + encodeURIComponent(state.sessionId) + '/state');
+      state.profile = normalizeProfile(data.profile);
+      state.activeModel = normalizeModel(data.active_model);
+      state.versions = normalizeVersions(data.versions);
+      state.pendingProposal = data.pending_proposal || null;
+      state.lastSelection = normalizeSelection(data.last_selection);
+      state.stateError = null;
+      setWorkbenchAlert('');
+    } catch (error) {
+      state.stateError = error.message || '会话状态加载失败';
+      setWorkbenchAlert('会话状态加载失败：' + state.stateError);
     }
-    if (!response.ok) throw new AppError(extractApiError(payload, response.status), response.status);
-    return payload;
   }
 
-  async function createSession() {
-    var payload = await request('/sessions', { method: 'POST' });
-    if (!payload || !payload.session_id) throw new AppError('创建会话失败：响应缺少 session_id。', 0);
-    return String(payload.session_id);
-  }
-
-  function readStoredSession() {
-    try { return localStorage.getItem(SESSION_KEY) || ''; } catch (err) { return ''; }
-  }
-  function storeSession(sessionId) {
-    try { localStorage.setItem(SESSION_KEY, sessionId); } catch (err) { /* 隐私模式不阻塞使用 */ }
-  }
-  function clearStoredSession() {
-    try { localStorage.removeItem(SESSION_KEY); } catch (err) { /* ignore */ }
-  }
-  function sessionPath(suffix) {
-    return '/sessions/' + encodeURIComponent(state.sessionId) + suffix;
-  }
-
-  /* ------------------------------------------------------------ 数据归一化 */
-  function normalizeSlots(raw) {
-    var slots = {};
-    if (!raw) return slots;
-    if (Array.isArray(raw)) {
-      raw.forEach(function (item) {
-        if (item && item.key) slots[item.key] = item.value == null ? '' : String(item.value);
-      });
-      return slots;
-    }
-    if (typeof raw !== 'object') return slots;
-    SLOT_KEYS.forEach(function (key) {
-      var value = raw[key];
-      if (value === null || value === undefined) return;
-      if (Array.isArray(value)) value = value.join('、');
-      slots[key] = String(value).trim();
-    });
-    // 仅在明确缺失 source 字段时保留额外字段，契约之外不主动展示。
-    return slots;
-  }
-
-  function completeFromSlots(slots) {
-    return REQUIRED_SLOTS.every(function (key) { return !!(slots && slots[key]); });
-  }
-
-  function normalizeProfile(payload) {
-    var source = payload || {};
-    var slots = normalizeSlots(source.slots || source);
-    var complete = typeof source.complete === 'boolean' ? source.complete : completeFromSlots(slots);
-    return {
-      slots: slots,
-      risk_level: source.risk_level || slots.risk_level || 'balanced',
-      confirmed: !!source.confirmed,
-      complete: complete
-    };
-  }
-
-  function slotsChanged(oldSlots, newSlots) {
-    return SLOT_KEYS.some(function (key) { return String((oldSlots || {})[key] || '') !== String((newSlots || {})[key] || ''); });
-  }
-
-  function normalizeWeights(raw) {
-    if (!raw) return null;
-    var output = {};
-    var found = false;
-    FACTOR_KEYS.forEach(function (key, index) {
-      var value = null;
-      if (Array.isArray(raw)) value = toNum(raw[index]);
-      else if (raw[key] !== undefined) value = toNum(raw[key]);
-      else if (raw.weights && raw.weights[key] !== undefined) value = toNum(raw.weights[key]);
-      output[key] = value;
-      if (value !== null) found = true;
-    });
-    return found ? output : null;
-  }
-
-  function normalizeMetrics(raw) {
-    var source = raw || {};
-    var cagr = firstNum(source.cagr, source.annual_return, source.annualized_return, source.return);
-    var sharpe = firstNum(source.sharpe, source.sharpe_ratio);
-    var mdd = firstNum(source.mdd, source.max_drawdown);
-    var ir = firstNum(source.ir, source.information_ratio);
-    var winRate = firstNum(source.win_rate, source.monthly_win_rate);
-    return {
-      cagr: cagr,
-      sharpe: sharpe,
-      mdd: mdd === null ? null : -Math.abs(mdd),
-      ir: ir,
-      win_rate: winRate
-    };
-  }
-
-  function normalizeStock(stock) {
-    if (typeof stock === 'string') stock = { code: stock };
-    stock = stock || {};
-    var factors = {};
-    var contributions = {};
-    var nestedFactors = stock.factors && typeof stock.factors === 'object' ? stock.factors : {};
-    var nestedContributions = stock.contributions && typeof stock.contributions === 'object' ? stock.contributions : {};
-    FACTOR_KEYS.forEach(function (key) {
-      var value = stock['z_' + key];
-      if (value === undefined && stock.z && typeof stock.z === 'object') value = stock.z[key];
-      if (value === undefined) value = nestedFactors[key];
-      if (value === undefined && Array.isArray(stock.z_values)) value = stock.z_values[FACTOR_KEYS.indexOf(key)];
-      factors[key] = toNum(value);
-      contributions[key] = toNum(nestedContributions[key]);
-    });
-    var rawCode = stock.code || stock.ts_code || stock.symbol || '';
-    return {
-      code: normalizeCode(rawCode),
-      name: stock.name || stock.stock_name || '',
-      industry: stock.industry || stock.industry_name || '—',
-      score: firstNum(stock.score, stock.factor_score, stock.total_score, stock.composite_score),
-      factors: factors,
-      contributions: contributions,
-      raw: stock
-    };
-  }
-
-  function normalizeSelectionPayload(raw, fallbackAsOf) {
-    var payload = raw && raw.result ? raw.result : (raw || {});
-    var topRaw = payload.top || payload.top_list || payload.items || [];
-    var top = Array.isArray(topRaw) ? topRaw.map(normalizeStock) : [];
-    var portfolioRaw = payload.portfolio || payload.portfolios || [];
-    var portfolio = Array.isArray(portfolioRaw) ? portfolioRaw.map(function (item) {
-      var originalWeight = toNum(item.weight_pct);
-      if (originalWeight === null) {
-        var ratio = toNum(item.weight);
-        if (ratio !== null) originalWeight = ratio <= 1 ? ratio * 100 : ratio;
+  async function loadVersions() {
+    try {
+      var data = await api('/api/versions');
+      var list = data && (data.versions || data.items) ? (data.versions || data.items) : data;
+      var versions = normalizeVersions(list);
+      if (versions.length) state.versions = versions;
+      if (!state.activeModel) {
+        var active = findActiveVersion(versions, data ? data.active_id : '');
+        if (active) state.activeModel = normalizeModel(active);
       }
-      return {
-        code: normalizeCode(item.code || item.symbol || ''),
-        weight_pct: originalWeight,
-        amount: firstNum(item.amount, item.market_value, item.value),
-        method: item.method || payload.method || ''
-      };
-    }) : [];
-    var rawMetrics = payload.metrics || (payload.backtest && payload.backtest.metrics) || {};
-    var metrics = normalizeMetrics(rawMetrics);
-    var navRaw = payload.nav || (payload.backtest && payload.backtest.nav) || null;
-    // 后端当前把 nav / benchmark_nav 作为两个并列数组返回，前端合并成统一曲线。
-    if (Array.isArray(navRaw) && payload.benchmark_nav) {
-      navRaw = { nav: navRaw, benchmark_nav: payload.benchmark_nav };
-    } else if (navRaw && typeof navRaw === 'object' && !Array.isArray(navRaw) &&
-      !navRaw.benchmark && !navRaw.benchmark_nav && payload.benchmark_nav) {
-      navRaw = Object.assign({}, navRaw, { benchmark_nav: payload.benchmark_nav, benchmark_name: payload.benchmark_name });
+    } catch (error) {
+      /* 版本清单不可用不影响对话主流程 */
     }
-    var nav = normalizeSelectionNav(navRaw);
-    var embedded = firstText(
-      payload.explanation, payload.interpretation, payload.ai_interpretation, payload.ai_commentary,
-      payload.commentary, payload.summary, raw && raw.explanation, raw && raw.interpretation, raw && raw.summary
-    );
-    return {
-      top: top,
-      portfolio: portfolio,
-      metrics: metrics,
-      nav: nav,
-      method: firstText(payload.method, portfolio[0] && portfolio[0].method),
-      top_n: firstNum(payload.top_n) || top.length,
-      as_of: firstText(payload.as_of, payload.asof, fallbackAsOf, state.health && state.health.as_of),
-      benchmark_name: firstText(nav && nav.benchmark_name, payload.benchmark_name, '沪深 300'),
-      interpretation: embedded,
-      raw: payload
-    };
   }
 
-  function axisSeries(raw) {
-    if (raw === null || raw === undefined) return null;
-    if (Array.isArray(raw)) {
-      if (!raw.length) return null;
-      if (typeof raw[0] !== 'object') {
-        var plain = raw.map(function (value) { return toNum(value); }).filter(function (value) { return value !== null; });
-        return plain.length ? { labels: [], values: plain } : null;
-      }
-      var recordLabels = [];
-      var recordValues = [];
-      raw.forEach(function (entry, index) {
-        var value = firstNum(entry.nav, entry.value, entry.y, entry.strategy, entry.current, entry.candidate);
-        if (value === null) return;
-        recordValues.push(value);
-        recordLabels.push(firstText(entry.date, entry.label, entry.x, String(index)));
-      });
-      return recordValues.length ? { labels: recordLabels, values: recordValues } : null;
+  function findActiveVersion(versions, activeId) {
+    var list = versions || [];
+    for (var i = 0; i < list.length; i += 1) {
+      if (list[i].status === 'active') return list[i];
     }
-    if (typeof raw === 'object') {
-      if (Array.isArray(raw.values)) {
-        return {
-          labels: Array.isArray(raw.labels) ? raw.labels.slice() : (Array.isArray(raw.dates) ? raw.dates.slice() : []),
-          values: raw.values.map(function (value) { return toNum(value); }).filter(function (value) { return value !== null; })
-        };
+    if (activeId) {
+      for (var j = 0; j < list.length; j += 1) {
+        if (list[j].id === activeId) return list[j];
       }
-      var keys = Object.keys(raw).filter(function (key) { return toNum(raw[key]) !== null; }).sort();
-      if (!keys.length) return null;
-      return {
-        labels: keys.slice(),
-        values: keys.map(function (key) { return toNum(raw[key]); })
-      };
     }
     return null;
   }
 
-  function normalizeSelectionNav(raw) {
-    if (!raw) return null;
-    if (!Array.isArray(raw) && raw.nav && typeof raw.nav === 'object' && !Array.isArray(raw.nav) &&
-      (raw.nav.dates || raw.nav.labels || raw.nav.strategy || raw.nav.values)) {
-      raw = raw.nav;
-    }
-    var labels = [];
-    var strategyRaw;
-    var benchmarkRaw;
-    if (Array.isArray(raw)) {
-      strategyRaw = raw;
-      labels = raw.map(function (entry, index) {
-        return (entry && typeof entry === 'object') ? firstText(entry.date, entry.label, String(index)) : '';
-      });
-    } else {
-      labels = (raw.labels || raw.dates || raw.x || raw.index || []).slice();
-      var series = raw.series || raw.lines;
-      if (Array.isArray(series) && series.length) {
-        strategyRaw = series[0] && (series[0].values || series[0].data);
-        benchmarkRaw = series[1] && (series[1].values || series[1].data);
-      } else {
-        strategyRaw = raw.strategy !== undefined ? raw.strategy
-          : raw.nav !== undefined ? raw.nav
-            : raw.portfolio_nav !== undefined ? raw.portfolio_nav
-              : raw.net_value !== undefined ? raw.net_value
-                : raw.current !== undefined ? raw.current
-                  : raw.candidate !== undefined ? raw.candidate : raw.values;
-        benchmarkRaw = raw.benchmark !== undefined ? raw.benchmark
-          : raw.benchmark_nav !== undefined ? raw.benchmark_nav
-            : raw.bench !== undefined ? raw.bench : raw.hs300;
-      }
-    }
-    var strategy = axisSeries(strategyRaw);
-    var benchmark = axisSeries(benchmarkRaw);
-    if (!strategy || strategy.values.length < 2) return null;
-    if (!labels.length) labels = strategy.labels || (benchmark && benchmark.labels) || [];
-    if (!labels.length) labels = strategy.values.map(function (_, index) { return 'T' + (index + 1); });
-    var benchmarkValues = benchmark ? benchmark.values : [];
-    var size = strategy.values.length;
-    return {
-      labels: labels.slice(0, size),
-      strategy: strategy.values.slice(0, size),
-      benchmark: benchmarkValues.slice(0, size),
-      benchmark_name: firstText(benchmark && benchmark.name, '沪深 300')
-    };
-  }
-
-  function normalizeCompareNav(compare) {
-    if (!compare) return null;
-    var source = compare.nav && typeof compare.nav === 'object' ? compare.nav : compare;
-    if (!Array.isArray(source) && source.nav && typeof source.nav === 'object' && !Array.isArray(source.nav) &&
-      (source.nav.dates || source.nav.labels || source.nav.base_nav || source.nav.candidate_nav)) {
-      source = source.nav;
-    }
-    var labels = (source.dates || source.labels || compare.dates || compare.labels || []).slice();
-    var baseRaw = source.base_nav !== undefined ? source.base_nav
-      : source.current_nav !== undefined ? source.current_nav
-        : source.current !== undefined ? source.current
-          : source.base !== undefined ? source.base
-            : compare.base_nav !== undefined ? compare.base_nav
-              : compare.current_nav;
-    var candidateRaw = source.candidate_nav !== undefined ? source.candidate_nav
-      : source.best_nav !== undefined ? source.best_nav
-        : source.candidate !== undefined ? source.candidate
-          : source.best !== undefined ? source.best
-            : compare.candidate_nav !== undefined ? compare.candidate_nav
-              : compare.best_nav;
-    if (!labels.length && Array.isArray(source.series)) {
-      labels = source.series[0] && (source.series[0].labels || source.series[0].dates || []);
-    }
-    var base = axisSeries(baseRaw);
-    var candidate = axisSeries(candidateRaw);
-    // 兼容未来后端以 compare.nav.series = [{name,values}, ...] 返回的情况。
-    if (!base && !candidate && Array.isArray(source.series) && source.series.length) {
-      base = axisSeries(source.series[0] && (source.series[0].values || source.series[0].data));
-      candidate = axisSeries(source.series[1] && (source.series[1].values || source.series[1].data));
-    }
-    if (!base && !candidate) return null;
-    var benchmark = axisSeries(source.benchmark !== undefined ? source.benchmark : source.benchmark_nav);
-    if (!labels.length) labels = (base && base.labels) || (candidate && candidate.labels) || [];
-    var lengths = [];
-    if (base) lengths.push(base.values.length);
-    if (candidate) lengths.push(candidate.values.length);
-    if (!lengths.length) return null;
-    var size = Math.min.apply(null, lengths);
-    if (!labels.length) labels = Array.from({ length: size }, function (_, index) { return 'T' + (index + 1); });
-    return {
-      labels: labels.slice(0, size),
-      base: base ? base.values.slice(0, size) : null,
-      candidate: candidate ? candidate.values.slice(0, size) : null,
-      benchmark: benchmark ? benchmark.values.slice(0, size) : null
-    };
-  }
-
-  /* ------------------------------------------------------------- 视图切换 */
-  function getInitialView() {
-    var raw = (window.location.hash || '').replace(/^#/, '');
-    return VIEWS.indexOf(raw) >= 0 ? raw : 'chat';
-  }
-
-  function switchView(view, options) {
-    var opts = options || {};
-    if (VIEWS.indexOf(view) < 0) view = 'chat';
-    state.activeView = view;
-    all('.nav-item').forEach(function (button) {
-      var active = button.getAttribute('data-view') === view;
-      button.classList.toggle('is-active', active);
-      if (active) button.setAttribute('aria-current', 'page');
-      else button.removeAttribute('aria-current');
-    });
-    all('.view[data-view-panel]').forEach(function (panel) {
-      var active = panel.getAttribute('data-view-panel') === view;
-      panel.hidden = !active;
-      panel.classList.toggle('is-active', active);
-    });
-    if (!opts.keepHash) {
-      try { history.replaceState(null, '', '#' + view); } catch (err) { /* file:// 下可能受限 */ }
-    }
-    if (!opts.initial) window.scrollTo(0, 0);
-    if (view === 'selection') renderSelectionView();
-    if (view === 'interpretation') renderInterpretation();
-    if (view === 'tune') {
-      renderTuneView();
-      if (state.booted && !state.mock) ensureVersions();
-    }
-    if (view === 'chat') {
-      if (!state.messages.length && !state.chatBusy) renderChatEmpty();
-      scrollChat(false);
-    }
-  }
-
-  /* --------------------------------------------------------------- 启动引导 */
-  function init() {
-    bindEvents();
-    setHealth('connecting', '连接中');
-    updateSessionLabel();
-    if (DEV_MOCK) {
-      var flag = $('mock-flag');
-      if (flag) flag.hidden = false;
-    }
-    renderProfile();
-    renderSelectionView();
-    renderInterpretation();
-    renderTuneView();
-    switchView(getInitialView(), { initial: true, keepHash: false });
-    if (DEV_MOCK) bootMock();
-    else bootLive();
-  }
-
-  async function bootLive() {
-    var sessionId = readStoredSession();
+  function readSavedSession() {
     try {
-      if (!sessionId) {
-        sessionId = await createSession();
-        storeSession(sessionId);
-      }
-      state.sessionId = sessionId;
-      updateSessionLabel();
-      var results = await Promise.all([
-        request(sessionPath('/messages')),
-        request(sessionPath('/profile'))
-      ]);
-      state.messages = Array.isArray(results[0] && results[0].messages) ? results[0].messages : [];
-      state.profile = normalizeProfile(results[1] || {});
-      state.booted = true;
-      renderMessages();
-      renderProfile();
-      renderSelectionView();
-      renderInterpretation();
-      renderTuneView();
-      if (state.activeView === 'tune') ensureVersions();
-      loadHealth();
+      return window.localStorage.getItem(SESSION_KEY) || '';
     } catch (err) {
-      if (err.status === 404 && readStoredSession()) {
-        clearStoredSession();
-        state.sessionId = '';
-        updateSessionLabel();
-        return bootLive();
-      }
-      state.booted = false;
-      state.sessionId = sessionId || '';
-      updateSessionLabel();
-      renderChatEmpty();
-      renderProfile();
-      renderSelectionView();
-      showError('初始化失败：' + friendlyError(err), function () { hideError(); bootLive(); });
+      return '';
     }
   }
 
-  /* DEV-ONLY：?mock=1 时装载本地 mock-data.js，不访问任何网络接口。 */
-  function bootMock() {
-    if (!window.MockData) {
-      showError('Mock 数据未加载：请确认 frontend/mock-data.js 与 index.html 位于同一目录，且以 ?mock=1 打开。', function () { window.location.reload(); });
-      renderChatEmpty();
-      return;
+  function saveSession(sessionId) {
+    try {
+      window.localStorage.setItem(SESSION_KEY, sessionId);
+    } catch (err) {
+      /* 本地存储不可用时仅影响刷新恢复 */
     }
-    var data = window.MockData;
-    state.mock = true;
-    state.sessionId = data.session_id || 'mock-session';
-    state.profile = normalizeProfile(data.profile || {});
-    state.messages = deepClone(data.messages || []);
-    state.selection.result = normalizeSelectionPayload(data.selectionResult || {}, '2025-12-31');
-    state.selection.status = 'complete';
-    state.selection.runSeq += 1;
-    state.interpretation.text = data.interpretation || '';
-    state.interpretation.status = data.interpretation ? 'ready' : 'idle';
-    state.versions = deepClone(data.versions || []);
-    state.activeVersionId = data.active_id || ((state.versions.find(function (version) { return version.status === 'active'; }) || {}).id || '');
-    state.versionsLoaded = true;
-    state.booted = true;
-    setHealth('warn', 'Mock 预览');
-    var healthPill = $('health-pill');
-    if (healthPill) healthPill.title = '开发预览：所有数据来自 frontend/mock-data.js';
-    setText($('footer-data-source'), 'DATA · DEV-ONLY MOCK');
-    updateSessionLabel();
-    renderMessages();
-    renderProfile();
-    renderSelectionView();
-    renderInterpretation();
-    renderTuneView();
-    showToast('开发预览模式：当前页面不连接后端，展示的是 mock 数据。');
   }
 
-  function loadHealth() {
-    if (state.mock) return;
-    fetch(API_BASE + '/health', { headers: { Accept: 'application/json' } }).then(function (response) {
-      if (!response.ok) throw new Error('health ' + response.status);
-      return response.json();
-    }).then(function (payload) {
-      state.health = payload || {};
-      var llmValue = payload.llm;
-      // 契约示例为 "ok"；当前后端返回 LLM 客户端类名，因此类名同样视为可用。
-      var llmOk = !llmValue || llmValue === 'ok' || /llm|fake|client/i.test(String(llmValue));
-      setHealth(llmOk ? 'ok' : 'warn', llmOk ? '服务在线' : 'LLM 异常');
-      var pill = $('health-pill');
-      if (pill) pill.title = '数据源：' + (payload.source || '—') + ' · 截至 ' + (payload.as_of || '—') + ' · LLM：' + (payload.llm || '—');
-      setText($('footer-data-source'), 'DATA · CSI 800 / ' + String(payload.source || 'SAMPLE').toUpperCase());
-    }).catch(function () {
-      setHealth('error', '服务离线');
-    });
-  }
-
-  function setHealth(kind, text) {
-    var pill = $('health-pill');
-    if (!pill) return;
-    pill.classList.remove('is-ok', 'is-warn', 'is-error');
-    if (kind) pill.classList.add('is-' + kind);
-    setText($('health-text'), text || '连接中');
-  }
-
-  function updateSessionLabel() {
-    var node = $('session-label');
-    if (!node) return;
-    if (!state.sessionId) {
-      node.textContent = 'SESSION —';
-      return;
-    }
-    if (state.mock) {
-      node.textContent = 'MOCK · DEMO';
-      node.title = state.sessionId;
-      return;
-    }
-    var suffix = state.sessionId.length > 8 ? state.sessionId.slice(-8) : state.sessionId;
-    node.textContent = 'SESSION · ' + suffix.toUpperCase();
-    node.title = state.sessionId;
-  }
-
-  /* ------------------------------------------------------------ Markdown 安全渲染 */
-  function inlineMarkdown(text) {
-    var output = esc(text);
-    output = output.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    output = output.replace(/`([^`]+)`/g, '<code>$1</code>');
-    return output;
-  }
-
-  function renderMarkdown(input) {
-    var lines = String(input == null ? '' : input).replace(/\r\n?/g, '\n').split('\n');
-    var html = [];
-    var paragraph = [];
-    var list = null;
-    var quote = [];
-
-    function flushParagraph() {
-      if (!paragraph.length) return;
-      html.push('<p>' + paragraph.map(inlineMarkdown).join('<br>') + '</p>');
-      paragraph = [];
-    }
-    function flushList() {
-      if (!list) return;
-      html.push('<' + list.type + '>' + list.items.map(function (item) { return '<li>' + inlineMarkdown(item) + '</li>'; }).join('') + '</' + list.type + '>');
-      list = null;
-    }
-    function flushQuote() {
-      if (!quote.length) return;
-      html.push('<blockquote>' + quote.map(inlineMarkdown).join('<br>') + '</blockquote>');
-      quote = [];
-    }
-    function flushAll() {
-      flushParagraph(); flushList(); flushQuote();
-    }
-
-    lines.forEach(function (line) {
-      var trimmed = line.trim();
-      if (!trimmed) { flushAll(); return; }
-      var heading = trimmed.match(/^#{1,4}\s+(.+)$/);
-      if (heading) {
-        flushAll();
-        html.push('<h3>' + inlineMarkdown(heading[1]) + '</h3>');
-        return;
-      }
-      if (/^>\s?/.test(trimmed)) {
-        flushParagraph(); flushList();
-        quote.push(trimmed.replace(/^>\s?/, ''));
-        return;
-      }
-      var unordered = trimmed.match(/^[-*+]\s+(.+)$/);
-      var ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
-      if (unordered || ordered) {
-        flushParagraph(); flushQuote();
-        var type = unordered ? 'ul' : 'ol';
-        var content = (unordered || ordered)[1];
-        if (!list || list.type !== type) {
-          flushList();
-          list = { type: type, items: [] };
+  /* ============================== 数据归一化 ============================== */
+  function normalizeProfile(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var items = [];
+    if (Array.isArray(raw.items)) {
+      var hasFilledFlag = raw.items.some(function (item) {
+        return item && item.filled !== undefined;
+      });
+      raw.items.forEach(function (item) {
+        if (!item || item.label === undefined || item.value === undefined || item.value === null) return;
+        if (hasFilledFlag && item.filled === false) return;
+        if (String(item.value).trim() === '') return;
+        items.push({ label: String(item.label), value: String(item.value) });
+      });
+    } else if (raw.slots && typeof raw.slots === 'object') {
+      Object.keys(SLOT_LABELS).forEach(function (key) {
+        var value = raw.slots[key];
+        if (value !== undefined && value !== null && String(value).trim() !== '') {
+          items.push({ label: SLOT_LABELS[key], value: String(value) });
         }
-        list.items.push(content);
-        return;
-      }
-      flushList(); flushQuote();
-      paragraph.push(trimmed);
-    });
-    flushAll();
-    return html.join('');
-  }
-
-  /* --------------------------------------------------------------- 聊天视图 */
-  function renderChatEmpty() {
-    var box = $('chat-messages');
-    if (!box) return;
-    box.innerHTML =
-      '<div class="chat-empty">' +
-        '<div class="chat-empty-orbit" aria-hidden="true"><svg class="icon"><use href="#i-spark"></use></svg></div>' +
-        '<h3>从一个投资目标开始</h3>' +
-        '<p>不需要填冗长表单。用一句话描述你的风险偏好、期限与目标，AI 会逐轮追问并抽取可确认的画像槽位。</p>' +
-        '<div class="empty-tags"><span>风险偏好</span><span>投资期限</span><span>回撤容忍</span><span>排除行业</span></div>' +
-      '</div>';
-    var quick = $('quick-prompts');
-    if (quick) quick.hidden = false;
-  }
-
-  function renderMessages() {
-    var box = $('chat-messages');
-    if (!box) return;
-    box.innerHTML = '';
-    if (!state.messages.length) {
-      renderChatEmpty();
-      return;
+      });
     }
-    var quick = $('quick-prompts');
-    if (quick) quick.hidden = true;
-    state.messages.forEach(function (message) {
-      box.appendChild(createMessageElement(message, false).root);
-    });
-    scrollChat(true);
+    var completeness = num(raw.completeness);
+    if (completeness === null && items.length) {
+      completeness = items.length / Object.keys(SLOT_LABELS).length;
+    }
+    if (completeness !== null) completeness = clamp(completeness, 0, 1);
+    var riskLevel = raw.risk_level || (raw.slots && raw.slots.risk_level) || '';
+    return {
+      summary: raw.summary ? String(raw.summary) : '',
+      items: items,
+      completeness: completeness,
+      missing: Array.isArray(raw.missing) ? raw.missing.map(String) : [],
+      confirmed: !!raw.confirmed,
+      riskLevel: riskLevel ? String(riskLevel) : ''
+    };
   }
 
-  function createMessageElement(message, streaming) {
-    var role = message.role === 'user' ? 'user' : 'assistant';
-    var root = document.createElement('div');
-    root.className = 'message message-' + role;
-    var avatar = document.createElement('div');
-    avatar.className = 'msg-avatar' + (role === 'user' ? ' user-avatar' : '');
-    if (role === 'assistant') {
-      avatar.innerHTML = '<svg class="icon"><use href="#i-spark"></use></svg>';
-    } else {
-      avatar.textContent = '你';
-    }
-    var main = document.createElement('div');
-    main.className = 'msg-main';
-    var meta = document.createElement('div');
-    meta.className = 'msg-meta';
-    var name = document.createElement('b');
-    name.textContent = role === 'assistant' ? 'AI 画像分析师' : '你';
-    var time = document.createElement('time');
-    time.textContent = timeText(message.created_at) || (streaming ? '正在回复' : '');
-    meta.appendChild(name);
-    if (time.textContent) meta.appendChild(time);
+  function buildProfileSummary(profile) {
+    if (!profile || !profile.items.length) return '';
+    if (profile.summary) return profile.summary;
+    var count = profile.items.length;
+    if (profile.confirmed) return '已确认的画像包含 ' + count + ' 项信息，AI 会按它来选股和解释结果。';
+    return 'AI 已记录 ' + count + ' 项画像信息，继续补充后确认，就能开始选股。';
+  }
+
+  function normalizeModel(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+      id: raw.id ? String(raw.id) : '',
+      name: raw.name ? String(raw.name) : (raw.model_name ? String(raw.model_name) : '未命名模型'),
+      description: raw.description ? String(raw.description) : '',
+      metrics: raw.metrics && typeof raw.metrics === 'object' ? raw.metrics : null,
+      status: raw.status ? String(raw.status) : 'active'
+    };
+  }
+
+  function normalizeVersions(raw) {
+    var list = Array.isArray(raw) ? raw : [];
+    return list.filter(function (item) {
+      return item && typeof item === 'object' && (item.id || item.name);
+    }).map(function (item) {
+      return {
+        id: item.id ? String(item.id) : '',
+        name: item.name ? String(item.name) : '未命名版本',
+        status: item.status ? String(item.status) : '',
+        created_at: item.created_at ? String(item.created_at) : '',
+        metrics: item.metrics && typeof item.metrics === 'object' ? item.metrics : null
+      };
+    });
+  }
+
+  function normalizeSelection(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var metrics = raw.metrics && typeof raw.metrics === 'object' ? raw.metrics : {};
+    var hasMetrics = METRIC_ORDER.some(function (key) { return num(metrics[key]) !== null; });
+    return {
+      as_of: raw.as_of ? String(raw.as_of) : '',
+      model: raw.model && typeof raw.model === 'object' ? raw.model : null,
+      top: Array.isArray(raw.top) ? raw.top.filter(function (item) { return item && typeof item === 'object'; }) : [],
+      metrics: metrics,
+      metric_notes: raw.metric_notes && typeof raw.metric_notes === 'object' ? raw.metric_notes : {},
+      portfolio: Array.isArray(raw.portfolio) ? raw.portfolio : [],
+      factor_contributions: Array.isArray(raw.factor_contributions) ? raw.factor_contributions : [],
+      nav: Array.isArray(raw.nav) ? raw.nav : [],
+      benchmark_nav: Array.isArray(raw.benchmark_nav) ? raw.benchmark_nav : [],
+      explanation: raw.explanation ? String(raw.explanation) : '',
+      hasMetrics: hasMetrics
+    };
+  }
+
+  /* ============================== 聊天区渲染 ============================== */
+  function clearChat() {
+    dom.stream.innerHTML = '';
+    dom.stream.classList.remove('is-welcome');
+    state.cardNodes.clear();
+    state.activeTurn = null;
+    state.following = true;
+  }
+
+  function appendWelcome() {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg msg-ai msg-welcome';
+    wrap.innerHTML = '<div class="msg-avatar">' + icon('spark') + '</div>'
+      + '<div class="msg-main"><div class="msg-meta"><strong>AI 选股助手</strong><time>刚刚</time></div>'
+      + '<div class="card card-welcome"><div class="card-body">'
+      + '<h2 class="welcome-title">你好，我是你的 AI 选股助手</h2>'
+      + '<p class="welcome-text">先用几句话说说你的投资想法就行——打算投多久、能接受亏多少、有没有不想碰的行业。我会边聊边把投资画像整理给你看，确认后直接帮你选股、解释结果，也能和你一起优化模型。</p>'
+      + '<div class="starter-list">' + STARTERS.map(function (item) {
+        return '<button class="starter" type="button" data-action="quick" data-message="' + esc(item.message) + '">' + esc(item.label) + '</button>';
+      }).join('') + '</div>'
+      + '</div></div></div>';
+    dom.stream.classList.add('is-welcome');
+    dom.stream.appendChild(wrap);
+  }
+
+  function appendTextMessage(role, content, createdAt) {
+    var wrap = document.createElement('div');
+    var isUser = role === 'user';
+    wrap.className = 'msg ' + (isUser ? 'msg-user' : 'msg-ai');
+    dom.stream.classList.remove('is-welcome');
+    var meta = '<div class="msg-meta"><strong>' + (isUser ? '你' : 'AI 选股助手') + '</strong><time>' + esc(formatClock(createdAt)) + '</time></div>';
+    var bubble = '<div class="bubble">' + esc(content) + '</div>';
+    wrap.innerHTML = isUser
+      ? '<div class="msg-main">' + meta + bubble + '</div>'
+      : '<div class="msg-avatar">' + icon('spark') + '</div><div class="msg-main">' + meta + bubble + '</div>';
+    dom.stream.appendChild(wrap);
+    return wrap;
+  }
+
+  function renderHistory(messages) {
+    messages.forEach(function (message) {
+      if (!message) return;
+      var role = message.role === 'user' ? 'user' : 'assistant';
+      var content = message.content === null || message.content === undefined ? '' : String(message.content);
+      if (!content.trim()) return;
+      appendTextMessage(role, content, message.created_at);
+      if (role === 'user') state.lastUserMessage = content;
+    });
+  }
+
+  function beginAssistantTurn() {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg msg-ai is-streaming';
+    dom.stream.classList.remove('is-welcome');
+    wrap.innerHTML = '<div class="msg-avatar">' + icon('spark') + '</div>'
+      + '<div class="msg-main"><div class="msg-meta"><strong>AI 选股助手</strong><time>' + esc(nowClock()) + '</time></div>'
+      + '<div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>'
+      + '<div class="cards"></div></div>';
+    dom.stream.appendChild(wrap);
+    var turn = {
+      node: wrap,
+      bubble: wrap.querySelector('.bubble'),
+      cards: wrap.querySelector('.cards'),
+      text: '',
+      cardCount: 0,
+      failed: false
+    };
+    state.activeTurn = turn;
+    state.following = true;
+    scrollToBottom(true);
+    return turn;
+  }
+
+  function ensureBubble(turn) {
+    if (turn.bubble && turn.bubble.isConnected) return turn.bubble;
     var bubble = document.createElement('div');
-    bubble.className = 'msg-bubble';
-    var textNode = document.createElement('div');
-    textNode.className = 'message-text';
-    if (!streaming) {
-      if (role === 'assistant') textNode.innerHTML = renderMarkdown(message.content || '');
-      else textNode.textContent = message.content || '';
+    bubble.className = 'bubble';
+    turn.cards.parentNode.insertBefore(bubble, turn.cards);
+    turn.bubble = bubble;
+    return bubble;
+  }
+
+  function appendToken(turn, text) {
+    if (!turn || !text) return;
+    var bubble = ensureBubble(turn);
+    turn.text += String(text);
+    bubble.textContent = turn.text;
+    if (state.following) scrollToBottom(true);
+  }
+
+  function finalizeTurn(turn) {
+    if (!turn) return;
+    turn.node.classList.remove('is-streaming');
+    if (!turn.text && turn.bubble && turn.bubble.isConnected) turn.bubble.remove();
+    if (state.activeTurn === turn) state.activeTurn = null;
+  }
+
+  function errorCardHtml(title, message, action) {
+    var actionHtml = '';
+    if (action === 'retry-init') {
+      actionHtml = '<button class="btn btn-sm" type="button" data-action="retry-init">' + icon('refresh') + '重新连接</button>';
+    } else if (action === 'retry') {
+      actionHtml = '<button class="btn btn-sm" type="button" data-action="retry">' + icon('refresh') + '重试</button>';
     }
-    bubble.appendChild(textNode);
-    var dots = null;
-    var caret = null;
-    if (streaming) {
-      dots = document.createElement('span');
-      dots.className = 'typing-dots';
-      dots.innerHTML = '<i></i><i></i><i></i>';
-      bubble.appendChild(dots);
-      caret = document.createElement('span');
-      caret.className = 'typing-caret';
-      caret.hidden = true;
-      bubble.appendChild(caret);
-    }
-    main.appendChild(meta);
-    main.appendChild(bubble);
-    root.appendChild(avatar);
-    root.appendChild(main);
-    return { root: root, meta: meta, bubble: bubble, textEl: textNode, dots: dots, caret: caret, role: role };
+    return '<article class="card card-error"><span class="error-mark">!</span><div class="error-copy"><strong>' + esc(title) + '</strong><p>' + esc(message) + '</p></div>' + actionHtml + '</article>';
   }
 
-  function appendChatMessage(message) {
-    var box = $('chat-messages');
-    if (!box) return;
-    if (!state.messages.length || box.querySelector('.chat-empty')) box.innerHTML = '';
-    var quick = $('quick-prompts');
-    if (quick) quick.hidden = true;
-    box.appendChild(createMessageElement(message, false).root);
-    scrollChat(true);
-  }
-
-  function appendStreamingChatBubble() {
-    var box = $('chat-messages');
-    if (!box) return null;
-    if (box.querySelector('.chat-empty')) box.innerHTML = '';
-    var quick = $('quick-prompts');
-    if (quick) quick.hidden = true;
-    var info = createMessageElement({ role: 'assistant', content: '', created_at: nowIso() }, true);
-    box.appendChild(info.root);
-    scrollChat(true);
-    return info;
-  }
-
-  function setChatBusy(busy) {
-    state.chatBusy = busy;
-    var button = $('chat-send');
-    var panel = document.querySelector('.chat-panel');
-    if (button) {
-      button.disabled = busy;
-      var span = button.querySelector('span');
-      if (span) span.textContent = busy ? '生成中' : '发送';
-    }
-    if (panel) panel.classList.toggle('is-streaming', busy);
-  }
-
-  function finalizeStreamBubble(info, text, markdown) {
-    if (!info) return;
-    if (info.dots) info.dots.remove();
-    if (info.caret) info.caret.remove();
-    if (markdown) info.textEl.innerHTML = renderMarkdown(text);
-    else info.textEl.textContent = text;
-  }
-
-  function createTypewriter(node, onProgress) {
-    var buffer = '';
-    var text = '';
-    var timer = null;
-    var closing = false;
-    var finishResolvers = [];
-    var finished = false;
-
-    function resolveIfDone() {
-      if (!closing || buffer.length || timer || finished) return;
-      finished = true;
-      finishResolvers.splice(0).forEach(function (resolve) { resolve(text); });
-    }
-    function tick() {
-      timer = null;
-      if (!buffer.length) {
-        resolveIfDone();
-        return;
-      }
-      var take = buffer.length > 200 ? 5 : (buffer.length > 60 ? 3 : 2);
-      text += buffer.slice(0, take);
-      buffer = buffer.slice(take);
-      node.textContent = text;
-      if (typeof onProgress === 'function') onProgress();
-      timer = setTimeout(tick, 15);
-    }
-    function start() {
-      if (timer || !buffer.length) return;
-      timer = setTimeout(tick, 15);
-    }
-    return {
-      push: function (chunk) {
-        if (!chunk) return;
-        buffer += String(chunk);
-        start();
-      },
-      finish: function () {
-        closing = true;
-        if (!buffer.length && !timer) {
-          finished = true;
-          return Promise.resolve(text);
-        }
-        return new Promise(function (resolve) { finishResolvers.push(resolve); });
-      },
-      abort: function () {
-        if (timer) clearTimeout(timer);
-        timer = null;
-        if (buffer) {
-          text += buffer;
-          buffer = '';
-          node.textContent = text;
-        }
-        closing = true;
-        finished = true;
-        finishResolvers.splice(0).forEach(function (resolve) { resolve(text); });
-      },
-      getText: function () { return text + buffer; }
-    };
-  }
-
-  function handleSlotsUpdate(rawSlots) {
-    if (!rawSlots || typeof rawSlots !== 'object') return;
-    var incoming = normalizeSlots(rawSlots.slots || rawSlots);
-    if (!Object.keys(incoming).length) return;
-    var before = state.profile.slots || {};
-    var merged = Object.assign({}, before, incoming);
-    var changed = slotsChanged(before, merged);
-    if (!changed) return;
-    var wasConfirmed = state.profile.confirmed;
-    state.profile.slots = merged;
-    state.profile.complete = completeFromSlots(merged);
-    state.profile.risk_level = merged.risk_level || state.profile.risk_level || 'balanced';
-    if (wasConfirmed) state.profile.confirmed = false;
-    renderProfile();
-    if (wasConfirmed) showToast('画像槽位已更新，请重新确认后开始选股。');
-  }
-
-  function handleProfileReady(rawProfile) {
-    if (!rawProfile || typeof rawProfile !== 'object') return;
-    var incoming = rawProfile.profile || rawProfile;
-    if (!incoming.slots && !SLOT_KEYS.some(function (key) { return incoming[key] !== undefined; })) return;
-    var normalized = normalizeProfile(incoming);
-    var mergedSlots = Object.assign({}, state.profile.slots, normalized.slots);
-    var changed = slotsChanged(state.profile.slots, mergedSlots);
-    var wasComplete = state.profile.complete;
-    state.profile.slots = mergedSlots;
-    state.profile.complete = typeof normalized.complete === 'boolean' ? normalized.complete : completeFromSlots(mergedSlots);
-    if (!state.profile.complete) state.profile.complete = completeFromSlots(mergedSlots);
-    state.profile.risk_level = normalized.risk_level || mergedSlots.risk_level || state.profile.risk_level || 'balanced';
-    if (Object.prototype.hasOwnProperty.call(incoming, 'confirmed')) {
-      state.profile.confirmed = !!incoming.confirmed;
-    } else if (changed) {
-      state.profile.confirmed = false;
-    }
-    renderProfile();
-    if (!wasComplete && state.profile.complete) showToast('画像核心槽位已完整，可确认后开始选股。');
-  }
-
-  async function handleChatSubmit() {
-    if (state.chatBusy) return;
-    var input = $('chat-input');
-    var content = (input && input.value || '').trim();
-    if (!content) return;
-    if (!state.sessionId) {
-      showError('会话尚未就绪，请稍后重试。', function () { hideError(); bootLive(); });
+  function showTurnError(turn, title, message, retryEnabled) {
+    if (!turn) {
+      appendSystemError(title, message, retryEnabled === false ? null : 'retry');
       return;
     }
-    input.value = '';
-    autoGrow(input);
-    await sendChatContent(content, { retry: false });
+    turn.failed = true;
+    var slot = document.createElement('div');
+    slot.className = 'card-slot';
+    slot.innerHTML = errorCardHtml(title, message, retryEnabled === false ? null : 'retry');
+    turn.cards.appendChild(slot);
+    turn.cardCount += 1;
+    pushActivity('error-' + nowClock() + '-' + Math.random().toString(36).slice(2, 6), title + '：' + message, 'error', 'alert');
+    scrollToBottom(true);
   }
 
-  async function sendChatContent(content, options) {
-    var opts = options || {};
-    if (state.chatBusy) return;
-    hideError();
-    var userMessage = { role: 'user', content: content, created_at: nowIso() };
-    if (!opts.retry) {
-      state.messages.push(userMessage);
-      appendChatMessage(userMessage);
+  function appendSystemError(title, message, action) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg msg-ai';
+    wrap.innerHTML = '<div class="msg-avatar">' + icon('alert') + '</div>'
+      + '<div class="msg-main"><div class="cards">' + errorCardHtml(title, message, action || 'retry-init') + '</div></div>';
+    dom.stream.appendChild(wrap);
+    scrollToBottom(true);
+  }
+
+  function scrollToBottom(force) {
+    if (!dom.scroll) return;
+    if (force || isNearBottom()) dom.scroll.scrollTop = dom.scroll.scrollHeight;
+  }
+
+  function isNearBottom() {
+    if (!dom.scroll) return true;
+    return dom.scroll.scrollHeight - dom.scroll.scrollTop - dom.scroll.clientHeight < 160;
+  }
+
+  /* ============================== 卡片模板 ============================== */
+  function renderCard(block) {
+    switch (block.type) {
+      case 'profile':
+        return profileCardHtml(normalizeProfile(block));
+      case 'selection':
+        return selectionCardHtml(normalizeSelection(block));
+      case 'work':
+        return workCardHtml(block);
+      case 'approval':
+        return approvalCardHtml(block);
+      case 'version':
+        return versionCardHtml(block);
+      default:
+        return genericCardHtml(block);
     }
-    setChatBusy(true);
-    var info = appendStreamingChatBubble();
-    var typer = createTypewriter(info.textEl, function () { scrollChat(false); });
-    var collected = '';
-    var firstToken = false;
-    var handlers = {
-      onToken: function (token) {
-        if (!firstToken) {
-          firstToken = true;
-          if (info.dots) info.dots.remove();
-          if (info.caret) info.caret.hidden = false;
-        }
-        collected += token;
-        typer.push(token);
-      },
-      onSlots: handleSlotsUpdate,
-      onProfileReady: handleProfileReady
-    };
-    try {
-      await runConversationStream(content, 'chat', handlers);
-      var finalText = await typer.finish();
-      if (info.caret) info.caret.remove();
-      if (!finalText.trim()) throw new AppError('AI 返回了空内容，请重试。', 0);
-      finalizeStreamBubble(info, finalText, true);
-      state.messages.push({ role: 'assistant', content: finalText, created_at: nowIso() });
-      if (info.meta) {
-        var oldTime = info.meta.querySelector('time');
-        if (oldTime) oldTime.textContent = timeText(nowIso());
-      }
-      scrollChat(true);
-    } catch (err) {
-      typer.abort();
-      if (info.caret) info.caret.remove();
-      if (info.dots) info.dots.remove();
-      var message = friendlyError(err);
-      showError('AI 对话失败：' + message, function () {
-        hideError();
-        sendChatContent(content, { retry: true });
+  }
+
+  function genericCardHtml(block) {
+    return '<article class="card"><header class="card-head"><span class="card-icon tone-slate">' + icon('layers') + '</span>'
+      + '<div class="card-title"><span class="card-kicker">AI BLOCK</span><h3>' + esc(block.title || block.type || 'AI 内容') + '</h3></div></header>'
+      + '<div class="card-body"><p class="wb-empty">收到一条暂不支持展示的内容。</p></div></article>';
+  }
+
+  /* ---------------------------------------------------------- 画像卡 */
+  function profileCardHtml(profile) {
+    if (!profile) return '';
+    var pct = profile.completeness === null ? null : Math.round(profile.completeness * 100);
+    var summary = profile.summary || buildProfileSummary(profile);
+    var itemsHtml = profile.items.length
+      ? '<div class="profile-items">' + profile.items.map(function (item) {
+        return '<div class="profile-item"><span class="profile-item-label">' + esc(item.label) + '</span><span class="profile-item-value">' + esc(item.value) + '</span></div>';
+      }).join('') + '</div>'
+      : '<p class="wb-empty">AI 还在了解你的情况，继续聊聊吧。</p>';
+    var missingHtml = profile.missing.length
+      ? '<p class="missing-line">还差：<b>' + profile.missing.map(function (item) { return esc(item); }).join('、') + '</b></p>'
+      : '';
+    var progressHtml = pct === null ? '' : '<div class="completeness"><div class="completeness-head"><span>资料完整度</span><b>' + pct + '%</b></div>'
+      + '<div class="progress-line"><i style="width:' + pct + '%"></i></div>' + missingHtml + '</div>';
+    return '<article class="card card-profile">'
+      + '<header class="card-head"><span class="card-icon tone-cyan">' + icon('user') + '</span>'
+      + '<div class="card-title"><span class="card-kicker">INVESTOR PROFILE</span><h3>你的投资画像</h3></div>'
+      + '<span class="status-pill ' + (profile.confirmed ? 'is-ok' : 'is-warn') + '">' + (profile.confirmed ? '已确认' : '待确认') + '</span></header>'
+      + '<div class="card-body">'
+      + (summary ? '<p class="card-summary">' + esc(summary) + '</p>' : '')
+      + itemsHtml + progressHtml
+      + '</div></article>';
+  }
+
+  /* ---------------------------------------------------------- 选股卡 */
+  function metricCardsHtml(selection) {
+    var keys = METRIC_ORDER.filter(function (key) { return num(selection.metrics[key]) !== null; });
+    if (!keys.length) {
+      keys = Object.keys(selection.metrics).filter(function (key) { return num(selection.metrics[key]) !== null; }).slice(0, 5);
+    }
+    if (!keys.length) return '';
+    return '<div class="metric-grid">' + keys.map(function (key) {
+      var meta = metricMeta(key);
+      var note = selection.metric_notes && selection.metric_notes[key] ? String(selection.metric_notes[key]) : meta.note;
+      return '<div class="metric-card tone-' + meta.tone + '">'
+        + '<span class="metric-label">' + esc(meta.label) + '</span>'
+        + '<span class="metric-value">' + esc(formatMetric(key, selection.metrics[key])) + '</span>'
+        + (note ? '<span class="metric-note">' + esc(note) + '</span>' : '')
+        + '</div>';
+    }).join('') + '</div>';
+  }
+
+  function stockRowsHtml(top) {
+    return top.map(function (stock, index) {
+      var reasons = Array.isArray(stock.reasons) ? stock.reasons.filter(function (reason) { return reason; }) : [];
+      var reasonHtml = reasons.length
+        ? '<div class="reason-chips">' + reasons.slice(0, 3).map(function (reason) {
+          return '<span class="reason-chip">' + esc(reason) + '</span>';
+        }).join('') + '</div>'
+        : '—';
+      return '<tr>'
+        + '<td class="stock-rank">' + (index + 1) + '</td>'
+        + '<td class="stock-code">' + esc(stock.code || '—') + '</td>'
+        + '<td class="industry-tag">' + esc(stock.industry || '—') + '</td>'
+        + '<td class="stock-score">' + (num(stock.score) === null ? '—' : fmtNum(stock.score, 2)) + '</td>'
+        + '<td>' + reasonHtml + '</td>'
+        + '</tr>';
+    }).join('');
+  }
+
+  function factorItems(selection) {
+    if (Array.isArray(selection.factor_contributions) && selection.factor_contributions.length) {
+      return selection.factor_contributions.map(function (item) {
+        if (!item || typeof item !== 'object') return null;
+        var value = num(item.value !== undefined ? item.value : item.current);
+        if (value === null) return null;
+        var name = item.name ? String(item.name) : '';
+        var fullLabel = item.label ? String(item.label) : '';
+        return {
+          key: name,
+          label: FACTOR_SHORT[name] || fullLabel || name || '因子',
+          title: fullLabel || FACTOR_LABELS[name] || name,
+          current: value
+        };
+      }).filter(Boolean).slice(0, 10);
+    }
+    var sources = [];
+    selection.top.forEach(function (stock) {
+      if (stock && stock.contributions && typeof stock.contributions === 'object') sources.push(stock.contributions);
+    });
+    if (!sources.length) {
+      selection.top.forEach(function (stock) {
+        if (stock && stock.factors && typeof stock.factors === 'object') sources.push(stock.factors);
       });
-    } finally {
-      setChatBusy(false);
+    }
+    if (!sources.length) return [];
+    var sums = {};
+    var counts = {};
+    sources.forEach(function (source) {
+      Object.keys(source).forEach(function (key) {
+        var value = num(source[key]);
+        if (value === null) return;
+        sums[key] = (sums[key] || 0) + value;
+        counts[key] = (counts[key] || 0) + 1;
+      });
+    });
+    return Object.keys(sums).map(function (key) {
+      return {
+        key: key,
+        label: FACTOR_SHORT[key] || FACTOR_LABELS[key] || key,
+        title: FACTOR_LABELS[key] || key,
+        current: sums[key] / counts[key]
+      };
+    }).sort(function (a, b) {
+      return Math.abs(b.current) - Math.abs(a.current);
+    }).slice(0, 10);
+  }
+
+  function portfolioHtml(selection) {
+    var rows = selection.portfolio.map(function (item) {
+      if (!item || !item.code) return null;
+      var weight = num(item.weight_pct);
+      if (weight === null) {
+        var rawWeight = num(item.weight);
+        weight = rawWeight === null ? null : rawWeight * 100;
+      }
+      if (weight === null) return null;
+      return { code: String(item.code), weight: weight };
+    }).filter(Boolean).slice(0, 12);
+    if (!rows.length) return '';
+    var max = Math.max.apply(null, rows.map(function (row) { return row.weight; }).concat([0.0001]));
+    var barRows = rows.map(function (row) {
+      var width = clamp((row.weight / max) * 100, 0, 100);
+      return '<div class="weight-row"><span class="weight-code">' + esc(row.code) + '</span>'
+        + '<span class="weight-track"><i class="weight-fill" style="width:' + width.toFixed(1) + '%"></i></span>'
+        + '<span class="weight-pct">' + fmtNum(row.weight, 1) + '%</span></div>';
+    }).join('');
+    return '<div class="sub-block"><div class="sub-title"><h4>组合权重</h4><span class="sub-meta">共 ' + selection.portfolio.length + ' 只</span></div>'
+      + '<div class="weight-list">' + barRows + '</div></div>';
+  }
+
+  function buildNavData(selection) {
+    var nav = (selection.nav || []).filter(function (point) {
+      return point && point.date !== undefined && num(point.value) !== null;
+    });
+    if (nav.length < 2) return null;
+    var labels = nav.map(function (point) { return String(point.date); });
+    var series = [{
+      name: '策略净值',
+      values: nav.map(function (point) { return num(point.value); }),
+      color: '#22D3EE'
+    }];
+    var benchmark = (selection.benchmark_nav || []).filter(function (point) {
+      return point && point.date !== undefined && num(point.value) !== null;
+    });
+    if (benchmark.length) {
+      var byDate = {};
+      benchmark.forEach(function (point) { byDate[String(point.date)] = num(point.value); });
+      var byDateValues = labels.map(function (label) {
+        return byDate[label] !== undefined ? byDate[label] : null;
+      });
+      if (byDateValues.some(function (value) { return value !== null; })) {
+        series.push({ name: '基准', values: byDateValues, color: '#7C93AD', dashed: true });
+      } else if (benchmark.length >= nav.length) {
+        series.push({
+          name: '基准',
+          values: benchmark.slice(0, nav.length).map(function (point) { return num(point.value); }),
+          color: '#7C93AD',
+          dashed: true
+        });
+      }
+    }
+    return { labels: labels, series: series };
+  }
+
+  function selectionCardHtml(selection) {
+    if (!selection) return '';
+    var meta = [];
+    meta.push('<span class="meta-tag is-cyan">' + icon('clock') + (selection.as_of ? esc(selection.as_of) : '最新数据') + '</span>');
+    if (selection.model && selection.model.name) {
+      meta.push('<span class="meta-tag">模型 · ' + esc(selection.model.name) + '</span>');
+    }
+    var modelDesc = selection.model && selection.model.description
+      ? '<p class="card-summary">' + esc(selection.model.description) + '</p>'
+      : '';
+    var metricsHtml = metricCardsHtml(selection);
+    var shownTop = selection.top.slice(0, 12);
+    var tableHtml = shownTop.length
+      ? '<div class="sub-block"><div class="sub-title"><h4>Top 精选股票</h4><span class="sub-meta">'
+        + (selection.top.length > shownTop.length ? '展示前 ' + shownTop.length + ' 只 / 共 ' + selection.top.length + ' 只' : '按综合得分排序')
+        + '</span></div><div class="table-scroll"><table class="stock-table"><thead><tr><th>#</th><th>代码</th><th>行业</th><th>综合得分</th><th>推荐理由</th></tr></thead>'
+        + '<tbody>' + stockRowsHtml(shownTop) + '</tbody></table></div></div>'
+      : '';
+    var factors = factorItems(selection);
+    var factorsHtml = factors.length
+      ? '<div class="sub-block"><div class="sub-title"><h4>因子贡献</h4><span class="sub-meta">组合平均暴露</span></div>'
+        + '<div class="chart-box" data-chart="factors"></div>'
+        + '<p class="chart-note">条越长表示组合在这个因子上越占优（已完成行业中性化）。</p></div>'
+      : '';
+    var weightsHtml = portfolioHtml(selection);
+    var navData = buildNavData(selection);
+    var navHtml = navData
+      ? '<div class="sub-block"><div class="sub-title"><h4>策略净值 vs 基准</h4><span class="sub-meta">起点归一为 1.00</span></div>'
+        + '<div class="chart-box" data-chart="nav"></div>'
+        + '<p class="chart-note">青色为策略净值，灰色虚线为基准；回测已计入交易成本与涨跌停约束。</p></div>'
+      : '';
+    var explanationHtml = selection.explanation
+      ? '<div class="ai-note"><span class="ai-note-label">' + icon('spark') + 'AI 解读</span><p>' + esc(selection.explanation) + '</p></div>'
+      : '';
+    var splitHtml = factorsHtml || weightsHtml
+      ? '<div class="selection-split">' + factorsHtml + weightsHtml + '</div>'
+      : '';
+    return '<article class="card card-selection">'
+      + '<header class="card-head"><span class="card-icon tone-cyan">' + icon('target') + '</span>'
+      + '<div class="card-title"><span class="card-kicker">AI SELECTION</span><h3>本次选股结果</h3></div>'
+      + '<span class="status-pill is-run">已完成</span></header>'
+      + '<div class="card-body">'
+      + '<div class="selection-meta-line">' + meta.join('') + '</div>'
+      + modelDesc + metricsHtml + tableHtml + splitHtml + navHtml + explanationHtml
+      + '</div></article>';
+  }
+
+  /* ---------------------------------------------------------- AI 工作过程卡 */
+  function stepHtml(step, index) {
+    var status = step.status === 'done' ? 'done'
+      : step.status === 'running' ? 'running'
+        : step.status === 'error' ? 'error' : 'pending';
+    var iconHtml = status === 'done' ? icon('check')
+      : status === 'running' ? '<i class="spinner"></i>'
+        : status === 'error' ? icon('alert')
+          : '<i class="step-dot"></i>';
+    var kind = step.kind ? (STEP_KIND_LABELS[step.kind] || String(step.kind)) : '';
+    return '<li class="step is-' + status + '">'
+      + '<span class="step-icon">' + iconHtml + '</span>'
+      + '<div class="step-body"><div class="step-title"><span>' + esc(step.title || ('第 ' + (index + 1) + ' 步')) + '</span>'
+      + (kind ? '<span class="step-kind">' + esc(kind) + '</span>' : '') + '</div>'
+      + (step.detail ? '<p class="step-detail">' + esc(step.detail) + '</p>' : '')
+      + '</div></li>';
+  }
+
+  function comparisonItems(comparison) {
+    if (!comparison || typeof comparison !== 'object') return [];
+    var current = comparison.current && typeof comparison.current === 'object' ? comparison.current : {};
+    var candidate = comparison.candidate && typeof comparison.candidate === 'object' ? comparison.candidate : {};
+    var keys = [];
+    METRIC_ORDER.forEach(function (key) {
+      if (num(current[key]) !== null || num(candidate[key]) !== null) keys.push(key);
+    });
+    Object.keys(current).concat(Object.keys(candidate)).forEach(function (key) {
+      if (keys.indexOf(key) !== -1) return;
+      if (num(current[key]) !== null || num(candidate[key]) !== null) keys.push(key);
+    });
+    return keys.map(function (key) {
+      return {
+        key: key,
+        label: metricMeta(key).label,
+        current: num(current[key]),
+        candidate: num(candidate[key])
+      };
+    });
+  }
+
+  function comparisonHtml(comparison) {
+    var items = comparisonItems(comparison);
+    if (!items.length) return '';
+    return '<div class="sub-block"><div class="sub-title"><h4>效果对比</h4><span class="sub-meta">当前 → 候选</span></div>'
+      + '<div class="chart-box" data-chart="compare"></div>'
+      + '<p class="chart-note">灰色为当前模型，青色为候选模型；回撤越接近 0 越好，其余指标越大越好。</p></div>';
+  }
+
+  function proposalHtml(proposal) {
+    if (!proposal || typeof proposal !== 'object') return '';
+    var approachLabels = { model_type: '切换内置模型', weights: '调整因子权重', code: '修改模型代码' };
+    var summary = proposal.summary ? '<p class="proposal-summary">' + esc(proposal.summary) + '</p>' : '';
+    var tags = [];
+    if (proposal.approach) tags.push('<span class="tag is-amber">' + esc(approachLabels[proposal.approach] || proposal.approach) + '</span>');
+    if (proposal.model_name) tags.push('<span class="tag">模型 · ' + esc(proposal.model_name) + '</span>');
+    var diff = proposal.diff
+      ? '<details class="diff"><summary>展开查看代码改动</summary><pre>' + esc(proposal.diff) + '</pre></details>'
+      : '';
+    var risks = Array.isArray(proposal.risks) && proposal.risks.length
+      ? '<div class="risk-list"><h5>需要注意</h5><ul>' + proposal.risks.map(function (risk) {
+        return '<li>' + esc(risk) + '</li>';
+      }).join('') + '</ul></div>'
+      : '';
+    return '<div class="proposal">' + summary
+      + (tags.length ? '<div class="proposal-meta">' + tags.join('') + '</div>' : '')
+      + diff + risks + '</div>';
+  }
+
+  function workCardHtml(block) {
+    var steps = Array.isArray(block.steps) ? block.steps.filter(function (step) {
+      return step && typeof step === 'object';
+    }) : [];
+    var status = block.status === 'done' ? 'done' : block.status === 'error' ? 'error' : 'running';
+    var statusLabel = status === 'done' ? '已完成' : status === 'error' ? '失败' : '运行中';
+    var statusClass = status === 'done' ? 'is-ok' : status === 'error' ? 'is-error' : 'is-run';
+    var statusPill = '<span class="status-pill ' + statusClass + '">'
+      + (status === 'running' ? '<i class="spinner"></i>' : '') + statusLabel + '</span>';
+    var doneCount = steps.filter(function (step) { return step.status === 'done'; }).length;
+    var progressPct = steps.length ? Math.round((doneCount / steps.length) * 100) : 0;
+    var progressHtml = steps.length
+      ? '<div class="step-progress"><div class="progress-line"><i style="width:' + progressPct + '%"></i></div><span>' + doneCount + ' / ' + steps.length + ' 步</span></div>'
+      : '';
+    var stepsHtml = '<ol class="steps">' + steps.map(stepHtml).join('') + '</ol>';
+    return '<article class="card card-work">'
+      + '<header class="card-head"><span class="card-icon tone-amber">' + icon('spark') + '</span>'
+      + '<div class="card-title"><span class="card-kicker">AI WORK LOG</span><h3>' + esc(block.title || 'AI 正在工作') + '</h3></div>'
+      + statusPill + '</header>'
+      + '<div class="card-body">' + progressHtml + stepsHtml
+      + comparisonHtml(block.comparison) + proposalHtml(block.proposal)
+      + '</div></article>';
+  }
+
+  /* ---------------------------------------------------------- 审批卡 */
+  function approvalCardHtml(block) {
+    var actions = Array.isArray(block.actions) ? block.actions : [];
+    var buttons = actions.map(function (action, index) {
+      if (!action || !action.message) return '';
+      return '<button class="btn ' + (index === 0 ? 'btn-primary' : 'btn-ghost') + '" type="button" data-action="quick" data-message="' + esc(action.message) + '">'
+        + esc(action.label || action.message) + '</button>';
+    }).join('');
+    var riskHtml = block.risk
+      ? '<div class="approval-risk">' + icon('shield') + '<span>' + esc(block.risk) + '</span></div>'
+      : '';
+    return '<article class="card card-approval">'
+      + '<header class="card-head"><span class="card-icon tone-amber">' + icon('shield') + '</span>'
+      + '<div class="card-title"><span class="card-kicker">NEEDS YOUR APPROVAL</span><h3>' + esc(block.title || '需要你确认') + '</h3></div>'
+      + '<span class="status-pill is-warn">等待确认</span></header>'
+      + '<div class="card-body">'
+      + (block.summary ? '<p class="card-summary">' + esc(block.summary) + '</p>' : '')
+      + riskHtml
+      + '<div class="approval-actions">' + buttons + '</div>'
+      + '</div></article>';
+  }
+
+  /* ---------------------------------------------------------- 版本卡 */
+  function metricChipsHtml(metrics) {
+    if (!metrics) return '';
+    var chips = [];
+    METRIC_ORDER.forEach(function (key) {
+      var value = num(metrics[key]);
+      if (value === null) return;
+      chips.push('<span class="version-metric">' + metricMeta(key).label + ' ' + formatMetric(key, value) + '</span>');
+    });
+    if (!chips.length) {
+      Object.keys(metrics).slice(0, 4).forEach(function (key) {
+        var value = num(metrics[key]);
+        if (value !== null) chips.push('<span class="version-metric">' + esc(key) + ' ' + fmtNum(value, 2) + '</span>');
+      });
+    }
+    return chips.join('');
+  }
+
+  function versionStatusText(status) {
+    if (status === 'active') return '启用中';
+    if (status === 'candidate') return '候选';
+    if (status === 'archived' || status === 'rolled_back') return '已归档';
+    return status ? String(status) : '未知';
+  }
+
+  function versionStatusClass(status) {
+    if (status === 'active') return 'is-ok';
+    if (status === 'candidate') return 'is-warn';
+    return '';
+  }
+
+  function versionCardHtml(block) {
+    var active = block.active && typeof block.active === 'object' ? block.active : null;
+    var versions = normalizeVersions(block.versions);
+    var activeHtml = '';
+    if (active) {
+      var chips = metricChipsHtml(active.metrics);
+      activeHtml = '<div class="version-active"><div class="version-active-main"><span>当前启用版本</span>'
+        + '<strong>' + esc(active.name || '未命名版本') + '</strong>'
+        + (active.id ? '<code>' + esc(active.id) + '</code>' : '') + '</div>'
+        + (chips ? '<div class="version-metrics">' + chips + '</div>' : '')
+        + '<span class="status-pill is-ok">启用中</span></div>';
+    }
+    var listHtml = versions.length
+      ? '<ul class="version-list">' + versions.map(function (version) {
+        var dotClass = version.status === 'active' ? ' is-active' : version.status === 'candidate' ? ' is-candidate' : '';
+        return '<li class="version-row"><span class="version-dot' + dotClass + '"></span>'
+          + '<span class="version-row-name">' + esc(version.name) + '</span>'
+          + '<span class="status-pill ' + versionStatusClass(version.status) + '">' + esc(versionStatusText(version.status)) + '</span>'
+          + (version.created_at ? '<time>' + esc(shortDate(version.created_at)) + '</time>' : '')
+          + '</li>';
+      }).join('') + '</ul>'
+      : '';
+    return '<article class="card card-version">'
+      + '<header class="card-head"><span class="card-icon tone-green">' + icon('layers') + '</span>'
+      + '<div class="card-title"><span class="card-kicker">MODEL VERSION</span><h3>模型版本已更新</h3></div>'
+      + '<span class="status-pill is-ok">已生效</span></header>'
+      + '<div class="card-body">' + activeHtml + listHtml + '</div></article>';
+  }
+
+  /* ============================== 卡片挂载与图表 ============================== */
+  function upsertCard(block) {
+    if (!block || !block.id || !block.type) return;
+    var turn = state.activeTurn;
+    if (!turn) turn = beginAssistantTurn();
+    var key = String(block.id);
+    var node = state.cardNodes.get(key);
+    if (node && !node.isConnected) node = null;
+    if (node && turn.node && node.closest('.msg') !== turn.node) {
+      turn.cards.appendChild(node);
+      turn.cardCount += 1;
+    }
+    if (!node) {
+      node = document.createElement('div');
+      node.className = 'card-slot';
+      node.setAttribute('data-card-id', key);
+      state.cardNodes.set(key, node);
+      turn.cards.appendChild(node);
+      turn.cardCount += 1;
+    }
+    var html = renderCard(block);
+    if (!html) return;
+    node.innerHTML = html;
+    mountCardCharts(node, block);
+    syncFromBlock(block);
+    if (state.following) scrollToBottom(true);
+  }
+
+  function mountCardCharts(node, block) {
+    if (typeof window.Charts === 'undefined') return;
+    if (block.type === 'selection') {
+      var selection = normalizeSelection(block);
+      if (!selection) return;
+      var navHost = node.querySelector('[data-chart="nav"]');
+      var navData = buildNavData(selection);
+      if (navHost && navData) {
+        window.Charts.line(navHost, navData, {
+          width: 640,
+          height: 250,
+          yFormatter: function (value) { return fmtNum(value, 2); },
+          xFormatter: shortDateLabel,
+          ariaLabel: '策略与基准净值曲线'
+        });
+      }
+      var factorHost = node.querySelector('[data-chart="factors"]');
+      var factors = factorItems(selection);
+      if (factorHost && factors.length) {
+        window.Charts.bar(factorHost, { items: factors }, {
+          width: 620,
+          rowHeight: 27,
+          labelWidth: 68,
+          valueFormatter: function (value) { return fmtNum(value, 2); },
+          ariaLabel: '因子贡献条形图'
+        });
+      }
+    }
+    if (block.type === 'work') {
+      var compareHost = node.querySelector('[data-chart="compare"]');
+      var items = comparisonItems(block.comparison);
+      if (compareHost && items.length) {
+        window.Charts.bar(compareHost, { items: items }, {
+          width: 620,
+          rowHeight: 34,
+          valueFormatter: function (value, item) {
+            return formatMetric(item.key, value);
+          },
+          ariaLabel: '候选与当前模型指标对比'
+        });
+      }
     }
   }
 
-  async function runConversationStream(content, kind, handlers) {
-    if (state.mock) return mockConversationStream(content, kind, handlers);
-    return postMessageSse(content, handlers);
+  function syncFromBlock(block) {
+    switch (block.type) {
+      case 'profile':
+        state.profile = normalizeProfile(block);
+        renderProfileSection();
+        pushActivity('profile-' + block.id, state.profile && state.profile.confirmed ? '已确认你的投资画像' : '更新了你的投资画像', 'done', 'profile');
+        break;
+      case 'selection':
+        state.lastSelection = normalizeSelection(block);
+        renderResultSection();
+        pushActivity('selection-' + block.id,
+          '完成选股' + (state.lastSelection && state.lastSelection.top.length ? ' · Top ' + state.lastSelection.top.length : ''),
+          'done', 'selection');
+        break;
+      case 'work':
+        syncWorkActivity(block);
+        break;
+      case 'approval':
+        pushActivity('approval-' + block.id, '等待你确认：' + (block.title || '待审批方案'), 'waiting', 'wait');
+        break;
+      case 'version': {
+        if (block.active && typeof block.active === 'object') state.activeModel = normalizeModel(block.active);
+        var parsedVersions = normalizeVersions(block.versions);
+        if (parsedVersions.length) state.versions = parsedVersions;
+        renderModelSection();
+        renderChatModelChip();
+        pushActivity('version-' + block.id, '模型版本已更新' + (block.active && block.active.name ? ' · ' + block.active.name : ''), 'done', 'version');
+        break;
+      }
+      default:
+        break;
+    }
   }
 
-  async function postMessageSse(content, handlers) {
-    var response;
+  function syncWorkActivity(block) {
+    var steps = Array.isArray(block.steps) ? block.steps : [];
+    steps.forEach(function (step, index) {
+      if (!step) return;
+      var status = step.status === 'done' ? 'done'
+        : step.status === 'running' ? 'running'
+          : step.status === 'error' ? 'error' : 'pending';
+      var detail = step.detail ? ' · ' + truncate(step.detail, 44) : '';
+      pushActivity('work:' + block.id + ':' + index, (step.title || ('第 ' + (index + 1) + ' 步')) + detail, status, step.kind || 'work');
+    });
+    if (block.status === 'done') {
+      pushActivity('work:' + block.id + ':overall', (block.title || 'AI 工作') + ' · 已完成', 'done', 'check');
+    } else if (block.status === 'error') {
+      pushActivity('work:' + block.id + ':overall', (block.title || 'AI 工作') + ' · 失败', 'error', 'alert');
+    } else if (!steps.some(function (step) { return step && step.status === 'running'; })) {
+      pushActivity('work:' + block.id + ':overall', block.title || 'AI 正在工作', 'running', 'ai');
+    }
+  }
+
+  /* ============================== 工作台 ============================== */
+  function renderAllWorkbench() {
+    renderProfileSection();
+    renderActivitySection();
+    renderModelSection();
+    renderResultSection();
+    renderChatModelChip();
+  }
+
+  function setWorkbenchAlert(message) {
+    if (!dom.wbAlert) return;
+    if (!message) {
+      dom.wbAlert.hidden = true;
+      dom.wbAlert.textContent = '';
+      return;
+    }
+    dom.wbAlert.hidden = false;
+    dom.wbAlert.textContent = message;
+  }
+
+  function renderProfileSection() {
+    var profile = state.profile;
+    var head = '<header class="wb-head"><span class="wb-kicker">PROFILE</span><h2>当前画像</h2>'
+      + '<span class="status-pill ' + (profile && profile.confirmed ? 'is-ok' : 'is-warn') + '">'
+      + (profile ? (profile.confirmed ? '已确认' : '完善中') : '未开始') + '</span></header>';
+    if (!profile || (!profile.items.length && !profile.summary)) {
+      dom.profile.innerHTML = head + '<p class="wb-empty">从左侧聊天开始，AI 会逐步了解你的投资目标、期限和风险承受力。</p>';
+      return;
+    }
+    var pct = profile.completeness === null ? 0 : Math.round(profile.completeness * 100);
+    var summary = profile.summary || buildProfileSummary(profile);
+    var items = profile.items.slice(0, 6).map(function (item) {
+      return '<li class="wb-item"><span>' + esc(item.label) + '</span><b>' + esc(item.value) + '</b></li>';
+    }).join('');
+    dom.profile.innerHTML = head
+      + '<div class="wb-profile-top"><div class="wb-ring" data-chart="ring"></div>'
+      + '<div class="wb-profile-copy"><span class="wb-confirmed' + (profile.confirmed ? '' : ' is-pending') + '">'
+      + (profile.confirmed ? '已确认，可用于选股' : '等待你确认') + '</span>'
+      + '<p class="wb-summary">' + esc(summary) + '</p></div></div>'
+      + (items ? '<ul class="wb-items">' + items + '</ul>' : '');
+    var ring = dom.profile.querySelector('[data-chart="ring"]');
+    if (ring && typeof window.Charts !== 'undefined') {
+      window.Charts.gauge(ring, { value: pct, max: 100, label: '完整度' }, { size: 66, thickness: 5, ariaLabel: '画像完整度' });
+    }
+  }
+
+  function activityIcon(kind, status) {
+    if (status === 'running') return '<i class="spinner"></i>';
+    if (status === 'done') return icon('check');
+    if (status === 'error') return icon('alert');
+    if (status === 'waiting') return icon('shield');
+    return icon(ACTIVITY_ICONS[kind] || 'spark');
+  }
+
+  function renderActivitySection() {
+    var head = '<header class="wb-head"><span class="wb-kicker">ACTIVITY</span><h2>AI 活动时间线</h2></header>';
+    if (!state.activity.length) {
+      dom.activity.innerHTML = head + '<p class="wb-empty">AI 的每一步动作都会实时显示在这里。</p>';
+      return;
+    }
+    var rows = state.activity.map(function (item) {
+      return '<li class="act is-' + esc(item.status) + '"><span class="act-icon">' + activityIcon(item.kind, item.status) + '</span>'
+        + '<div class="act-body"><p class="act-text">' + esc(item.text) + '</p><time class="act-time">' + esc(item.time) + '</time></div></li>';
+    }).join('');
+    dom.activity.innerHTML = head + '<ul class="activity-list">' + rows + '</ul>';
+  }
+
+  function pushActivity(key, text, status, kind) {
+    var existing = null;
+    for (var i = 0; i < state.activity.length; i += 1) {
+      if (state.activity[i].key === key) {
+        existing = state.activity[i];
+        break;
+      }
+    }
+    if (existing) {
+      existing.text = text;
+      existing.status = status;
+      existing.kind = kind || existing.kind;
+      existing.time = nowClock();
+    } else {
+      state.activity.unshift({
+        key: key,
+        text: text,
+        status: status,
+        kind: kind || 'ai',
+        time: nowClock()
+      });
+      if (state.activity.length > MAX_ACTIVITY) state.activity.length = MAX_ACTIVITY;
+    }
+    renderActivitySection();
+  }
+
+  function renderModelSection() {
+    var head = '<header class="wb-head"><span class="wb-kicker">MODEL</span><h2>当前模型与版本</h2></header>';
+    var html = head;
+    var model = state.activeModel;
+    if (model) {
+      var chips = metricChipsHtml(model.metrics);
+      html += '<div class="wb-model-top"><strong>' + esc(model.name) + '</strong><span class="status-pill is-ok">启用中</span></div>'
+        + (model.description ? '<p class="wb-model-desc">' + esc(model.description) + '</p>' : '')
+        + (chips ? '<div class="wb-chips">' + chips + '</div>' : '');
+    } else {
+      html += '<p class="wb-empty">还没有启用的自定义模型。跟 AI 说「帮我优化模型」，它会先给你方案，再等你确认。</p>';
+    }
+    var versions = state.versions.slice(0, 6);
+    if (versions.length) {
+      html += '<ul class="wb-version-list">' + versions.map(function (version) {
+        var dotClass = version.status === 'active' ? ' is-active' : version.status === 'candidate' ? ' is-candidate' : '';
+        return '<li class="wb-version"><span class="version-dot' + dotClass + '"></span>'
+          + '<span class="wb-version-name">' + esc(version.name) + '</span>'
+          + '<span class="status-pill ' + versionStatusClass(version.status) + '">' + esc(versionStatusText(version.status)) + '</span>'
+          + (version.created_at ? '<time>' + esc(shortDate(version.created_at)) + '</time>' : '')
+          + '</li>';
+      }).join('') + '</ul>';
+    }
+    if (state.pendingProposal) {
+      html += '<div class="wb-pending"><strong>有一个待确认的改进方案</strong><br>AI 会在聊天里等你确认，不会自动启用。'
+        + '<br><button class="btn btn-sm" type="button" data-action="quick" data-message="展开说说待审批方案的细节">展开说说方案</button></div>';
+    }
+    dom.model.innerHTML = html;
+  }
+
+  function renderResultSection() {
+    var head = '<header class="wb-head"><span class="wb-kicker">LAST SELECTION</span><h2>最近选股结果</h2></header>';
+    var selection = state.lastSelection;
+    if (!selection || (!selection.top.length && !selection.hasMetrics)) {
+      dom.result.innerHTML = head + '<p class="wb-empty">完成一次选股后，这里会显示最近的结果摘要和净值曲线。</p>';
+      return;
+    }
+    var meta = '<div class="wb-result-meta"><span>' + esc(selection.as_of || '最新数据') + '</span>'
+      + '<span>' + esc(selection.model && selection.model.name ? selection.model.name : 'AI 选股模型') + '</span></div>';
+    var chips = '<div class="wb-chips">' + ['cagr', 'sharpe', 'mdd'].map(function (key) {
+      var value = num(selection.metrics[key]);
+      return value === null ? '' : '<span class="version-metric">' + metricMeta(key).label + ' ' + formatMetric(key, value) + '</span>';
+    }).join('') + '</div>';
+    var stocks = selection.top.slice(0, 5).map(function (stock) {
+      var score = num(stock.score);
+      return '<span class="wb-stock-chip">' + esc(stock.code || '—') + (score === null ? '' : '<b>' + fmtNum(score, 2) + '</b>') + '</span>';
+    }).join('');
+    var navData = buildNavData(selection);
+    dom.result.innerHTML = head + meta + chips
+      + (stocks ? '<div class="wb-stock-chips">' + stocks + '</div>' : '')
+      + (navData ? '<div class="wb-mini-chart" data-chart="wb-nav"></div>' : '');
+    var navHost = dom.result.querySelector('[data-chart="wb-nav"]');
+    if (navHost && navData && typeof window.Charts !== 'undefined') {
+      window.Charts.line(navHost, navData, {
+        width: 340,
+        height: 118,
+        yFormatter: function (value) { return fmtNum(value, 2); },
+        xFormatter: shortDateLabel,
+        showEnds: false,
+        ariaLabel: '最近选股净值曲线'
+      });
+    }
+  }
+
+  function renderChatModelChip() {
+    if (!dom.chatModelChip) return;
+    dom.chatModelChip.textContent = state.activeModel && state.activeModel.name
+      ? '模型 · ' + state.activeModel.name
+      : 'AI · 助手';
+  }
+
+  function updateSessionChip() {
+    if (!dom.sessionChip) return;
+    dom.sessionChip.textContent = state.sessionId ? '会话 ' + shortId(state.sessionId) : '会话 —';
+    dom.sessionChip.title = state.sessionId ? '会话 ID：' + state.sessionId : '浏览器本地会话';
+  }
+
+  /* ============================== SSE 发送与解析 ============================== */
+  function updateComposerState() {
+    dom.sendBtn.disabled = state.streaming;
+    dom.input.placeholder = state.streaming
+      ? 'AI 正在回复，稍等片刻…'
+      : '说说你的投资想法，例如：我想稳健一点，能接受 10% 左右回撤……';
+  }
+
+  async function sendMessage(rawContent) {
+    var content = String(rawContent === null || rawContent === undefined ? '' : rawContent).trim();
+    if (!content) {
+      dom.input.focus();
+      return;
+    }
+    if (state.streaming) {
+      dom.input.focus();
+      return;
+    }
+    if (!state.sessionId) {
+      appendSystemError('会话未就绪', '还没有建立会话，请点击重新连接。', 'retry-init');
+      return;
+    }
+    state.streaming = true;
+    updateComposerState();
+    dom.input.value = '';
+    resizeInput();
+    state.following = true;
+    appendTextMessage('user', content, null);
+    state.lastUserMessage = content;
+    var turn = beginAssistantTurn();
+    pushActivity('turn', 'AI 正在处理你的请求…', 'running', 'ai');
+    var failed = false;
     try {
-      response = await fetch(API_BASE + sessionPath('/messages'), {
+      var response = await fetch('/api/sessions/' + encodeURIComponent(state.sessionId) + '/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify({ content: content })
       });
-    } catch (err) {
-      throw new AppError('无法连接后端服务，请确认服务已启动。', 0);
+      if (!response.ok) {
+        var detail = await readErrorDetail(response);
+        throw new Error(detail || '对话请求失败（HTTP ' + response.status + '）');
+      }
+      if (!response.body) throw new Error('当前浏览器不支持流式响应');
+      await readEventStream(response.body, turn, function (payload) {
+        failed = true;
+        showTurnError(turn, 'AI 执行出错', payload && payload.message ? String(payload.message) : '处理失败，请重试。', payload && payload.retryable !== false);
+      });
+      if (!failed && !turn.text && turn.cardCount === 0) {
+        failed = true;
+        showTurnError(turn, '没有收到回复', 'AI 没有返回内容，请重试。', true);
+      }
+    } catch (error) {
+      failed = true;
+      showTurnError(turn, '网络异常', error && error.message ? error.message : '请检查后端服务后重试。', true);
+    } finally {
+      finalizeTurn(turn);
+      state.streaming = false;
+      updateComposerState();
+      pushActivity('turn', failed ? '本次处理未完成' : '已完成回复', failed ? 'error' : 'done', failed ? 'alert' : 'check');
+      checkHealth();
+      dom.input.focus();
     }
-    if (!response.ok) {
-      var rawError = await response.text();
-      var payload = null;
-      try { payload = JSON.parse(rawError); } catch (err) { payload = rawError; }
-      throw new AppError(extractApiError(payload, response.status), response.status);
-    }
-    if (!response.body) throw new AppError('浏览器不支持流式响应。', 0);
+  }
 
-    var reader = response.body.getReader();
+  async function readErrorDetail(response) {
+    try {
+      var text = await response.text();
+      if (!text) return '';
+      try {
+        var data = JSON.parse(text);
+        var detail = data.detail || data.message || data.error;
+        if (detail) return String(detail);
+        return text.slice(0, 300);
+      } catch (err) {
+        return text.slice(0, 300);
+      }
+    } catch (err) {
+      return '';
+    }
+  }
+
+  async function readEventStream(body, turn, onErrorEvent) {
+    var reader = body.getReader();
     var decoder = new TextDecoder('utf-8');
     var buffer = '';
-    var eventCount = 0;
-    var parseBlock = function (block) {
-      if (!block || !block.trim()) return;
-      var lines = block.split('\n');
-      var eventName = 'message';
-      var dataLines = [];
-      lines.forEach(function (line) {
-        if (!line || line.charAt(0) === ':') return;
-        var colon = line.indexOf(':');
-        var field = colon === -1 ? line : line.slice(0, colon);
-        var value = colon === -1 ? '' : line.slice(colon + 1).replace(/^ /, '');
-        if (field === 'event') eventName = value || 'message';
-        if (field === 'data') dataLines.push(value);
-      });
-      if (!dataLines.length) return;
-      var dataText = dataLines.join('\n');
-      var payload = dataText;
-      try { payload = JSON.parse(dataText); } catch (err) { payload = dataText; }
-      eventCount += 1;
-      if (eventName === 'token') {
-        // 不用 firstText：token 可能是纯空格或换行，需要原样拼入。
-        var token = '';
-        if (typeof payload === 'string') token = payload;
-        else if (payload && typeof payload === 'object') {
-          var tokenKeys = ['text', 'token', 'delta', 'content'];
-          for (var t = 0; t < tokenKeys.length; t += 1) {
-            if (typeof payload[tokenKeys[t]] === 'string') { token = payload[tokenKeys[t]]; break; }
-          }
-        }
-        if (token && handlers.onToken) handlers.onToken(token);
-      } else if (eventName === 'slots') {
-        var slots = payload && payload.slots ? payload.slots : payload;
-        if (handlers.onSlots) handlers.onSlots(slots);
-      } else if (eventName === 'profile_ready') {
-        var profile = payload && payload.profile ? payload.profile : payload;
-        if (handlers.onProfileReady) handlers.onProfileReady(profile);
-      } else if (eventName === 'error') {
-        var message = extractApiError(payload, 0);
-        var error = new AppError(message || 'AI 对话流返回错误。', 0);
-        error.fromSse = true;
-        throw error;
-      }
-    };
-
     try {
-      while (true) {
-        var read = await reader.read();
-        if (read.done) break;
-        buffer += decoder.decode(read.value, { stream: true });
-        buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        var boundary = buffer.indexOf('\n\n');
-        while (boundary >= 0) {
-          parseBlock(buffer.slice(0, boundary));
-          buffer = buffer.slice(boundary + 2);
-          boundary = buffer.indexOf('\n\n');
+      for (;;) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var boundary = buffer.match(/\r?\n\r?\n/);
+        while (boundary) {
+          var raw = buffer.slice(0, boundary.index);
+          buffer = buffer.slice(boundary.index + boundary[0].length);
+          handleEventBlock(raw, turn, onErrorEvent);
+          boundary = buffer.match(/\r?\n\r?\n/);
         }
       }
       buffer += decoder.decode();
-      buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      if (buffer.trim()) parseBlock(buffer);
-      if (!eventCount) throw new AppError('AI 返回了空响应，请重试。', 0);
+      if (buffer.trim()) handleEventBlock(buffer, turn, onErrorEvent);
     } finally {
-      try { reader.releaseLock(); } catch (err) { /* ignore */ }
-    }
-  }
-
-  /* ------------------------------------------------------------------ 画像 */
-  function renderProfile() {
-    var slotsBox = $('profile-slots');
-    if (!slotsBox) return;
-    var slots = state.profile.slots || {};
-    var filledRequired = REQUIRED_SLOTS.filter(function (key) { return !!slots[key]; }).length;
-    var progress = $('profile-progress-bar');
-    if (progress) progress.style.width = String((filledRequired / REQUIRED_SLOTS.length) * 100) + '%';
-    setText($('profile-required-count'), filledRequired + ' / ' + REQUIRED_SLOTS.length);
-
-    slotsBox.innerHTML = '';
-    SLOT_DEFS.forEach(function (def) {
-      var raw = slots[def.key];
-      var value = raw ? (def.formatter ? def.formatter(raw) : String(raw)) : '未填写';
-      var row = document.createElement('div');
-      row.className = 'slot-item' + (raw ? ' is-filled' : '');
-      var dot = document.createElement('span');
-      dot.className = 'slot-dot';
-      var label = document.createElement('div');
-      label.className = 'slot-label';
-      label.textContent = def.label;
-      if (def.required) {
-        var required = document.createElement('em');
-        required.textContent = '必填';
-        label.appendChild(required);
-      }
-      var valueNode = document.createElement('div');
-      valueNode.className = 'slot-value' + (raw ? '' : ' is-empty');
-      valueNode.textContent = value;
-      row.appendChild(dot);
-      row.appendChild(label);
-      row.appendChild(valueNode);
-      slotsBox.appendChild(row);
-    });
-
-    var status = $('profile-status');
-    var confirm = $('profile-confirm');
-    var start = $('start-selection');
-    var hint = $('profile-hint');
-    var startHint = $('selection-start-hint');
-    var confirmed = state.profile.confirmed;
-    var complete = state.profile.complete;
-    if (status) {
-      status.classList.remove('confirmed', 'ready');
-      if (confirmed) {
-        status.textContent = '已确认';
-        status.classList.add('confirmed');
-      } else if (complete) {
-        status.textContent = '待确认';
-        status.classList.add('ready');
-      } else {
-        status.textContent = '待补全';
+      try {
+        reader.releaseLock();
+      } catch (err) {
+        /* 忽略释放异常 */
       }
     }
-    if (confirm) {
-      confirm.disabled = state.profileBusy || !complete || confirmed;
-      confirm.textContent = confirmed ? '已确认' : (state.profileBusy ? '保存中…' : '确认画像');
-    }
-    if (start) {
-      start.disabled = state.profileBusy || !complete || !confirmed || !state.booted || state.selection.status === 'running' || state.selection.status === 'starting';
-      var span = start.querySelector('.btn-label');
-      if (span) span.textContent = state.selection.status === 'running' ? '选股进行中…' : '开始选股';
-    }
-    if (hint) {
-      if (confirmed) hint.textContent = '画像已确认，可开始 10 因子选股；也可以在「AI 解读」中继续追问。';
-      else if (complete) hint.textContent = '核心槽位已完整，请确认后启用选股。';
-      else hint.textContent = '补全风险偏好、投资期限、回撤容忍后可确认。';
-    }
-    if (startHint) {
-      if (!state.booted) startHint.textContent = '会话初始化中';
-      else if (!complete) startHint.textContent = '等待补全核心槽位';
-      else if (!confirmed) startHint.textContent = '等待画像确认';
-      else if (state.selection.status === 'running' || state.selection.status === 'starting') startHint.textContent = '选股任务进行中';
-      else startHint.textContent = '画像已确认，可选股';
-    }
-    if ($('profile-save')) $('profile-save').disabled = state.profileBusy;
-    if ($('profile-cancel')) $('profile-cancel').disabled = state.profileBusy;
-    if ($('profile-edit')) $('profile-edit').disabled = state.profileBusy;
-    var editor = $('profile-editor');
-    if (editor) {
-      editor.hidden = !state.profileEditing;
-    }
   }
 
-  function openProfileEditor() {
-    if (state.profileBusy) return;
-    var slots = state.profile.slots || {};
-    SLOT_KEYS.forEach(function (key) {
-      var input = $('slot-' + key);
-      if (input) input.value = slots[key] || '';
+  function handleEventBlock(raw, turn, onErrorEvent) {
+    var eventName = 'message';
+    var dataLines = [];
+    String(raw === null || raw === undefined ? '' : raw).split(/\r?\n/).forEach(function (line) {
+      if (!line || line.charAt(0) === ':') return;
+      var colon = line.indexOf(':');
+      var field = colon === -1 ? line : line.slice(0, colon);
+      var value = colon === -1 ? '' : line.slice(colon + 1);
+      if (value.charAt(0) === ' ') value = value.slice(1);
+      if (field === 'event') eventName = value;
+      else if (field === 'data') dataLines.push(value);
     });
-    state.profileEditing = true;
-    renderProfile();
-    var first = $('slot-risk_level');
-    if (first && typeof first.focus === 'function') first.focus();
-  }
-
-  function closeProfileEditor() {
-    state.profileEditing = false;
-    renderProfile();
-  }
-
-  function collectEditorSlots() {
-    var slots = {};
-    SLOT_KEYS.forEach(function (key) {
-      var input = $('slot-' + key);
-      var value = input && input.value ? input.value.trim() : '';
-      if (value) slots[key] = value;
-    });
-    return slots;
-  }
-
-  async function persistProfile(slots, confirmed) {
-    if (state.profileBusy) return;
-    if (!state.sessionId) {
-      showError('会话尚未就绪，请稍后重试。', function () { hideError(); bootLive(); });
-      return;
-    }
-    if (!completeFromSlots(slots)) {
-      showToast('请先补全风险偏好、投资期限和回撤容忍。');
-      return;
-    }
-    state.profileBusy = true;
-    renderProfile();
-    hideError();
+    if (!dataLines.length) return;
+    var payload;
     try {
-      var payload;
-      if (state.mock) {
-        await sleep(320);
-        payload = normalizeProfile({ slots: slots, confirmed: confirmed, complete: true, risk_level: slots.risk_level });
-      } else {
-        payload = await request(sessionPath('/profile'), {
-          method: 'PUT',
-          body: { slots: slots, confirmed: confirmed }
-        });
-      }
-      state.profile = normalizeProfile(payload);
-      state.profileEditing = false;
-      renderProfile();
-      if (state.profile.confirmed) showToast('画像已确认，可以开始选股了。');
-      else showToast('画像已保存，尚待确认。');
+      payload = JSON.parse(dataLines.join('\n'));
     } catch (err) {
-      showError('画像保存失败：' + friendlyError(err), function () { hideError(); persistProfile(slots, confirmed); });
-    } finally {
-      state.profileBusy = false;
-      renderProfile();
-    }
-  }
-
-  function handleConfirmProfile() {
-    if (state.profileBusy) return;
-    if (!state.profile.complete) {
-      openProfileEditor();
-      showToast('请先补全核心画像槽位。');
       return;
     }
-    persistProfile(state.profile.slots, true);
-  }
-
-  function handleSaveProfile() {
-    var slots = collectEditorSlots();
-    var missing = REQUIRED_SLOTS.filter(function (key) { return !slots[key]; });
-    if (missing.length) {
-      showToast('请补全：' + missing.map(function (key) { return (SLOT_DEFS.find(function (item) { return item.key === key; }) || {}).label || key; }).join('、'));
-      return;
-    }
-    persistProfile(slots, true);
-  }
-
-  /* ---------------------------------------------------------------- 选股结果 */
-  function renderSelectionView() {
-    var selection = state.selection;
-    var running = selection.status === 'starting' || selection.status === 'running';
-    var hasResult = selection.status === 'complete' && !!selection.result;
-    var runButton = $('run-selection');
-    var emptyButton = $('selection-empty-run');
-    var select = $('selection-top-n');
-    setHidden($('selection-progress'), !running);
-    setHidden($('selection-skeleton'), !running);
-    setHidden($('selection-content'), !hasResult);
-    setHidden($('selection-empty'), running || hasResult);
-    if (runButton) {
-      runButton.disabled = running || !state.booted || !state.profile.confirmed;
-      var runSpan = runButton.querySelector('span');
-      if (runSpan) runSpan.textContent = running ? '选股中…' : (hasResult ? '重新选股' : '开始选股');
-    }
-    if (emptyButton) {
-      emptyButton.disabled = running || !state.booted || !state.profile.confirmed;
-      var emptySpan = emptyButton.querySelector('span');
-      if (emptySpan) emptySpan.textContent = selection.status === 'error' ? '重试选股' : '开始选股';
-    }
-    if (select) select.disabled = running;
-    if (running) {
-      var stage = selection.stage || (selection.status === 'starting' ? '任务创建中' : '因子计算');
-      var message = selection.message || (selection.status === 'starting' ? '正在提交选股请求…' : '正在执行 10 因子评分与回测…');
-      var percent = clamp(Number(selection.progress) || 0, 0, 100);
-      setText($('selection-stage'), mapStage(stage));
-      setText($('selection-progress-message'), message);
-      setText($('selection-progress-percent'), Math.round(percent) + '%');
-      var fill = $('selection-progress-fill');
-      if (fill) fill.style.width = percent + '%';
-    }
-    if (!hasResult) {
-      renderSelectionEmptyState();
-      return;
-    }
-    renderSelectionData(selection.result);
-  }
-
-  function mapStage(stage) {
-    var map = {
-      loading_data: '读取行情数据',
-      data: '读取行情数据',
-      scoring: '因子评分',
-      score: '因子评分',
-      portfolio: '构建组合',
-      construction: '构建组合',
-      backtest: '历史回测',
-      started: '任务已启动',
-      running: '运行中'
-    };
-    return map[stage] || stage || '运行中';
-  }
-
-  function renderSelectionEmptyState() {
-    var selection = state.selection;
-    var title = $('selection-empty-title');
-    var text = $('selection-empty-text');
-    var actions = $('selection-go-chat');
-    var runButton = $('selection-empty-run');
-    if (selection.status === 'error') {
-      setText(title, '本次选股未完成');
-      setText(text, selection.error || '选股任务执行失败，请重试。当前页面不会展示任何模拟或降级结果。');
-      if (actions) actions.hidden = false;
-      if (runButton) runButton.hidden = false;
-      return;
-    }
-    if (!state.booted) {
-      setText(title, '正在初始化选股服务');
-      setText(text, '正在连接后端并恢复会话状态，请稍候。');
-      return;
-    }
-    if (!state.profile.confirmed) {
-      setText(title, '先确认投资画像');
-      setText(text, state.profile.complete ? '画像核心槽位已完整，请在对话页确认画像后再启动选股。' : '补全风险偏好、投资期限与回撤容忍，AI 才能按画像适配因子权重。');
-      if (actions) actions.hidden = false;
-      if (runButton) runButton.hidden = true;
-      return;
-    }
-    setText(title, '尚未生成选股结果');
-    setText(text, '投资画像已确认。点击开始选股，系统将执行 10 因子行业中性化打分、组合构建与 A 股规则回测。');
-    if (actions) actions.hidden = true;
-    if (runButton) {
-      runButton.hidden = false;
-      runButton.disabled = false;
+    if (!payload || typeof payload !== 'object') payload = { value: payload };
+    switch (eventName) {
+      case 'token':
+        appendToken(turn, typeof payload.text === 'string' ? payload.text : '');
+        break;
+      case 'ui':
+        if (payload.block && typeof payload.block === 'object') upsertCard(payload.block);
+        break;
+      case 'done':
+        if (payload.message_id) state.lastMessageId = payload.message_id;
+        if (state.activeTurn === turn) state.activeTurn = null;
+        break;
+      case 'error':
+        if (typeof onErrorEvent === 'function') onErrorEvent(payload);
+        break;
+      default:
+        break;
     }
   }
 
-  function renderSelectionData(result) {
-    var metrics = result.metrics || {};
-    setText($('selection-asof'), '数据截至 ' + (result.as_of || '—'));
-    setText($('selection-meta'), 'A 股多因子 · 行业中性化 · ' + methodLabel(result.method) + ' · ' + (result.top && result.top.length || 0) + ' 只');
-    setText($('selection-count'), 'Top ' + (result.top_n || result.top && result.top.length || 0));
-    renderSelectionMetrics(metrics);
-    renderSelectionTable(result.top || [], result.portfolio || []);
-    renderSelectionFactorChart(result.top || []);
-    renderPortfolio(result.portfolio || [], result.top || [], result.method);
-    renderSelectionNav(result.nav, result.benchmark_name);
-  }
+  /* ============================== 初始化 ============================== */
+  async function bootstrap() {
+    clearChat();
+    dom.stream.innerHTML = '<div class="chat-loading"><span class="spinner"></span>正在连接 AI 助手…</div>';
+    setHealth('loading', '连接中', '正在检查后端服务');
+    await checkHealth();
 
-  function renderSelectionMetrics(metrics) {
-    var box = $('selection-metrics');
-    if (!box) return;
-    var items = [
-      {
-        label: '年化收益', en: 'CAGR', value: fmtPct(metrics.cagr, 1),
-        tone: toNum(metrics.cagr) !== null && metrics.cagr < 0 ? 'negative' : 'positive',
-        note: '回测区间年化收益'
-      },
-      {
-        label: 'Sharpe', en: 'RISK ADJ', value: fmtNum(metrics.sharpe, 2),
-        tone: 'plain', note: '风险调整后收益'
-      },
-      {
-        label: '最大回撤', en: 'MAX DD', value: fmtPct(metrics.mdd, 1),
-        tone: 'negative', note: '峰谷最大跌幅'
-      },
-      {
-        label: '信息比率', en: 'IR', value: fmtNum(metrics.ir, 2),
-        tone: 'plain', note: '相对沪深 300'
-      },
-      {
-        label: '月胜率', en: 'WIN RATE', value: fmtPct(metrics.win_rate, 1),
-        tone: 'plain', note: '月度正收益占比'
+    var sessionId = readSavedSession();
+    var history = null;
+    if (sessionId) {
+      var fetched = await fetchMessages(sessionId);
+      if (fetched.ok) {
+        history = fetched.messages;
+      } else if (fetched.notFound) {
+        sessionId = '';
       }
-    ];
-    box.innerHTML = items.map(function (item) {
-      var valueClass = item.tone === 'positive' ? ' positive' : (item.tone === 'negative' ? ' negative' : '');
-      return '<div class="metric-card">' +
-        '<div class="metric-top"><span>' + esc(item.label) + '</span><em>' + esc(item.en) + '</em></div>' +
-        '<div class="metric-value' + valueClass + '">' + esc(item.value) + '</div>' +
-        '<div class="metric-note">' + esc(item.note) + '</div>' +
-      '</div>';
-    }).join('');
-  }
+    }
 
-  function renderSelectionTable(top, portfolio) {
-    var body = $('selection-table-body');
-    if (!body) return;
-    if (!top.length) {
-      body.innerHTML = '<tr><td colspan="5" class="table-empty-cell">暂无可展示的入选股票。</td></tr>';
-      return;
-    }
-    var scores = top.map(function (stock) { return toNum(stock.score); }).filter(function (value) { return value !== null; });
-    var maxScore = scores.length ? Math.max.apply(null, scores) : null;
-    var minScore = scores.length ? Math.min.apply(null, scores) : null;
-    var portfolioMap = {};
-    (portfolio || []).forEach(function (item) { portfolioMap[item.code] = item; });
-    body.innerHTML = top.map(function (stock, index) {
-      var factors = FACTOR_KEYS.map(function (key) {
-        return { key: key, label: FACTOR_LABELS[key], value: stock.factors[key] };
-      }).filter(function (item) { return item.value !== null; }).sort(function (a, b) { return b.value - a.value; }).slice(0, 2);
-      var score = toNum(stock.score);
-      var scoreRatio = 50;
-      if (score !== null && maxScore !== null) {
-        scoreRatio = maxScore === minScore ? 60 : 20 + ((score - minScore) / (maxScore - minScore)) * 80;
-      }
-      var rankClass = index < 3 ? ' rank-' + (index + 1) : '';
-      var displayName = stock.name || stock.code || '—';
-      var subCode = stock.name ? stock.code : 'A 股标的';
-      return '<tr>' +
-        '<td><span class="rank-badge' + rankClass + '">' + String(index + 1).padStart(2, '0') + '</span></td>' +
-        '<td><div class="stock-id"><strong>' + esc(displayName) + '</strong><span>' + esc(subCode) + '</span></div></td>' +
-        '<td><span class="industry-tag">' + esc(stock.industry || '—') + '</span></td>' +
-        '<td><div class="score-cell"><span class="score-num">' + esc(fmtNum(score, 2)) + '</span><span class="score-track"><i style="width:' + clamp(scoreRatio, 0, 100).toFixed(1) + '%"></i></span></div></td>' +
-        '<td><div class="factor-tags">' + (factors.length ? factors.map(function (factor) {
-          return '<span class="factor-tag" title="' + esc(factor.label) + ' z=' + esc(fmtNum(factor.value, 2)) + '">' + esc(factor.label) + '</span>';
-        }).join('') : '<span class="factor-tag">—</span>') + '</div></td>' +
-      '</tr>';
-    }).join('');
-  }
-
-  function renderSelectionFactorChart(top) {
-    var container = $('selection-factor-chart');
-    if (!container) return;
-    var hasContributions = (top || []).some(function (stock) {
-      return stock.contributions && FACTOR_KEYS.some(function (key) { return stock.contributions[key] !== null; });
-    });
-    var sums = {};
-    var counts = {};
-    FACTOR_KEYS.forEach(function (key) { sums[key] = 0; counts[key] = 0; });
-    (top || []).forEach(function (stock) {
-      FACTOR_KEYS.forEach(function (key) {
-        var raw = hasContributions
-          ? (stock.contributions && stock.contributions[key])
-          : (stock.factors && stock.factors[key]);
-        var value = toNum(raw);
-        if (value !== null) {
-          sums[key] += value;
-          counts[key] += 1;
-        }
-      });
-    });
-    var items = FACTOR_KEYS.filter(function (key) { return counts[key] > 0; }).map(function (key) {
-      return { label: FACTOR_LABELS[key], current: sums[key] / counts[key] };
-    });
-    var note = $('selection-factor-note');
-    var caption = $('selection-factor-caption');
-    if (note) note.textContent = hasContributions ? '权重加权贡献' : '组合平均 z';
-    if (caption) caption.textContent = hasContributions
-      ? '贡献 = 行业中性化 z × 当前因子权重，按入选组合取均值。'
-      : '当前结果未返回 contributions，以方向对齐后的平均 z 暴露展示。';
-    if (!items.length) {
-      chartEmpty(container, '等待因子暴露数据');
-      return;
-    }
-    if (!window.Charts) {
-      chartEmpty(container, '图表库未加载');
-      return;
-    }
-    Charts.bar(container, { items: items }, {
-      width: chartWidth(container, 340),
-      rowHeight: 27,
-      labelWidth: 75,
-      showValues: true,
-      valueFormatter: function (value) {
-        return (value > 0 ? '+' : '') + fmtNum(value, hasContributions ? 3 : 2) + (hasContributions ? '' : 'z');
-      },
-      ariaLabel: hasContributions ? '入选组合因子权重加权贡献' : '入选组合因子平均暴露'
-    });
-  }
-
-  function renderPortfolio(portfolio, top, method) {
-    var container = $('portfolio-list');
-    var methodNode = $('portfolio-method');
-    if (!container) return;
-    if (methodNode) methodNode.textContent = methodLabel(method || (portfolio[0] && portfolio[0].method));
-    if (!portfolio.length) {
-      container.innerHTML = '<p class="muted-small">等待组合权重数据。</p>';
-      setText($('portfolio-total'), '—');
-      setText($('portfolio-count'), '—');
-      var ring = $('portfolio-ring');
-      if (ring) {
-        ring.style.setProperty('--p', '0');
-        ring.innerHTML = '<span>—</span>';
-      }
-      return;
-    }
-    var nameMap = {};
-    (top || []).forEach(function (stock) { nameMap[stock.code] = stock.name; });
-    var weights = portfolio.map(function (item) { return toNum(item.weight_pct); }).filter(function (value) { return value !== null; });
-    var totalWeight = weights.reduce(function (sum, value) { return sum + value; }, 0);
-    var maxWeight = weights.length ? Math.max.apply(null, weights) : 1;
-    var totalAmount = portfolio.some(function (item) { return toNum(item.amount) !== null; })
-      ? portfolio.reduce(function (sum, item) { return sum + (toNum(item.amount) || 0); }, 0)
-      : null;
-    var ring = $('portfolio-ring');
-    if (ring) {
-      ring.style.setProperty('--p', String(clamp(totalWeight, 0, 100)));
-      ring.innerHTML = '<span>' + esc(Math.round(totalWeight)) + '<small>%</small></span>';
-    }
-    setText($('portfolio-total'), totalAmount === null ? '—' : fmtMoney(totalAmount));
-    setText($('portfolio-count'), portfolio.length + ' 只标的 · ' + (totalWeight >= 99.9 ? '满仓' : fmtNum(totalWeight, 1) + '% 配置'));
-    var visible = portfolio.slice(0, 12);
-    container.innerHTML = visible.map(function (item, index) {
-      var weight = toNum(item.weight_pct);
-      var width = weight === null ? 0 : clamp((weight / (maxWeight || 1)) * 100, 1, 100);
-      var color = ALLOCATION_COLORS[index % ALLOCATION_COLORS.length];
-      var name = nameMap[item.code] || item.code || '—';
-      return '<div class="allocation-row">' +
-        '<div class="allocation-name"><i style="background:' + color + '"></i><span>' + esc(name) + '</span><em>' + esc(item.code) + '</em></div>' +
-        '<div class="allocation-pct">' + esc(weight === null ? '—' : (weight.toFixed(1) + '%')) + '</div>' +
-        '<div class="allocation-track"><i style="width:' + width.toFixed(1) + '%;background:' + color + '"></i></div>' +
-      '</div>';
-    }).join('');
-  }
-
-  function renderSelectionNav(nav, benchmarkName) {
-    var container = $('selection-nav-chart');
-    if (!container) return;
-    var caption = $('selection-nav-caption');
-    if (!nav || !nav.strategy || nav.strategy.length < 2) {
-      chartEmpty(container, '暂无净值数据（后端未返回 nav）');
-      if (caption) caption.textContent = '当前结果没有可用于绘制的净值序列，不使用模拟数据替代。';
-      return;
-    }
-    if (!window.Charts) {
-      chartEmpty(container, '图表库未加载');
-      return;
-    }
-    var series = [{
-      name: '策略净值',
-      values: nav.strategy,
-      color: Charts.palette.cyan,
-      fill: true
-    }];
-    if (nav.benchmark && nav.benchmark.length) {
-      series.push({
-        name: benchmarkName || nav.benchmark_name || '沪深 300',
-        values: nav.benchmark,
-        color: Charts.palette.slate,
-        dashed: true,
-        fill: false
-      });
-    }
-    Charts.line(container, { labels: nav.labels, series: series }, {
-      width: chartWidth(container, 700),
-      height: 238,
-      yFormatter: function (value) { return Number(value).toFixed(2); },
-      xFormatter: function (value) { return String(value).slice(0, 7).replace('-', '.'); },
-      ariaLabel: '策略净值与沪深 300 对比'
-    });
-    if (caption) {
-      var first = nav.labels[0] || '—';
-      var last = nav.labels[nav.labels.length - 1] || '—';
-      caption.textContent = first + ' 至 ' + last + ' · T+1 成交 · 买卖双边成本 · 停牌与涨跌停约束已计入';
-    }
-  }
-
-  async function startSelection() {
-    if (!state.booted || !state.sessionId) {
-      showError('会话尚未就绪，暂时无法启动选股。', function () { hideError(); bootLive(); });
-      return;
-    }
-    if (!state.profile.complete || !state.profile.confirmed) {
-      showToast('请先在「AI 对话画像」确认投资画像。');
-      switchView('chat');
-      openProfileEditor();
-      return;
-    }
-    if (state.selection.status === 'starting' || state.selection.status === 'running') return;
-    closeSelectionSource();
-    clearTimers(MOCK_SELECTION_TIMERS);
-    var topN = Number(($('selection-top-n') || {}).value) || 10;
-    var runSeq = state.selection.runSeq + 1;
-    state.selection = {
-      status: 'starting',
-      result: null,
-      taskId: '',
-      progress: 2,
-      stage: '任务创建中',
-      message: '正在提交选股请求…',
-      error: '',
-      startedAt: Date.now(),
-      finishedAt: 0,
-      source: null,
-      runSeq: runSeq
-    };
-    resetInterpretation('');
-    hideError();
-    switchView('selection');
-    renderSelectionView();
-    renderProfile();
-    try {
-      if (state.mock) {
-        mockStartSelection(topN, runSeq);
+    if (!sessionId) {
+      try {
+        var created = await api('/api/sessions', { method: 'POST' });
+        sessionId = created && created.session_id ? String(created.session_id) : '';
+        if (!sessionId) throw new Error('后端未返回会话 ID');
+        history = [];
+      } catch (error) {
+        clearChat();
+        appendSystemError('无法建立会话', error.message || '后端服务不可用，请确认服务已启动。', 'retry-init');
+        setHealth('error', '服务离线', error.message || '无法创建会话');
         return;
       }
-      var payload = await request(sessionPath('/selection'), {
-        method: 'POST',
-        body: { top_n: String(topN) }
-      });
-      if (runSeq !== state.selection.runSeq) return;
-      if (!payload || !payload.task_id) throw new AppError('选股任务创建失败：响应缺少 task_id。', 0);
-      state.selection.taskId = String(payload.task_id);
-      state.selection.status = 'running';
-      state.selection.progress = 5;
-      state.selection.stage = '任务已启动';
-      state.selection.message = '正在读取因子与行情数据…';
-      renderSelectionView();
-      openSelectionEvents(runSeq);
-    } catch (err) {
-      handleSelectionFailure(err, runSeq);
-    }
-  }
-
-  function openSelectionEvents(runSeq) {
-    var url = API_BASE + sessionPath('/selection/events') + '?task_id=' + encodeURIComponent(state.selection.taskId);
-    var source;
-    try { source = new EventSource(url); }
-    catch (err) { handleSelectionFailure(new AppError('浏览器无法建立 SSE 连接。', 0), runSeq); return; }
-    state.selection.source = source;
-    var settled = false;
-    function isCurrent() { return runSeq === state.selection.runSeq; }
-    function fail(message) {
-      if (settled || !isCurrent()) return;
-      settled = true;
-      source.close();
-      handleSelectionFailure(new AppError(message || '选股实时连接中断。', 0), runSeq);
-    }
-    source.addEventListener('started', function (event) {
-      if (!isCurrent()) return;
-      state.selection.status = 'running';
-      state.selection.message = '任务已启动，正在计算因子…';
-      state.selection.progress = Math.max(state.selection.progress, 5);
-      parseEventData(event.data, {});
-      renderSelectionView();
-    });
-    source.addEventListener('progress', function (event) {
-      if (!isCurrent()) return;
-      var payload = parseEventData(event.data, {});
-      state.selection.status = 'running';
-      state.selection.progress = clamp(Number(payload.percent) || state.selection.progress, 0, 100);
-      state.selection.stage = payload.stage || state.selection.stage;
-      state.selection.message = payload.message || state.selection.message;
-      renderSelectionView();
-    });
-    source.addEventListener('result', function (event) {
-      if (settled || !isCurrent()) return;
-      var payload;
-      try { payload = parseEventData(event.data, null); }
-      catch (err) { fail('选股结果解析失败。'); return; }
-      if (!payload || typeof payload !== 'object') { fail('选股结果事件为空或格式非法。'); return; }
-      settled = true;
-      source.close();
-      handleSelectionResult(payload, runSeq);
-    });
-    source.addEventListener('error', function (event) {
-      if (settled || !isCurrent()) return;
-      if (event && event.data) {
-        var payload = parseEventData(event.data, {});
-        fail(extractApiError(payload, 0) || '选股任务返回错误。');
-      } else {
-        fail('选股事件连接中断，请重试。');
-      }
-    });
-  }
-
-  function closeSelectionSource() {
-    if (state.selection.source) {
-      try { state.selection.source.close(); } catch (err) { /* ignore */ }
-      state.selection.source = null;
-    }
-  }
-
-  function handleSelectionResult(payload, runSeq) {
-    if (runSeq !== state.selection.runSeq) return;
-    closeSelectionSource();
-    var result;
-    try {
-      result = normalizeSelectionPayload(payload, state.health && state.health.as_of);
-    } catch (err) {
-      handleSelectionFailure(new AppError('选股结果格式异常，无法展示。', 0), runSeq);
-      return;
-    }
-    state.selection.status = 'complete';
-    state.selection.result = result;
-    state.selection.progress = 100;
-    state.selection.finishedAt = Date.now();
-    state.selection.error = '';
-    resetInterpretation(result.interpretation || '');
-    hideError();
-    renderSelectionView();
-    renderProfile();
-    if (state.activeView === 'selection') window.requestAnimationFrame(function () {
-      var title = $('selection-title');
-      if (title && typeof title.scrollIntoView === 'function') title.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
-    showToast('选股完成：已生成 Top ' + (result.top_n || result.top.length) + ' 组合。');
-  }
-
-  function handleSelectionFailure(err, runSeq) {
-    if (runSeq !== state.selection.runSeq) return;
-    closeSelectionSource();
-    state.selection.status = 'error';
-    state.selection.error = friendlyError(err);
-    state.selection.progress = 0;
-    state.selection.finishedAt = Date.now();
-    renderSelectionView();
-    renderProfile();
-    showError('选股失败：' + state.selection.error, function () {
-      hideError();
-      startSelection();
-    });
-  }
-
-  function parseEventData(raw, fallback) {
-    if (raw === undefined || raw === null || raw === '') return fallback;
-    if (typeof raw === 'object') return raw;
-    try { return JSON.parse(raw); } catch (err) { return raw; }
-  }
-
-  /* ---------------------------------------------------------------- AI 解读 */
-  function resetInterpretation(text) {
-    state.interpretation = {
-      text: text || '',
-      status: text ? 'ready' : 'idle',
-      busy: false,
-      busyKind: '',
-      followups: [],
-      typer: null
-    };
-    interpretationTyper = null;
-    renderInterpretation();
-  }
-
-  function renderInterpretation() {
-    if (!window.Charts) { /* charts not used here; 保持容错 */ }
-    var result = state.selection.result;
-    var interp = state.interpretation;
-    var statusNode = $('interpret-status');
-    var contextBox = $('interpret-context');
-    var body = $('interpret-body');
-    var thread = $('followup-thread');
-    var input = $('followup-input');
-    var send = $('followup-send');
-    var followupHeadNote = document.querySelector('.followup-head span');
-    if (!body) return;
-
-    if (statusNode) {
-      statusNode.classList.remove('ready', 'confirmed');
-      if (interp.busy) {
-        statusNode.textContent = interp.busyKind === 'main' ? '生成中' : '追问生成中';
-        statusNode.classList.add('ready');
-      } else if (interp.status === 'error') {
-        statusNode.textContent = '生成中断';
-      } else if (interp.text) {
-        statusNode.textContent = '已生成';
-        statusNode.classList.add('ready');
-      } else if (result) {
-        statusNode.textContent = '待生成';
-      } else {
-        statusNode.textContent = '暂无数据';
-      }
     }
 
-    if (contextBox) {
-      if (result) {
-        var chips = [
-          { label: 'TOP', value: String(result.top_n || result.top.length) },
-          { label: '风险', value: riskLabel(state.profile.risk_level || (state.profile.slots || {}).risk_level) },
-          { label: '方法', value: methodLabel(result.method) },
-          { label: 'AS OF', value: result.as_of || '—' }
-        ];
-        if (toNum(result.metrics.sharpe) !== null) chips.push({ label: 'SHARPE', value: fmtNum(result.metrics.sharpe, 2) });
-        contextBox.innerHTML = chips.map(function (chip) {
-          return '<span class="context-chip"><i class="ctx-dot"></i>' + esc(chip.label) + ' <b>' + esc(chip.value) + '</b></span>';
-        }).join('');
-      } else {
-        contextBox.innerHTML = '<span class="context-chip"><i class="ctx-dot"></i>等待选股结果</span>';
-      }
-    }
-
-    if (!interp.busy || interp.busyKind !== 'main') {
-      if (interp.text) {
-        body.innerHTML = renderMarkdown(interp.text);
-        body.classList.remove('is-streaming');
-      } else if (result) {
-        body.innerHTML =
-          '<div class="empty-inline">' +
-            '<div class="empty-icon"><svg class="icon"><use href="#i-doc"></use></svg></div>' +
-            '<h3>' + (interp.status === 'error' ? '解读生成中断' : '让 AI 解读本次选股') + '</h3>' +
-            '<p>将基于本次 Top N、因子暴露与回测指标生成解读。内容只使用系统事实，不预测收益，不构成投资建议。</p>' +
-            '<button class="btn btn-primary" type="button" data-action="generate-interpretation">' + (interp.status === 'error' ? '重新生成解读' : '让 AI 解读本次结果') + ' <svg class="icon"><use href="#i-arrow"></use></svg></button>' +
-          '</div>';
-      } else {
-        body.innerHTML =
-          '<div class="empty-inline">' +
-            '<div class="empty-icon"><svg class="icon"><use href="#i-doc"></use></svg></div>' +
-            '<h3>完成选股后生成解读</h3>' +
-            '<p>AI 将结合选股结果、回测指标与因子暴露给出解读，不编造未获得的行情事实。</p>' +
-            '<button class="btn btn-outline" type="button" data-action="go-selection">前往选股</button>' +
-          '</div>';
-      }
-    }
-
-    if (thread && (!interp.busy || interp.busyKind !== 'followup')) {
-      renderFollowupThread();
-    }
-    var canFollow = !!result && !interp.busy;
-    if (input) {
-      input.disabled = !canFollow;
-      input.placeholder = result ? '继续追问本次选股，例如：最大回撤的主要风险来源是什么？' : '完成选股后可继续追问';
-    }
-    if (send) send.disabled = !canFollow;
-    if (followupHeadNote) followupHeadNote.textContent = result ? '复用同一会话消息接口' : '选股后可追问';
-    renderInterpretSnapshot(result);
-  }
-
-  function renderFollowupThread() {
-    var thread = $('followup-thread');
-    if (!thread) return;
-    thread.innerHTML = '';
-    state.interpretation.followups.forEach(function (item) {
-      thread.appendChild(createFollowupElement(item, false).root);
-    });
-  }
-
-  function createFollowupElement(message, streaming) {
-    var root = document.createElement('div');
-    root.className = 'followup-msg' + (message.role === 'user' ? ' user' : '');
-    var meta = document.createElement('div');
-    meta.className = 'fu-meta';
-    meta.textContent = (message.role === 'user' ? '你' : 'AI 研究员') + (message.created_at ? ' · ' + timeText(message.created_at) : '');
-    var bubble = document.createElement('div');
-    bubble.className = 'fu-bubble';
-    var textNode = document.createElement('div');
-    textNode.className = 'message-text';
-    if (!streaming) {
-      if (message.role === 'assistant') textNode.innerHTML = renderMarkdown(message.content || '');
-      else textNode.textContent = message.content || '';
-    }
-    bubble.appendChild(textNode);
-    var dots = null;
-    var caret = null;
-    if (streaming) {
-      dots = document.createElement('span');
-      dots.className = 'typing-dots';
-      dots.innerHTML = '<i></i><i></i><i></i>';
-      bubble.appendChild(dots);
-      caret = document.createElement('span');
-      caret.className = 'typing-caret';
-      caret.hidden = true;
-      bubble.appendChild(caret);
-    }
-    root.appendChild(meta);
-    root.appendChild(bubble);
-    return { root: root, textEl: textNode, bubble: bubble, dots: dots, caret: caret, meta: meta };
-  }
-
-  function renderInterpretSnapshot(result) {
-    var box = $('interpret-snapshot');
-    if (!box) return;
-    if (!result) {
-      box.innerHTML = '<p class="muted-small">暂无已完成的选股任务。</p>';
-      return;
-    }
-    var metrics = result.metrics || {};
-    var top = (result.top || []).slice(0, 3);
-    var rows = [
-      ['年化收益', fmtPct(metrics.cagr, 1)],
-      ['Sharpe', fmtNum(metrics.sharpe, 2)],
-      ['最大回撤', fmtPct(metrics.mdd, 1)],
-      ['信息比率', fmtNum(metrics.ir, 2)]
-    ];
-    box.innerHTML =
-      '<div class="snapshot-top">' +
-        rows.map(function (row) { return '<div class="snapshot-row"><span>' + esc(row[0]) + '</span><b>' + esc(row[1]) + '</b></div>'; }).join('') +
-      '</div>' +
-      top.map(function (stock, index) {
-        return '<div class="snapshot-stock"><i>' + String(index + 1).padStart(2, '0') + '</i><span class="snap-name">' + esc(stock.name || stock.code) + '</span><span class="snap-code">' + esc(stock.name ? stock.code : (stock.industry || stock.code)) + '</span></div>';
-      }).join('');
-  }
-
-  function buildInterpretationPrompt(result) {
-    var topCodes = (result.top || []).slice(0, 10).map(function (stock) { return stock.code + (stock.name ? '(' + stock.name + ')' : ''); }).join('、');
-    var metrics = result.metrics || {};
-    return '请基于本次已完成的选股与回测结果，生成一份面向个人投资者的中文解读。' +
-      '事实：截至 ' + (result.as_of || '未知') + '，Top ' + (result.top_n || result.top.length) + '；组合方法 ' + methodLabel(result.method) + '；' +
-      '标的 ' + (topCodes || '无') + '；年化收益 ' + fmtPct(metrics.cagr, 1) + '，Sharpe ' + fmtNum(metrics.sharpe, 2) +
-      '，最大回撤 ' + fmtPct(metrics.mdd, 1) + '，信息比率 ' + fmtNum(metrics.ir, 2) + '，月胜率 ' + fmtPct(metrics.win_rate, 1) + '。' +
-      '请使用三个小节：选股逻辑、主要风险、建议跟踪项。只依据以上事实，不预测收益、不编造数据，并附一句风险提示，总字数不超过 600 字。';
-  }
-
-  async function generateInterpretation() {
-    var result = state.selection.result;
-    if (!result || state.interpretation.busy) {
-      if (!result) showToast('请先完成选股。');
-      return;
-    }
-    hideError();
-    state.interpretation.busy = true;
-    state.interpretation.busyKind = 'main';
-    state.interpretation.status = 'generating';
-    var body = $('interpret-body');
-    if (!body) return;
-    body.classList.add('is-streaming');
-    body.innerHTML = '<div class="stream-target"></div><span class="typing-caret"></span>';
-    var textNode = body.querySelector('.stream-target');
-    var caret = body.querySelector('.typing-caret');
-    var typer = createTypewriter(textNode, function () {});
-    interpretationTyper = typer;
-    state.interpretation.typer = typer;
-    var status = $('interpret-status');
-    if (status) { status.textContent = '生成中'; status.classList.add('ready'); }
-    var input = $('followup-input');
-    var send = $('followup-send');
-    if (input) input.disabled = true;
-    if (send) send.disabled = true;
-    var collected = '';
-    var firstToken = false;
-    var handlers = {
-      onToken: function (token) {
-        if (!firstToken) { firstToken = true; if (caret) caret.hidden = false; }
-        collected += token;
-        typer.push(token);
-      },
-      onSlots: handleSlotsUpdate,
-      onProfileReady: handleProfileReady
-    };
-    try {
-      await runConversationStream(buildInterpretationPrompt(result), 'interpretation', handlers);
-      var finalText = await typer.finish();
-      if (!finalText.trim()) throw new AppError('AI 返回了空解读，请重试。', 0);
-      state.interpretation.text = finalText;
-      state.interpretation.status = 'ready';
-      state.interpretation.busy = false;
-      state.interpretation.busyKind = '';
-      state.interpretation.typer = null;
-      interpretationTyper = null;
-      renderInterpretation();
-      showToast('AI 解读已生成。');
-    } catch (err) {
-      typer.abort();
-      state.interpretation.busy = false;
-      state.interpretation.busyKind = '';
-      state.interpretation.typer = null;
-      interpretationTyper = null;
-      state.interpretation.text = collected.trim();
-      state.interpretation.status = 'error';
-      renderInterpretation();
-      showError('AI 解读生成失败：' + friendlyError(err), function () { hideError(); generateInterpretation(); });
-    }
-  }
-
-  async function handleFollowupSubmit() {
-    var input = $('followup-input');
-    var content = (input && input.value || '').trim();
-    if (!content || state.interpretation.busy) return;
-    if (!state.selection.result) {
-      showToast('请先完成选股。');
-      return;
-    }
-    input.value = '';
-    autoGrow(input);
-    hideError();
-    var userMessage = { role: 'user', content: content, created_at: nowIso() };
-    state.interpretation.followups.push(userMessage);
-    var thread = $('followup-thread');
-    if (thread) thread.appendChild(createFollowupElement(userMessage, false).root);
-    state.interpretation.busy = true;
-    state.interpretation.busyKind = 'followup';
-    var send = $('followup-send');
-    if (send) send.disabled = true;
-    if (input) input.disabled = true;
-    var status = $('interpret-status');
-    if (status) { status.textContent = '追问生成中'; status.classList.add('ready'); }
-    var info = createFollowupElement({ role: 'assistant', content: '', created_at: nowIso() }, true);
-    if (thread) thread.appendChild(info.root);
-    var typer = createTypewriter(info.textEl, function () {
-      if (thread) thread.scrollTop = thread.scrollHeight;
-    });
-    interpretationTyper = typer;
-    state.interpretation.typer = typer;
-    var collected = '';
-    var firstToken = false;
-    try {
-      await runConversationStream(content, 'followup', {
-        onToken: function (token) {
-          if (!firstToken) {
-            firstToken = true;
-            if (info.dots) info.dots.remove();
-            if (info.caret) info.caret.hidden = false;
-          }
-          collected += token;
-          typer.push(token);
-        },
-        onSlots: handleSlotsUpdate,
-        onProfileReady: handleProfileReady
-      });
-      var finalText = await typer.finish();
-      if (!finalText.trim()) throw new AppError('AI 返回了空内容，请重试。', 0);
-      finalizeStreamBubble(info, finalText, true);
-      state.interpretation.followups.push({ role: 'assistant', content: finalText, created_at: nowIso() });
-      state.interpretation.busy = false;
-      state.interpretation.busyKind = '';
-      state.interpretation.typer = null;
-      interpretationTyper = null;
-      renderInterpretation();
-    } catch (err) {
-      typer.abort();
-      if (info.dots) info.dots.remove();
-      if (info.caret) info.caret.remove();
-      state.interpretation.busy = false;
-      state.interpretation.busyKind = '';
-      state.interpretation.typer = null;
-      interpretationTyper = null;
-      renderInterpretation();
-      showError('追问失败：' + friendlyError(err), function () {
-        hideError();
-        sendFollowupRetry(content);
-      });
-    }
-  }
-
-  async function sendFollowupRetry(content) {
-    if (state.interpretation.busy) return;
-    hideError();
-    state.interpretation.busy = true;
-    state.interpretation.busyKind = 'followup';
-    var thread = $('followup-thread');
-    var info = createFollowupElement({ role: 'assistant', content: '', created_at: nowIso() }, true);
-    if (thread) thread.appendChild(info.root);
-    var typer = createTypewriter(info.textEl);
-    interpretationTyper = typer;
-    state.interpretation.typer = typer;
-    var status = $('interpret-status');
-    if (status) { status.textContent = '追问生成中'; status.classList.add('ready'); }
-    var input = $('followup-input');
-    var sendButton = $('followup-send');
-    if (input) input.disabled = true;
-    if (sendButton) sendButton.disabled = true;
-    var collected = '';
-    var firstToken = false;
-    try {
-      await runConversationStream(content, 'followup', {
-        onToken: function (token) {
-          if (!firstToken) {
-            firstToken = true;
-            if (info.dots) info.dots.remove();
-            if (info.caret) info.caret.hidden = false;
-          }
-          collected += token;
-          typer.push(token);
-        },
-        onSlots: handleSlotsUpdate,
-        onProfileReady: handleProfileReady
-      });
-      var finalText = await typer.finish();
-      if (!finalText.trim()) throw new AppError('AI 返回了空内容，请重试。', 0);
-      finalizeStreamBubble(info, finalText, true);
-      state.interpretation.followups.push({ role: 'assistant', content: finalText, created_at: nowIso() });
-      state.interpretation.busy = false;
-      state.interpretation.busyKind = '';
-      state.interpretation.typer = null;
-      interpretationTyper = null;
-      renderInterpretation();
-    } catch (err) {
-      typer.abort();
-      state.interpretation.busy = false;
-      state.interpretation.busyKind = '';
-      state.interpretation.typer = null;
-      interpretationTyper = null;
-      renderInterpretation();
-      showError('追问失败：' + friendlyError(err), function () { hideError(); sendFollowupRetry(content); });
-    }
-  }
-
-  /* ---------------------------------------------------------------- 调参台 */
-  function renderTuneView() {
-    var tune = state.tune;
-    var running = tune.status === 'starting' || tune.status === 'running';
-    var done = tune.status === 'done';
-    // 只有收到 tuning_started（基线数据）或 trial 后才撤掉骨架屏。
-    var hasData = !!(tune.baseWeights || tune.baseMetrics || tune.trials.length || done);
-    var grid = $('tune-grid');
-    if (!grid) return;
-    grid.classList.toggle('is-loading', !hasData);
-
-    var titleState = $('tune-title-state');
-    if (titleState) {
-      if (running) titleState.textContent = '· 模型自动优化中';
-      else if (done) titleState.textContent = '· 候选版本待启用';
-      else if (tune.status === 'error') titleState.textContent = '· 调参中断';
-      else titleState.textContent = '· 等待启动';
-    }
-    var pill = $('tune-status-pill');
-    if (pill) {
-      pill.classList.remove('is-running', 'is-done', 'is-error');
-      if (running) pill.classList.add('is-running');
-      else if (done) pill.classList.add('is-done');
-      else if (tune.status === 'error') pill.classList.add('is-error');
-    }
-    var statusText = $('tune-status-text');
-    if (statusText) {
-      statusText.textContent = running ? (tune.trials.length ? '回测评估中' : '启动中') :
-        done ? '候选就绪' : tune.status === 'error' ? '已中断' : '等待启动';
-    }
-    var runTag = $('tune-run-tag');
-    if (runTag) runTag.textContent = running ? 'LIVE' : done ? 'DONE' : tune.status === 'error' ? 'ERROR' : 'IDLE';
-    var startButton = $('start-tune');
-    if (startButton) {
-      startButton.disabled = running;
-      var label = startButton.querySelector('span');
-      if (label) label.textContent = running ? '调参中…' : done || tune.status === 'error' ? '重新调参' : '启动 AI 调参';
-    }
-    var trialSelect = $('tune-trial-select');
-    if (trialSelect) trialSelect.disabled = running;
-    setText($('tune-elapsed'), formatElapsed(tune.elapsedMs || (tune.startedAt && running ? Date.now() - tune.startedAt : 0)));
-
-    var progress = tune.total > 0 ? clamp(tune.trials.length / tune.total * 100, 0, 100) : 0;
-    if (done) progress = 100;
-    if (window.Charts) {
-      var gaugeNode = $('tune-gauge');
-      if (gaugeNode) Charts.gauge(gaugeNode, { value: progress, max: 100, label: '进度' }, { size: 62, thickness: 4, ariaLabel: '调参进度' });
-    }
-
-    var compareLabel = $('tune-compare-label');
-    if (compareLabel) {
-      var activeLabel = versionLabel(state.activeVersionId) || '当前';
-      var candidateLabel = versionLabel(tune.candidateVersionId) || (tune.bestWeights ? '候选' : '候选参数');
-      if (tune.baseMetrics || tune.baseWeights) {
-        compareLabel.textContent = '当前 ' + activeLabel + '  vs  ' + candidateLabel;
-        if (tune.total) compareLabel.textContent += ' · ' + (done ? '完整回测' : tune.trials.length + ' / ' + tune.total + ' 组');
-      } else {
-        compareLabel.textContent = '等待基线权重载入';
-      }
-    }
-    var candidateBadge = $('candidate-badge');
-    if (candidateBadge) {
-      var candidateActive = done && tune.candidateVersionId && state.activeVersionId === tune.candidateVersionId;
-      candidateBadge.classList.toggle('is-on', !!tune.bestWeights);
-      var versionSuffix = tune.candidateVersionId ? ' ' + esc(versionLabel(tune.candidateVersionId)) : '';
-      candidateBadge.innerHTML = '<i></i>' + (candidateActive ? '已启用' : '候选') + versionSuffix;
-    }
-    var metricLabel = $('tune-metric-label');
-    if (metricLabel) {
-      metricLabel.textContent = tune.baseMetrics ? ('候选 vs 当前 · ' + (done ? '回测完成' : (tune.total ? tune.trials.length + ' / ' + tune.total + ' 组随机搜索' : '载入中'))) : '候选 vs 当前 · 等待回测';
-    }
-    var bestTag = $('tune-best-tag');
-    if (bestTag) bestTag.textContent = done ? 'BEST' : (tune.bestWeights ? 'LIVE' : '—');
-
-    renderTuneTimeline();
-    renderTuneCharts();
-    renderTuneMetrics();
-    renderVersionTimeline();
-    renderTuneActions();
-    if (grid.classList.contains('is-loading')) return;
-    renderTuneNav();
-    renderTuneVerdict();
-  }
-
-  function versionLabel(id) {
-    if (!id) return '';
-    var raw = String(id);
-    // 后端真实 ID 形如 v3fa2b1c9de，界面使用稳定的短标识，完整 ID 保留在 title 中。
-    return raw.length > 9 ? raw.slice(0, 7) : raw;
-  }
-
-  function getRollbackTarget() {
-    var versions = state.versions || [];
-    var activeId = state.activeVersionId || ((versions.find(function (version) { return version.status === 'active'; }) || {}).id || '');
-    var active = versions.find(function (version) { return version.id === activeId; });
-    if (active && active.parent_id) {
-      var parent = versions.find(function (version) { return version.id === active.parent_id; });
-      if (parent && parent.id !== activeId) return parent;
-    }
-    var sorted = versions.slice().sort(function (a, b) {
-      return String(a.created_at || '').localeCompare(String(b.created_at || ''));
-    });
-    var index = sorted.findIndex(function (version) { return version.id === activeId; });
-    if (index > 0) return sorted[index - 1];
-    return null;
-  }
-
-  function renderTuneTimeline() {
-    var box = $('tune-timeline');
-    if (!box) return;
-    var tune = state.tune;
-    var running = tune.status === 'starting' || tune.status === 'running';
-    var done = tune.status === 'done';
-    var complete = tune.trials.length;
-    var total = tune.total || 0;
-    var currentStep = 0;
-    if (tune.status === 'starting') currentStep = 1;
-    else if (running) currentStep = complete === 0 ? 2 : (complete >= total ? 4 : 3);
-    else if (done) currentStep = 5;
-    var baseSharpe = tune.baseMetrics ? fmtNum(tune.baseMetrics.sharpe, 2) : '—';
-    var bestSharpe = tune.bestMetrics ? fmtNum(tune.bestMetrics.sharpe, 2) : '—';
-    var descriptions = [
-      tune.baseMetrics ? '读取当前权重与基线指标 · Sharpe ' + baseSharpe : '读取线上权重与基线指标',
-      total ? '在权重和 = 100%、单项 ≤ 40% 约束内生成 ' + total + ' 组候选' : '在约束空间内生成随机候选权重',
-      total ? '已完成 ' + complete + ' / ' + total + ' 组回测' + (running ? ' · 已用 ' + formatElapsed(Date.now() - (tune.startedAt || Date.now())) : '') : '逐组执行 A 股规则回测',
-      tune.bestMetrics ? '对比新旧指标 · 候选 Sharpe ' + bestSharpe : '对比新旧指标，确认样本内 / 样本外稳健性',
-      tune.candidateVersionId ? '候选 ' + versionLabel(tune.candidateVersionId) + ' 已就绪，等待人工启用' : '候选完成后等待人工启用'
-    ];
-    var labels = ['诊断基线', '生成候选参数', '候选回测', '对比新旧指标',
-      tune.candidateVersionId ? '建议启用候选 ' + versionLabel(tune.candidateVersionId) : '建议启用候选'];
-    var icons = ['01', '02', '03', '04', '05'];
-    box.innerHTML = labels.map(function (label, index) {
-      var step = index + 1;
-      var stepState;
-      if (!running && !done && tune.status !== 'error') stepState = 'waiting';
-      else if (done) stepState = step < 5 ? 'done' : 'active';
-      else if (tune.status === 'error') stepState = step < Math.max(1, currentStep) ? 'done' : (step === Math.max(1, currentStep) ? 'active' : 'waiting');
-      else stepState = step < currentStep ? 'done' : (step === currentStep ? 'active' : 'waiting');
-      var statusLabel = stepState === 'done' ? (step === 5 ? '待启用' : '已完成') : stepState === 'active' ? '进行中' : '等待';
-      if (done && step === 5) statusLabel = '待启用';
-      if (tune.status === 'error' && stepState === 'active') statusLabel = '已中断';
-      return '<div class="timeline-step is-' + stepState + '"' + (stepState === 'active' ? ' aria-current="step"' : '') + '>' +
-        '<span class="step-index">' + (stepState === 'done' ? '<svg class="icon" style="width:11px;height:11px"><use href="#i-check"></use></svg>' : icons[index]) + '</span>' +
-        '<div class="step-body">' +
-          '<div class="step-top"><h3>' + esc(label) + '</h3><span class="step-status">' + statusLabel + '</span></div>' +
-          '<p>' + esc(descriptions[index]) + '</p>' +
-        '</div>' +
-        '<span class="step-pulse"></span>' +
-      '</div>';
-    }).join('');
-    var note = $('tune-agent-note');
-    if (note) {
-      var text;
-      if (tune.status === 'error') text = tune.error || '调参任务中断，请检查服务后重试。';
-      else if (done) text = '本次共评估 ' + (tune.total || complete) + ' 组候选，最优目标值 ' + (tune.bestTrialIndex >= 0 ? fmtNum(tune.trials[tune.bestTrialIndex] && tune.trials[tune.bestTrialIndex].objective, 3) : fmtNum(tune.bestMetrics && tune.bestMetrics.sharpe, 2)) + '。版本变更仍需人工确认。';
-      else if (running) text = complete ? '正在评估第 ' + Math.min(complete + 1, total || complete + 1) + ' 组候选；当前最优结构将实时映射到左侧权重与散点。' : '正在读取基线并生成第一批候选参数…';
-      else text = '等待启动。AI 将在合法权重空间内生成候选并逐轮回测。';
-      note.innerHTML = '<span class="note-mark"><svg class="icon"><use href="#i-spark"></use></svg></span><p>' + esc(text) + '</p>';
-    }
-  }
-
-  function renderTuneCharts() {
-    var tune = state.tune;
-    var weightsBox = $('tune-weight-chart');
-    var radarBox = $('tune-radar-chart');
-    var scatterBox = $('tune-scatter-chart');
-    if (!window.Charts) return;
-    var hasBase = !!tune.baseWeights;
-    var hasBest = !!tune.bestWeights;
-    if (weightsBox) {
-      if (hasBase || hasBest) {
-        var items = FACTOR_KEYS.map(function (key) {
-          return {
-            label: FACTOR_LABELS[key],
-            current: hasBase ? tune.baseWeights[key] : null,
-            candidate: hasBest ? tune.bestWeights[key] : null
-          };
-        });
-        Charts.bar(weightsBox, { items: items }, {
-          width: chartWidth(weightsBox, 540),
-          rowHeight: 27,
-          labelWidth: 86,
-          valueFormatter: function (value) { return fmtPct(value, 1); },
-          singleAsCurrent: !hasBest,
-          animate: !tune.weightChartRendered,
-          ariaLabel: '当前与候选因子权重对比'
-        });
-        tune.weightChartRendered = true;
-      } else {
-        chartEmpty(weightsBox, '等待基线权重载入');
-      }
-    }
-    if (radarBox) {
-      if (hasBase || hasBest) {
-        Charts.radar(radarBox, {
-          axes: FACTOR_KEYS.map(function (key) {
-            return {
-              label: FACTOR_SHORT[key],
-              current: hasBase ? tune.baseWeights[key] : null,
-              candidate: hasBest ? tune.bestWeights[key] : null
-            };
-          })
-        }, {
-          width: chartWidth(radarBox, 300),
-          height: 236,
-          ariaLabel: '因子权重雷达'
-        });
-      } else {
-        chartEmpty(radarBox, '等待权重数据');
-      }
-    }
-    if (scatterBox) {
-      if (tune.trials.length) {
-        var points = tune.trials.map(function (trial) {
-          return {
-            x: trial.metrics.sharpe,
-            y: trial.objective,
-            value: trial.objective,
-            label: trial.trial_index,
-            isBest: trial.is_best
-          };
-        });
-        var highlight = tune.trials.findIndex(function (trial) { return trial.is_best; });
-        if (highlight < 0) {
-          var bestIndex = -1;
-          var bestValue = -Infinity;
-          tune.trials.forEach(function (trial, index) {
-            if (trial.objective !== null && trial.objective > bestValue) { bestValue = trial.objective; bestIndex = index; }
-          });
-          highlight = bestIndex;
-        }
-        Charts.scatter(scatterBox, { points: points }, {
-          width: chartWidth(scatterBox, 350),
-          height: 236,
-          highlightIndex: highlight,
-          xLabel: 'Sharpe',
-          yLabel: '目标 J',
-          ariaLabel: '候选参数散点'
-        });
-        setText($('tune-scatter-count'), tune.trials.length + ' 组候选 · 按目标值着色');
-      } else {
-        chartEmpty(scatterBox, '等待候选参数');
-        setText($('tune-scatter-count'), '0 组候选 · 按目标值着色');
-      }
-    }
-  }
-
-  function renderTuneMetrics() {
-    var box = $('tune-metrics');
-    if (!box) return;
-    var tune = state.tune;
-    if (!tune.baseMetrics && !tune.bestMetrics) {
-      box.innerHTML = '<div class="chart-empty small">等待回测指标</div>';
-      return;
-    }
-    var defs = [
-      { key: 'sharpe', label: '风险调整', short: 'Sharpe', digits: 2, percent: false },
-      { key: 'cagr', label: '年化收益', short: 'CAGR', digits: 1, percent: true },
-      { key: 'mdd', label: '最大回撤', short: 'MDD', digits: 1, percent: true, inverse: true },
-      { key: 'ir', label: '信息比率', short: 'IR', digits: 2, percent: false }
-    ];
-    box.innerHTML = defs.map(function (def) {
-      var base = tune.baseMetrics ? toNum(tune.baseMetrics[def.key]) : null;
-      var best = tune.bestMetrics ? toNum(tune.bestMetrics[def.key]) : null;
-      var displayValue = best !== null ? best : base;
-      var improved = null;
-      if (base !== null && best !== null) {
-        improved = def.inverse ? Math.abs(best) < Math.abs(base) : best > base;
-      }
-      var mainText = displayValue === null ? '—' : (def.percent ? fmtPct(displayValue, def.digits) : fmtNum(displayValue, def.digits));
-      var baseText = base === null ? '—' : (def.percent ? fmtPct(base, def.digits) : fmtNum(base, def.digits));
-      var deltaText = '—';
-      var deltaClass = '';
-      if (base !== null && best !== null) {
-        if (def.percent) {
-          deltaText = fmtPp(best - base, def.digits);
-        } else {
-          var diff = best - base;
-          deltaText = (diff > 0 ? '+' : diff < 0 ? '−' : '') + Math.abs(diff).toFixed(def.digits);
-        }
-        if (improved === true) deltaClass = 'good';
-        else if (improved === false) deltaClass = 'bad';
-      }
-      return '<div class="tune-metric">' +
-        '<div class="metric-label"><span>' + esc(def.short) + ' · ' + esc(def.label) + '</span><i class="metric-dot ' + (improved === true ? 'good' : improved === false ? 'bad' : '') + '"></i></div>' +
-        '<div class="metric-big">' + esc(mainText) + '</div>' +
-        '<div class="metric-sub"><span>基线 ' + esc(baseText) + '</span><span class="delta ' + (deltaClass === 'bad' ? 'bad' : '') + '">' + esc(deltaText) + '</span></div>' +
-      '</div>';
-    }).join('');
-  }
-
-  function renderTuneNav() {
-    var container = $('tune-nav-chart');
-    var empty = $('tune-nav-empty');
-    if (!container) return;
-    var nav = normalizeCompareNav(state.tune.compare);
-    if (!nav || (!nav.base && !nav.candidate)) {
-      container.innerHTML = '';
-      if (empty) {
-        empty.hidden = false;
-        empty.textContent = state.tune.status === 'running' ? '候选回测完成后显示净值对比' : '本次结果未返回调参净值曲线';
-      }
-      return;
-    }
-    if (empty) empty.hidden = true;
-    var series = [];
-    if (nav.candidate) series.push({ name: '候选', values: nav.candidate, color: Charts.palette.cyan, fill: true });
-    if (nav.base) series.push({ name: '当前', values: nav.base, color: Charts.palette.slate, dashed: true, fill: false });
-    Charts.line(container, { labels: nav.labels, series: series }, {
-      width: chartWidth(container, 390),
-      height: 158,
-      yFormatter: function (value) { return Number(value).toFixed(2); },
-      xFormatter: function (value) { return String(value).slice(0, 4); },
-      ariaLabel: '调参候选与当前净值对比'
-    });
-  }
-
-  function renderTuneVerdict() {
-    var node = $('tune-verdict');
-    if (!node) return;
-    var tune = state.tune;
-    if (tune.status === 'done') {
-      var baseSharpe = tune.baseMetrics && toNum(tune.baseMetrics.sharpe);
-      var bestSharpe = tune.bestMetrics && toNum(tune.bestMetrics.sharpe);
-      var delta = (baseSharpe !== null && baseSharpe !== undefined && bestSharpe !== null && bestSharpe !== undefined) ? bestSharpe - baseSharpe : null;
-      node.textContent = delta === null
-        ? '候选版本已完成回测，等待人工复核与启用。'
-        : '候选相较当前 Sharpe ' + (delta >= 0 ? '提升 ' : '下降 ') + Math.abs(delta).toFixed(2) + '，已完成回测，等待人工启用。';
-    } else if (tune.status === 'running') {
-      node.textContent = '已完成 ' + tune.trials.length + ' / ' + (tune.total || '—') + ' 组候选。仅当最优目标值更新时，指标卡与权重才会切换。';
-    } else if (tune.status === 'error') {
-      node.textContent = '调参流已中断，当前展示的是已收到的真实事件，不补充模拟数据。';
+    state.sessionId = sessionId;
+    saveSession(sessionId);
+    updateSessionChip();
+    clearChat();
+    state.activity = [];
+    if (history && history.length) {
+      renderHistory(history);
     } else {
-      node.textContent = '启动后由后端 tune SSE 实时驱动，不使用前端伪造进度。';
+      appendWelcome();
     }
+    if (history === null) {
+      appendSystemError('历史消息加载失败', '聊天记录暂时没有拉到，你可以继续对话，或点一下重新连接。', 'retry-init');
+    }
+
+    await loadState();
+    await loadVersions();
+    if (history && history.length && (state.profile || state.lastSelection || state.activeModel)) {
+      pushActivity('restore', '已恢复上次会话的画像、模型与工作台状态', 'done', 'check');
+    }
+    renderAllWorkbench();
+    state.following = true;
+    scrollToBottom(true);
+    dom.input.focus();
   }
 
-  function renderVersionTimeline() {
-    var box = $('version-timeline');
-    if (!box) return;
-    var versions = (state.versions || []).slice().sort(function (a, b) {
-      return String(a.created_at || '').localeCompare(String(b.created_at || ''));
-    });
-    if (!versions.length) {
-      box.innerHTML = '<div class="version-empty">' + (state.versionsLoading ? '正在读取版本记录…' : '暂无可用版本记录') + '</div>';
-      setText($('version-active-label'), '—');
-      return;
-    }
-    var display = versions.slice(-4);
-    var active = versions.find(function (version) { return version.id === state.activeVersionId; }) ||
-      versions.find(function (version) { return version.status === 'active'; });
-    var candidateId = '';
-    if (state.tune.candidateVersionId && state.tune.candidateVersionId !== state.activeVersionId) {
-      candidateId = state.tune.candidateVersionId;
-    } else if (!state.tune.candidateVersionId) {
-      var candidateVersions = versions.filter(function (version) { return version.status === 'candidate'; });
-      if (candidateVersions.length) candidateId = candidateVersions[candidateVersions.length - 1].id;
-    }
-    setText($('version-active-label'), active ? '线上 · ' + versionLabel(active.id) : '—');
-    box.innerHTML = display.map(function (version) {
-      var isActive = version.id === state.activeVersionId || version.status === 'active';
-      var isCandidate = !isActive && version.id === candidateId;
-      var cls = isActive ? 'is-active' : isCandidate ? 'is-candidate' : 'is-history';
-      var sub = isActive ? '当前' : isCandidate ? '候选' : '历史';
-      return '<div class="version-node ' + cls + '" title="' + esc(version.id + ' · ' + (version.status || 'history')) + '">' +
-        '<span class="version-dot"></span>' +
-        '<span class="version-label">' + esc(versionLabel(version.id)) + '</span>' +
-        '<span class="version-sub">' + sub + '</span>' +
-      '</div>';
-    }).join('');
+  function resizeInput() {
+    if (!dom.input) return;
+    dom.input.style.height = 'auto';
+    dom.input.style.height = Math.min(dom.input.scrollHeight, 148) + 'px';
   }
 
-  function renderTuneActions() {
-    var tune = state.tune;
-    var done = tune.status === 'done';
-    var activate = $('tune-activate');
-    var rollback = $('tune-rollback');
-    var hint = $('tune-action-hint');
-    var activeIsCandidate = done && tune.candidateVersionId && state.activeVersionId === tune.candidateVersionId;
-    var rollbackTarget = getRollbackTarget();
-    if (activate) {
-      activate.disabled = !done || !tune.candidateVersionId || activeIsCandidate || tune.actionBusy;
-      activate.innerHTML = '<svg class="icon"><use href="#i-check"></use></svg>' +
-        (activeIsCandidate ? '候选已启用' : '启用候选版本');
-      activate.title = tune.candidateVersionId ? '启用 ' + tune.candidateVersionId : '';
-    }
-    if (rollback) {
-      rollback.disabled = !done || !rollbackTarget || tune.actionBusy;
-      rollback.title = rollbackTarget ? '回滚至 ' + rollbackTarget.id : '暂无可回滚版本';
-    }
-    if (hint) {
-      if (tune.status === 'running' || tune.status === 'starting') hint.textContent = '调参进行中 · 完成后可人工启用候选版本';
-      else if (activeIsCandidate) hint.textContent = '候选 ' + versionLabel(tune.candidateVersionId) + ' 已启用 · 可回滚至 ' + (rollbackTarget ? versionLabel(rollbackTarget.id) : '上一版本');
-      else if (done && tune.candidateVersionId) hint.textContent = '候选 ' + versionLabel(tune.candidateVersionId) + ' 已通过回测 · 所有变更需人工确认';
-      else if (tune.status === 'error') hint.textContent = '调参中断 · 可重新启动或稍后重试';
-      else hint.textContent = '所有变更需人工确认 · 历史版本可回滚';
-    }
-  }
-
-  function updateTuneElapsed() {
-    var tune = state.tune;
-    if (tune.startedAt && (tune.status === 'running' || tune.status === 'starting')) {
-      tune.elapsedMs = Date.now() - tune.startedAt;
-      setText($('tune-elapsed'), formatElapsed(tune.elapsedMs));
-    }
-  }
-
-  function startTuneClock() {
-    stopTuneClock();
-    tuneElapsedTimer = setInterval(updateTuneElapsed, 1000);
-  }
-
-  function stopTuneClock() {
-    if (tuneElapsedTimer) clearInterval(tuneElapsedTimer);
-    tuneElapsedTimer = null;
-    if (state.tune.startedAt) {
-      state.tune.elapsedMs = state.tune.status === 'running' || state.tune.status === 'starting'
-        ? Date.now() - state.tune.startedAt
-        : state.tune.elapsedMs || (Date.now() - state.tune.startedAt);
-    }
-  }
-
-  function scheduleTuneRender() {
-    if (state.tune.renderQueued) return;
-    state.tune.renderQueued = true;
-    if (tuneRenderHandle) cancelAnimationFrame(tuneRenderHandle);
-    tuneRenderHandle = requestAnimationFrame(function () {
-      tuneRenderHandle = null;
-      state.tune.renderQueued = false;
-      if (state.activeView === 'tune') renderTuneView();
-    });
-  }
-
-  async function startTune() {
-    if (!state.booted || !state.sessionId) {
-      showError('会话尚未就绪，暂时无法启动调参。', function () { hideError(); bootLive(); });
-      return;
-    }
-    if (state.tune.status === 'starting' || state.tune.status === 'running') return;
-    hideError();
-    closeTuneSource();
-    clearTimers(MOCK_TUNE_TIMERS);
-    stopTuneClock();
-    var requested = Number(($('tune-trial-select') || {}).value) || 24;
-    var runSeq = state.tune.runSeq + 1;
-    state.tune = {
-      status: 'starting',
-      jobId: '',
-      total: 0,
-      trials: [],
-      baseWeights: null,
-      bestWeights: null,
-      baseMetrics: null,
-      bestMetrics: null,
-      compare: null,
-      candidateVersionId: '',
-      bestTrialIndex: -1,
-      startedAt: Date.now(),
-      finishedAt: 0,
-      elapsedMs: 0,
-      error: '',
-      source: null,
-      runSeq: runSeq,
-      renderQueued: false,
-      weightChartRendered: false,
-      actionBusy: false,
-      currentStep: 1
-    };
-    if (state.activeView !== 'tune') switchView('tune');
-    renderTuneView();
-    startTuneClock();
-    try {
-      if (state.mock) {
-        mockStartTune(requested, runSeq);
-        return;
-      }
-      var payload = await request(sessionPath('/tune'), {
-        method: 'POST',
-        body: { trials: requested }
-      });
-      if (runSeq !== state.tune.runSeq) return;
-      if (!payload || !payload.job_id) throw new AppError('调参任务创建失败：响应缺少 job_id。', 0);
-      state.tune.jobId = String(payload.job_id);
-      state.tune.status = 'running';
-      renderTuneView();
-      openTuneEvents(runSeq);
-    } catch (err) {
-      handleTuneFailure(err, runSeq);
-    }
-  }
-
-  function openTuneEvents(runSeq) {
-    var url = API_BASE + sessionPath('/tune/events') + '?job_id=' + encodeURIComponent(state.tune.jobId);
-    var source;
-    try { source = new EventSource(url); }
-    catch (err) { handleTuneFailure(new AppError('浏览器无法建立调参 SSE 连接。', 0), runSeq); return; }
-    state.tune.source = source;
-    var settled = false;
-    function isCurrent() { return runSeq === state.tune.runSeq; }
-    function fail(message) {
-      if (settled || !isCurrent()) return;
-      settled = true;
-      source.close();
-      handleTuneFailure(new AppError(message || '调参事件连接中断。', 0), runSeq);
-    }
-    source.addEventListener('tuning_started', function (event) {
-      if (!isCurrent()) return;
-      var payload = parseEventData(event.data, {});
-      if (!payload || typeof payload !== 'object') { fail('调参启动事件格式非法。'); return; }
-      handleTuneStarted(payload, runSeq);
-    });
-    source.addEventListener('trial', function (event) {
-      if (!isCurrent()) return;
-      var payload;
-      try { payload = parseEventData(event.data, null); }
-      catch (err) { fail('调参 trial 数据解析失败。'); return; }
-      if (!payload || typeof payload !== 'object') { fail('调参 trial 事件格式非法。'); return; }
-      handleTuneTrial(payload, runSeq);
-    });
-    source.addEventListener('best_update', function (event) {
-      if (!isCurrent()) return;
-      var payload = parseEventData(event.data, {});
-      if (!payload || typeof payload !== 'object') { fail('调参最优更新事件格式非法。'); return; }
-      handleBestUpdate(payload, runSeq);
-    });
-    source.addEventListener('done', function (event) {
-      if (settled || !isCurrent()) return;
-      var payload = parseEventData(event.data, {});
-      if (!payload || typeof payload !== 'object') { fail('调参完成事件格式非法。'); return; }
-      settled = true;
-      source.close();
-      handleTuneDone(payload, runSeq);
-    });
-    source.addEventListener('error', function (event) {
-      if (settled || !isCurrent()) return;
-      if (event && event.data) {
-        var payload = parseEventData(event.data, {});
-        fail(extractApiError(payload, 0) || '调参流返回错误。');
-      } else {
-        fail('调参事件连接中断，请重试。');
-      }
-    });
-  }
-
-  function closeTuneSource() {
-    if (state.tune.source) {
-      try { state.tune.source.close(); } catch (err) { /* ignore */ }
-      state.tune.source = null;
-    }
-  }
-
-  function normalizeTrial(raw) {
-    var source = raw || {};
-    var metrics = normalizeMetrics(source.metrics || {});
-    var objective = firstNum(source.objective);
-    if (objective === null && metrics.sharpe !== null) {
-      objective = metrics.sharpe - 0.5 * Math.abs(metrics.mdd || 0) + 0.2 * (metrics.ir || 0);
-    }
-    return {
-      trial_index: firstNum(source.trial_index, source.index) || 0,
-      weights: normalizeWeights(source.weights),
-      metrics: metrics,
-      objective: objective,
-      is_best: !!source.is_best
-    };
-  }
-
-  function handleTuneStarted(payload, runSeq) {
-    if (runSeq !== state.tune.runSeq) return;
-    var tune = state.tune;
-    tune.status = 'running';
-    tune.jobId = firstText(payload.job_id, tune.jobId);
-    tune.total = firstNum(payload.trials_total, payload.total, tune.total) || 0;
-    tune.baseWeights = normalizeWeights(payload.base_weights) || tune.baseWeights;
-    tune.baseMetrics = Object.keys(payload.base_metrics || {}).length ? normalizeMetrics(payload.base_metrics) : tune.baseMetrics;
-    tune.startedAt = tune.startedAt || Date.now();
-    tune.weightChartRendered = false;
-    var grid = $('tune-grid');
-    if (grid) grid.classList.remove('is-loading');
-    startTuneClock();
-    renderTuneView();
-    scheduleTuneRender();
-  }
-
-  function handleTuneTrial(payload, runSeq) {
-    if (runSeq !== state.tune.runSeq) return;
-    var trial = normalizeTrial(payload);
-    if (!trial.trial_index) trial.trial_index = state.tune.trials.length + 1;
-    state.tune.trials.push(trial);
-    if (trial.is_best) {
-      // is_best 表示这组刷新了当时最优，不代表历史组一直是最优；
-      // 清除旧标记，让散点与指标卡始终高亮最终的最优 trial。
-      state.tune.trials.forEach(function (item, index) {
-        if (index !== state.tune.trials.length - 1) item.is_best = false;
-      });
-      if (trial.weights) state.tune.bestWeights = trial.weights;
-      state.tune.bestMetrics = trial.metrics;
-      state.tune.bestTrialIndex = state.tune.trials.length - 1;
-    }
-    if (!state.tune.total) state.tune.total = state.tune.trials.length;
-    state.tune.currentStep = state.tune.trials.length >= state.tune.total ? 4 : 3;
-    updateTuneElapsed();
-    scheduleTuneRender();
-  }
-
-  function handleBestUpdate(payload, runSeq) {
-    if (runSeq !== state.tune.runSeq) return;
-    var weights = normalizeWeights(payload.best_weights);
-    if (weights) state.tune.bestWeights = weights;
-    if (payload.best_metrics && Object.keys(payload.best_metrics).length) {
-      state.tune.bestMetrics = normalizeMetrics(payload.best_metrics);
-    }
-    var bestIndex = state.tune.trials.findIndex(function (trial) { return trial.is_best; });
-    if (bestIndex >= 0) state.tune.bestTrialIndex = bestIndex;
-    scheduleTuneRender();
-  }
-
-  function applyBestFromTrials() {
-    var tune = state.tune;
-    var bestIndex = -1;
-    var bestObjective = -Infinity;
-    tune.trials.forEach(function (trial, index) {
-      if (trial.is_best) { bestIndex = index; return; }
-      if (trial.objective !== null && trial.objective > bestObjective) {
-        bestObjective = trial.objective;
-      }
-    });
-    if (bestIndex < 0) {
-      tune.trials.forEach(function (trial, index) {
-        if (trial.objective !== null && trial.objective > bestObjective) {
-          bestObjective = trial.objective;
-          bestIndex = index;
-        }
-      });
-    }
-    if (bestIndex >= 0) {
-      tune.bestTrialIndex = bestIndex;
-      if (!tune.bestWeights && tune.trials[bestIndex].weights) tune.bestWeights = tune.trials[bestIndex].weights;
-      if (!tune.bestMetrics) tune.bestMetrics = tune.trials[bestIndex].metrics;
-    }
-  }
-
-  function handleTuneDone(payload, runSeq) {
-    if (runSeq !== state.tune.runSeq) return;
-    closeTuneSource();
-    stopTuneClock();
-    var tune = state.tune;
-    tune.status = 'done';
-    tune.finishedAt = Date.now();
-    tune.elapsedMs = tune.startedAt ? tune.finishedAt - tune.startedAt : tune.elapsedMs;
-    tune.candidateVersionId = firstText(payload.candidate_version_id, payload.version_id, tune.candidateVersionId);
-    tune.compare = payload.compare || tune.compare || null;
-    // 部分实现可能只在 done 中回传最终权重/指标，做兼容读取但不伪造。
-    if (payload.best_weights) tune.bestWeights = normalizeWeights(payload.best_weights) || tune.bestWeights;
-    if (payload.best_metrics && Object.keys(payload.best_metrics).length) tune.bestMetrics = normalizeMetrics(payload.best_metrics);
-    applyBestFromTrials();
-    if (!tune.total) tune.total = tune.trials.length;
-    if (!tune.bestWeights) {
-      var compare = payload.compare || {};
-      var competitor = compare.candidate || compare.best || {};
-      tune.bestWeights = normalizeWeights(compare.best_weights || compare.candidate_weights || competitor.weights) || tune.bestWeights;
-    }
-    if (!tune.bestMetrics) {
-      var compareMetrics = (payload.compare || {}).candidate_metrics ||
-        (payload.compare || {}).best_metrics ||
-        ((payload.compare || {}).candidate || {}).metrics;
-      if (compareMetrics) tune.bestMetrics = normalizeMetrics(compareMetrics);
-    }
-    upsertCandidateVersion();
-    var grid = $('tune-grid');
-    if (grid) grid.classList.remove('is-loading');
-    renderTuneView();
-    ensureVersions(true);
-    showToast('AI 调参完成，候选版本等待人工启用。');
-  }
-
-  function handleTuneFailure(err, runSeq) {
-    if (runSeq !== state.tune.runSeq) return;
-    closeTuneSource();
-    stopTuneClock();
-    state.tune.status = 'error';
-    state.tune.error = friendlyError(err);
-    state.tune.elapsedMs = state.tune.startedAt ? Date.now() - state.tune.startedAt : state.tune.elapsedMs;
-    renderTuneView();
-    showError('调参失败：' + state.tune.error, function () {
-      hideError();
-      startTune();
-    });
-  }
-
-  function upsertCandidateVersion() {
-    var tune = state.tune;
-    if (!tune.candidateVersionId) return;
-    var existingIndex = state.versions.findIndex(function (version) { return version.id === tune.candidateVersionId; });
-    // 新候选产生后，本地旧 candidate 状态归入历史；避免版本时间轴出现多个“候选”。
-    state.versions.forEach(function (version) {
-      if (version.id !== tune.candidateVersionId && version.status === 'candidate') version.status = 'archived';
-    });
-    var candidate = {
-      id: tune.candidateVersionId,
-      weights: tune.bestWeights,
-      metrics: tune.bestMetrics,
-      status: 'candidate',
-      created_at: nowIso(),
-      parent_id: state.activeVersionId || null
-    };
-    if (existingIndex >= 0) {
-      candidate = Object.assign({}, state.versions[existingIndex], candidate);
-      candidate.status = state.versions[existingIndex].status === 'active' ? 'active' : 'candidate';
-      state.versions[existingIndex] = candidate;
+  function toggleWorkbench() {
+    var wide = window.matchMedia('(min-width: 1280px)').matches;
+    if (wide) {
+      document.body.classList.toggle('wb-collapsed');
     } else {
-      state.versions.push(candidate);
+      document.body.classList.toggle('wb-open');
     }
-    renderVersionTimeline();
+    syncWorkbenchToggle();
   }
 
-  async function ensureVersions(force) {
-    if (state.mock) {
-      state.versionsLoaded = true;
-      renderVersionTimeline();
-      renderTuneActions();
-      return;
-    }
-    if (!state.booted) return;
-    if (state.versionsLoading) return;
-    if (state.versionsLoaded && !force) return;
-    state.versionsLoading = true;
-    state.versionError = '';
-    try {
-      var payload = await request('/versions');
-      var versions = payload && Array.isArray(payload.versions) ? payload.versions : [];
-      state.versions = versions.map(function (version) {
-        return {
-          id: String(version.id),
-          weights: normalizeWeights(version.weights),
-          metrics: normalizeMetrics(version.metrics || {}),
-          status: version.status || 'archived',
-          created_at: version.created_at || '',
-          parent_id: version.parent_id || null
-        };
-      });
-      state.activeVersionId = firstText(payload && payload.active_id, state.activeVersionId);
-      if (!state.activeVersionId) {
-        var active = state.versions.find(function (version) { return version.status === 'active'; });
-        if (active) state.activeVersionId = active.id;
-      }
-      // done 事件已给出候选版本，若版本列表略滞后则保留本地占位，避免时间轴缺节点。
-      if (state.tune.candidateVersionId && state.tune.status === 'done' &&
-        !state.versions.some(function (version) { return version.id === state.tune.candidateVersionId; })) {
-        state.versions.push({
-          id: state.tune.candidateVersionId,
-          weights: state.tune.bestWeights,
-          metrics: state.tune.bestMetrics,
-          status: 'candidate',
-          created_at: nowIso(),
-          parent_id: state.activeVersionId || null
+  function syncWorkbenchToggle() {
+    var wide = window.matchMedia('(min-width: 1280px)').matches;
+    var expanded = wide ? !document.body.classList.contains('wb-collapsed') : document.body.classList.contains('wb-open');
+    dom.wbToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    dom.wbToggleLabel.textContent = expanded ? '收起工作台' : 'AI 工作台';
+  }
+
+  /* ============================== 事件绑定 ============================== */
+  function handleActionClick(event) {
+    var button = event.target.closest ? event.target.closest('[data-action]') : null;
+    if (!button || button.disabled) return;
+    var action = button.getAttribute('data-action');
+    if (action === 'quick') {
+      var message = button.getAttribute('data-message');
+      var approval = button.closest('.card-approval');
+      if (approval) {
+        approval.classList.add('is-answered');
+        var pill = approval.querySelector('.card-head .status-pill');
+        if (pill) {
+          pill.className = 'status-pill is-ok';
+          pill.textContent = '已回复';
+        }
+        Array.prototype.forEach.call(approval.querySelectorAll('button'), function (item) {
+          item.disabled = true;
         });
       }
-      state.versionsLoaded = true;
-      renderVersionTimeline();
-      renderTuneActions();
-      if (state.activeView === 'tune') renderTuneView();
-    } catch (err) {
-      state.versionError = friendlyError(err);
-      renderVersionTimeline();
-      showError('版本记录加载失败：' + state.versionError, function () { hideError(); ensureVersions(true); });
-    } finally {
-      state.versionsLoading = false;
+      if (message) sendMessage(message);
+      return;
+    }
+    if (action === 'retry') {
+      if (state.lastUserMessage) sendMessage(state.lastUserMessage);
+      else bootstrap();
+      return;
+    }
+    if (action === 'retry-init') {
+      bootstrap();
     }
   }
 
-  async function performVersionAction(action) {
-    if (state.tune.actionBusy) return;
-    var target;
-    if (action === 'activate') {
-      target = state.tune.candidateVersionId;
-      if (!target) { showToast('候选版本尚未就绪。'); return; }
-    } else {
-      // 后端 /versions/{vid}/rollback 的语义是“回滚到 vid”。
-      var rollbackTarget = getRollbackTarget();
-      target = rollbackTarget && rollbackTarget.id;
-      if (!target) { showToast('当前没有可回滚的历史版本。'); return; }
-    }
-    state.tune.actionBusy = true;
-    renderTuneActions();
-    hideError();
-    try {
-      var payload;
-      if (state.mock) {
-        payload = await mockVersionAction(action, target);
-      } else {
-        payload = await request('/versions/' + encodeURIComponent(target) + '/' + (action === 'activate' ? 'activate' : 'rollback'), {
-          method: 'POST',
-          body: { reason: action === 'activate' ? '用户在 AI 调参台人工启用候选版本' : '用户在 AI 调参台人工回滚至历史版本' }
-        });
-      }
-      if (payload && payload.active_id) state.activeVersionId = String(payload.active_id);
-      if (state.mock) {
-        renderVersionTimeline();
-        renderTuneActions();
-      } else {
-        state.versionsLoaded = false;
-        await ensureVersions(true);
-      }
-      showToast(action === 'activate' ? '候选版本已启用。' : '已回滚至 ' + versionLabel(target) + '。');
-    } catch (err) {
-      showError((action === 'activate' ? '启用失败：' : '回滚失败：') + friendlyError(err), function () {
-        hideError();
-        performVersionAction(action);
-      });
-    } finally {
-      state.tune.actionBusy = false;
-      renderTuneActions();
-    }
-  }
-
-  /* =========================================================================
-   * DEV-ONLY：Mock 适配器
-   * 仅在 ?mock=1 且 mock-data.js 已加载时被调用；生产路径不会执行。
-   * ========================================================================= */
-  function mockStartSelection(topN, runSeq) {
-    clearTimers(MOCK_SELECTION_TIMERS);
-    var result = deepClone(window.MockData.selectionResult || {});
-    var top = (result.top || []).slice(0, Math.min(topN, (result.top || []).length));
-    var portfolio = (result.portfolio || []).slice(0, top.length);
-    var selectedWeights = portfolio.map(function (item) { return toNum(item.weight_pct) || 0; });
-    var weightSum = selectedWeights.reduce(function (sum, value) { return sum + value; }, 0) || 1;
-    portfolio = portfolio.map(function (item, index) {
-      var weight = Number((selectedWeights[index] / weightSum * 100).toFixed(1));
-      return Object.assign({}, item, { weight_pct: weight, amount: Math.round(weight / 100 * 1000000) });
-    });
-    result.top = top;
-    result.portfolio = portfolio;
-    result.top_n = top.length;
-    result.nav = window.MockData.selectionResult.nav;
-    var staged = [
-      { stage: 'loading_data', percent: 18, message: '读取示例行情与基本面缓存…' },
-      { stage: 'scoring', percent: 46, message: '计算 10 因子并进行行业中性化…' },
-      { stage: 'portfolio', percent: 71, message: '按风险平价构建组合…' },
-      { stage: 'backtest', percent: 88, message: '执行 T+1、涨跌停与成本约束回测…' }
-    ];
-    function later(ms, fn) {
-      MOCK_SELECTION_TIMERS.push(setTimeout(function () {
-        if (runSeq !== state.selection.runSeq) return;
-        fn();
-      }, ms));
-    }
-    later(220, function () {
-      state.selection.status = 'running';
-      state.selection.progress = 8;
-      state.selection.stage = 'started';
-      state.selection.message = '示例选股任务已启动…';
-      renderSelectionView();
-    });
-    staged.forEach(function (item, index) {
-      later(500 + index * 330, function () {
-        state.selection.progress = item.percent;
-        state.selection.stage = item.stage;
-        state.selection.message = item.message;
-        renderSelectionView();
-      });
-    });
-    later(2050, function () {
-      handleSelectionResult(result, runSeq);
-    });
-  }
-
-  function mockStartTune(requested, runSeq) {
-    clearTimers(MOCK_TUNE_TIMERS);
-    var data = window.MockData.tuning;
-    var all = data.trials.slice();
-    var count = Math.max(3, Math.min(requested, all.length));
-    var selected = all.slice();
-    if (count < all.length) {
-      var best = all.find(function (trial) { return trial.is_best; });
-      selected = all.slice(0, count - 1);
-      if (best && selected.indexOf(best) < 0) selected.push(best);
-      selected.sort(function (a, b) { return a.trial_index - b.trial_index; });
-    }
-    var total = selected.length;
-    function later(ms, fn) {
-      MOCK_TUNE_TIMERS.push(setTimeout(function () {
-        if (runSeq !== state.tune.runSeq) return;
-        fn();
-      }, ms));
-    }
-    later(320, function () {
-      handleTuneStarted({
-        job_id: data.job_id,
-        trials_total: total,
-        base_weights: data.base_weights,
-        base_metrics: data.base_metrics
-      }, runSeq);
-    });
-    selected.forEach(function (trial, index) {
-      later(650 + index * 125, function () {
-        handleTuneTrial(trial, runSeq);
-        if (trial.is_best) {
-          later(160, function () {
-            handleBestUpdate({ best_weights: data.best_weights, best_metrics: data.best_metrics }, runSeq);
-          });
-        }
-      });
-    });
-    later(850 + total * 125, function () {
-      handleTuneDone({
-        candidate_version_id: data.candidate_version_id,
-        compare: data.compare
-      }, runSeq);
-    });
-  }
-
-  async function mockConversationStream(content, kind, handlers) {
-    await sleep(260);
-    var data = window.MockData;
-    var text = kind === 'interpretation' ? data.interpretation : (kind === 'followup' ? data.followupReply : data.chatReply.content);
-    if (kind === 'chat' && data.chatReply) {
-      await sleep(120);
-      if (handlers.onSlots) handlers.onSlots(data.chatReply.slots);
-      if (handlers.onProfileReady) handlers.onProfileReady({ slots: data.chatReply.slots, confirmed: state.profile.confirmed, complete: true });
-    }
-    var chunks = mockChunkText(text, 5);
-    for (var i = 0; i < chunks.length; i += 1) {
-      await sleep(18);
-      if (handlers.onToken) handlers.onToken(chunks[i]);
-    }
-  }
-
-  async function mockVersionAction(action, target) {
-    await sleep(320);
-    // 与后端 store.rollback 语义一致：activate 与 rollback 都是把目标版本设为 active。
-    var previousActive = state.activeVersionId;
-    state.versions.forEach(function (version) {
-      if (version.id === previousActive) version.status = 'archived';
-      if (version.id === target) version.status = 'active';
-    });
-    state.activeVersionId = target;
-    return { active_id: target };
-  }
-
-  /* ------------------------------------------------------------- 事件绑定 */
   function bindEvents() {
-    all('.nav-item').forEach(function (button) {
-      button.addEventListener('click', function () { switchView(button.getAttribute('data-view')); });
-    });
-    all('[data-nav]').forEach(function (link) {
-      link.addEventListener('click', function (event) {
-        event.preventDefault();
-        switchView(link.getAttribute('data-nav') || 'chat');
-      });
-    });
-    window.addEventListener('hashchange', function () {
-      var view = (window.location.hash || '').replace(/^#/, '');
-      if (VIEWS.indexOf(view) >= 0 && view !== state.activeView) switchView(view, { keepHash: true });
-    });
-    window.addEventListener('online', function () {
-      if (!state.mock) loadHealth();
-    });
-    window.addEventListener('resize', function () {
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(function () {
-        if (state.activeView === 'selection' && state.selection.result) renderSelectionView();
-        else if (state.activeView === 'tune') renderTuneView();
-      }, 220);
-    });
-
-    var errorRetry = $('error-retry');
-    if (errorRetry) errorRetry.addEventListener('click', function () {
-      var action = state.retryAction;
-      hideError();
-      if (action) action();
-    });
-    var errorClose = $('error-close');
-    if (errorClose) errorClose.addEventListener('click', hideError);
-
-    var chatForm = $('chat-form');
-    if (chatForm) chatForm.addEventListener('submit', function (event) {
+    dom.composer.addEventListener('submit', function (event) {
       event.preventDefault();
-      handleChatSubmit();
-    });
-    var chatInput = $('chat-input');
-    if (chatInput) {
-      chatInput.addEventListener('input', function () { autoGrow(chatInput); });
-      chatInput.addEventListener('keydown', function (event) {
-        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-          event.preventDefault();
-          chatForm.requestSubmit();
-        }
-      });
-    }
-    var quick = $('quick-prompts');
-    if (quick) quick.addEventListener('click', function (event) {
-      var chip = event.target.closest('.quick-chip');
-      if (!chip || state.chatBusy) return;
-      var prompt = chip.getAttribute('data-prompt') || chip.textContent.trim();
-      if (chatInput) {
-        chatInput.value = prompt;
-        autoGrow(chatInput);
-        handleChatSubmit();
-      }
+      sendMessage(dom.input.value);
     });
 
-    var editButton = $('profile-edit');
-    if (editButton) editButton.addEventListener('click', function () {
-      if (state.profileEditing) closeProfileEditor();
-      else openProfileEditor();
-    });
-    var cancel = $('profile-cancel');
-    if (cancel) cancel.addEventListener('click', closeProfileEditor);
-    var save = $('profile-save');
-    if (save) save.addEventListener('click', handleSaveProfile);
-    var confirm = $('profile-confirm');
-    if (confirm) confirm.addEventListener('click', handleConfirmProfile);
-    var editor = $('profile-editor');
-    if (editor) editor.addEventListener('submit', function (event) { event.preventDefault(); handleSaveProfile(); });
-    var start = $('start-selection');
-    if (start) start.addEventListener('click', startSelection);
-
-    var runSelection = $('run-selection');
-    if (runSelection) runSelection.addEventListener('click', startSelection);
-    var emptyRun = $('selection-empty-run');
-    if (emptyRun) emptyRun.addEventListener('click', startSelection);
-    var goChat = $('selection-go-chat');
-    if (goChat) goChat.addEventListener('click', function () { switchView('chat'); });
-
-    var interpretBody = $('interpret-body');
-    if (interpretBody) interpretBody.addEventListener('click', function (event) {
-      var generate = event.target.closest('[data-action="generate-interpretation"], #generate-interpretation');
-      if (generate) { generateInterpretation(); return; }
-      var go = event.target.closest('[data-action="go-selection"]');
-      if (go) switchView('selection');
-    });
-    var followupForm = $('followup-form');
-    if (followupForm) followupForm.addEventListener('submit', function (event) {
+    dom.input.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing || composing) return;
       event.preventDefault();
-      handleFollowupSubmit();
+      sendMessage(dom.input.value);
     });
-    var followupInput = $('followup-input');
-    if (followupInput) {
-      followupInput.addEventListener('input', function () { autoGrow(followupInput); });
-      followupInput.addEventListener('keydown', function (event) {
-        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-          event.preventDefault();
-          followupForm.requestSubmit();
-        }
-      });
-    }
 
-    var startTuneButton = $('start-tune');
-    if (startTuneButton) startTuneButton.addEventListener('click', startTune);
-    var activate = $('tune-activate');
-    if (activate) activate.addEventListener('click', function () { performVersionAction('activate'); });
-    var rollback = $('tune-rollback');
-    if (rollback) rollback.addEventListener('click', function () { performVersionAction('rollback'); });
+    dom.input.addEventListener('compositionstart', function () {
+      composing = true;
+    });
+    dom.input.addEventListener('compositionend', function () {
+      composing = false;
+    });
+    dom.input.addEventListener('input', resizeInput);
+
+    dom.scroll.addEventListener('scroll', function () {
+      state.following = isNearBottom();
+    }, { passive: true });
+
+    dom.wbToggle.addEventListener('click', toggleWorkbench);
+    dom.stream.addEventListener('click', handleActionClick);
+    dom.workbench.addEventListener('click', handleActionClick);
+
+    var media = window.matchMedia('(min-width: 1280px)');
+    var onViewportChange = function () {
+      syncWorkbenchToggle();
+    };
+    if (media.addEventListener) media.addEventListener('change', onViewportChange);
+    else if (media.addListener) media.addListener(onViewportChange);
   }
 
-  /* --------------------------------------------------------------- 启动 */
+  /* ============================== 启动 ============================== */
+  function boot() {
+    cacheDom();
+    bindEvents();
+    syncWorkbenchToggle();
+    renderAllWorkbench();
+    bootstrap();
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', boot);
   } else {
-    init();
+    boot();
   }
 })();

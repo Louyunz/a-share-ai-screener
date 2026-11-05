@@ -1,149 +1,178 @@
-# A 股 AI 选股 MVP · 接口契约（开发冻结版）
+# A 股 AI 选股助手 · v2 契约（对话优先 + AI 主动执行 + AI 参与建模）
 
-本文件是并开发包的唯一契约。所有模块按此实现，禁止擅自改字段名/语义；确需变更先告知 Lead。
+> 本文件是 v2 唯一契约。旧版接口/页面/兜底设计直接替换，不保留兼容层；历史版本见 git。
 
 ## 0. 环境
 
 - 项目根：`C:\Users\77578\Documents\deepseek-harness\default-workspace\a-share-ai-screener`
-- Python：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（3.12，已装 pandas 3 / numpy 2 / scipy）
-- Node：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe`（24）
-- **没有** fastapi/uvicorn/pytest/akshare/tushare，也不能联网安装。后端同时提供标准库 dev_server 供本地运行。
-- git 由 Lead 统一管理，队友**不要执行任何 git 命令**。
+- Python：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（已装 fastapi/uvicorn；无 akshare/tushare）
+- Node：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe`
+- git 由 Lead 统一提交；子任务不要执行 git，不要改自己写作用域之外的文件。
 
-## 1. 数据层契约（DataBundle）
+## 1. 产品原则（v2）
 
-`backend/data/base.py` 定义：
+1. **一个对话框完成全部操作**：画像采集、确认、选股、解读、追问、模型优化、版本启用/回滚，全部在同一个聊天流里完成。没有模块页签、没有独立的“运行/确认”按钮页面。
+2. **AI 主动执行（用户确认后）**：AI 判断用户意图并调用后端动作。画像确认、发起选股等低风险动作，在用户对话中确认后由 AI 直接执行；应用模型变更/启用版本等高影响动作，在聊天中给出审批卡，用户点击聊天内快捷回复或直接说“同意”后执行。
+3. **普通用户语言**：AI 不用专业术语提问；必须把“回撤、夏普、因子”等翻译成生活化解释；一次只问一个问题；先共情再提问。
+4. **AI 真正参与建模**：AI 可以切换内置模型类型、调整参数、生成/修改选股模型源码（受静态检查与冒烟测试约束），并用回测结果向用户解释为什么更好。
+5. **AI 工作过程可见**：优化过程中，前端实时展示 AI 的步骤（分析→提出方案→改代码→检查→回测→对比→等待确认），步骤由后端真实动作产生，不伪造。
 
-```python
-@dataclass
-class DataBundle:
-    prices: pd.DataFrame       # 前复权收盘价，宽表 index=交易日(Timestamp,升序), columns=代码
-    close_raw: pd.DataFrame    # 未复权收盘价，与 prices 对齐（判断涨跌停）
-    amount: pd.DataFrame       # 成交额（元），与 prices 对齐（流动性、停牌判断）
-    fundamentals: pd.DataFrame # index=代码；列：ep/bp/roe/ocf_to_profit/revenue_growth/pe/pb/total_mv/float_mv
-    industry: pd.DataFrame     # index=代码；列：industry（申万一级行业名）
-    benchmark: pd.Series       # 沪深300 收盘价，index=交易日
-    universe: list[str]        # 股票池代码
-    meta: dict                 # {"source": "sample"/"akshare"/"tushare", "as_of": "YYYY-MM-DD", ...}
+## 2. 后端 API（精简）
 
-class IDataPort(Protocol):
-    def load(self) -> DataBundle: ...
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/health` | `{ok, source, as_of, universe, llm}` |
+| POST | `/api/sessions` | `{session_id}` |
+| POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
+| GET | `/api/sessions/{sid}/messages` | 文本历史 `{messages:[{role,content,created_at}]}` |
+| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection}` |
+| GET | `/api/versions` | 版本列表（兼容保留给状态面板） |
+
+不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
+
+## 3. 聊天 SSE 事件
+
+`event: token` → `{text}`：AI 自然语言增量。
+`event: ui` → `{block: {...}}`：插入或更新一个富卡片（按 `id` upsert）。
+`event: done` → `{message_id}`。
+`event: error` → `{message, retryable}`。
+
+### 3.1 卡片（block）
+
+**profile**（画像卡）
+```json
+{"id":"profile-1","type":"profile",
+ "summary":"用一句话描述用户（AI 生成，通俗）",
+ "items":[{"label":"风险感受","value":"亏 15% 会有点慌"},...],
+ "completeness":0.75,"missing":["投资期限"],
+ "confirmed":false}
 ```
 
-缓存文件（`data/a_share/`）：`prices`、`close_raw`、`amount`、`fundamentals`、`benchmark` 五类数值表（有 pyarrow 时写 `.parquet`，否则写 `.csv`，读取时自动识别），以及 `industry.csv`、`universe.csv`、`meta.json`。服务运行期只读缓存。
-
-## 2. 引擎契约（engine-dev 实现）
-
-文件：`backend/engine/factors.py`、`selection.py`、`tuner.py`。只允许 import：`pandas`、`numpy`、`scipy`、标准库；**不得 import fastapi/akshare/tushare/其他 backend 模块**（engine 是纯函数库）。
-
-### 2.1 factors.py
-
-```python
-FACTOR_NAMES = ["ep","bp","roe","ocf_to_profit","revenue_growth","momentum_60","reversal_5","volatility_60","liquidity_20","size"]
-FACTOR_DIRECTION = {"ep":1,"bp":1,"roe":1,"ocf_to_profit":1,"revenue_growth":1,
-                    "momentum_60":1,"reversal_5":-1,"volatility_60":-1,"liquidity_20":-1,"size":-1}
-RISK_WEIGHTS = {"conservative": {...10 项和为1...}, "balanced": {...}, "aggressive": {...}}
-DEFAULT_WEIGHTS = RISK_WEIGHTS["balanced"]
-WEIGHT_PRESETS: dict[str, dict] = {...}
-
-def weights_for(risk_level: str) -> dict            # 未知等级回退 balanced
-def validate_weights(weights: dict) -> None          # 10 项齐全、和为1±1e-6、每项 ∈[0,0.4]，否则 ValueError
-def register_preset(name: str, weights: dict) -> None
-def compute_factor_scores(prices, close_raw, amount, fundamentals, industry,
-                          weights=None, asof=None, min_history=120) -> pd.DataFrame
+**selection**（选股结果卡）
+```json
+{"id":"selection-1","type":"selection",
+ "as_of":"2024-11-18","model":{"name":"均衡多因子","description":"..."},
+ "top":[{"code":"600519.SH","industry":"食品饮料","score":2.4,
+         "reasons":["盈利质量高","价格相对便宜"]}],
+ "metrics":{"cagr":0.19,"sharpe":1.0,"mdd":-0.17,"ir":3.5,"win_rate":0.6},
+ "metric_notes":{"cagr":"过去几年平均每年涨多少","sharpe":"同样的波动下赚得多不多"},
+ "portfolio":[{"code":"...","weight_pct":12.0}],
+ "nav":[{"date":"...","value":1.0}],"benchmark_nav":[...],
+ "explanation":"给普通用户看的解读"}
 ```
 
-`compute_factor_scores` 返回：index=代码，列包含每个因子的 `raw_<name>`、`z_<name>`（行业中性化后），以及 `factor_score`；按 score 降序。规则：
-- 用 `asof` 之前（含）的行情切片；`momentum_60`=近60交易日收益、`reversal_5`=近5日收益、`volatility_60`=近60日日收益年化波动、`liquidity_20`=近20日日均成交额取对数、`size`=ln(流通市值)。
-- 去极值 1%/99%、z-score；行业中性化=按 industry 分组 z-score（行业样本<3 时用全市场 z）。
-- 方向对齐：`z * FACTOR_DIRECTION`，保证越大越好；缺失值 z=0。
-- 数据不足 `min_history` 的代码剔除。
-
-### 2.2 selection.py
-
-```python
-def screen(data, weights, top_n=10, asof=None, exclude_codes=None) -> tuple[pd.DataFrame, pd.DataFrame]
-# data 可为 DataBundle 或 dict；top_df 列：code, score, industry, z 列（至少 z_ep 等 10 个）
-def build_portfolio(top_df, prices, method="equal_weight", capital=1_000_000.0) -> pd.DataFrame
-# 列：code, weight_pct, amount, method；method ∈ {equal_weight, risk_parity}
-def run_backtest(data, weights, start, end, top_n=10, rebalance_days=20,
-                 cost_buy=0.0003, cost_sell=0.0013, risk_free_rate=0.02) -> dict
-# 返回 {"nav": pd.Series, "benchmark_nav": pd.Series,
-#       "metrics": {"cagr","sharpe","mdd","ir","win_rate"}, "rebalances": int}
+**work**（AI 工作过程卡，优化/分析时出现）
+```json
+{"id":"work-1","type":"work","title":"AI 正在优化模型",
+ "status":"running|done|error",
+ "steps":[{"title":"看当前表现","detail":"近两年年化 12%，最大回撤 18%","status":"done","kind":"analysis"},
+          {"title":"提出方案","detail":"把权重更多放给低波动和盈利质量","status":"running","kind":"plan"}],
+ "comparison":{"current":{"sharpe":1.0},"candidate":{"sharpe":1.2}},
+ "proposal":{"summary":"...","approach":"model_type|weights|code",
+             "model_name":"低波质量","diff":"（code 方案时的 diff 摘要）",
+             "risks":["..."]}}
 ```
 
-A 股规则：
-- T+1：调仓日 t 收盘出信号，t+1 收盘价成交（价格缺失则顺延）。
-- 停牌/无成交（price 或 amount 为 NaN/0）标的买卖跳过。
-- 涨跌停：以 `close_raw` 日收益判断，买入时涨幅 ≥ +9.8% 跳过，卖出时跌幅 ≤ −9.8% 跳过。
-- 成本：买入收 `cost_buy`，卖出收 `cost_sell`（含印花税）；按换手计。
-- 风险平价：用调仓日前 60 日日收益年化波动倒数加权。
-- 指标：CAGR、Sharpe（日频年化、减无风险）、MDD、IR（相对基准）、月胜率。
-
-### 2.3 tuner.py
-
-```python
-def run_tuning(data, base_weights=None, trials=60, top_n=10, start=None, end=None,
-               seed=42, progress_cb=None) -> dict
-# 返回 {"best_weights","base_metrics","best_metrics","objective","trials":[...]}
-# progress_cb(trial: dict) 每完成一组调用一次；trial 字段：
-#   {"trial_index":int,"weights":{10项},"metrics":{cagr,sharpe,mdd,ir},"objective":float,"is_best":bool}
-# 约束：随机采样 10 项权重、和为 1、每项 ∈[0,0.4]；目标 J = sharpe - 0.5*abs(mdd) + 0.2*ir
-# 防过拟合：同时计算 IS（前 70% 区间）与 OOS（后 30%）；要求 IS cagr >= 0.8*base IS cagr
+**approval**（审批卡；用户可在聊天里点快捷回复，也可直接说话）
+```json
+{"id":"approval-1","type":"approval","title":"是否启用这个改进？",
+ "summary":"AI 建议把模型切成「低波质量」并微调权重，回测 Sharpe 从 1.02 升到 1.21。",
+ "risk":"这是演示系统，不构成投资建议。",
+ "actions":[{"label":"同意，启用吧","message":"同意启用这个改进"},
+            {"label":"先看看细节","message":"先不启用，展开说说风险"}]}
 ```
 
-### 2.4 测试（engine-dev 负责）
-
-`tests/test_engine.py`（unittest，不依赖 pytest）：构造 60 只股票、400 个交易日的合成数据（固定 seed），验证：10 因子列齐全/权重校验/行业中性化稳健/筛选排序/组合权重和为 100/回测指标有限且 MDD≤0/调优输出约束与进度回调次数。运行命令：
-
+**version**（版本卡）
+```json
+{"id":"version-1","type":"version","active":{"id":"v...","name":"低波质量",
+ "metrics":{"sharpe":1.2}},
+ "versions":[{"id":"v...","name":"低波质量","status":"candidate","created_at":"..."}]}
 ```
-& $py -m unittest tests.test_engine -v
+
+## 4. AI 动作与权限（后端执行，前端不直接调）
+
+Planner 每轮输出：
+```json
+{"reply":"给用户看的自然语言（≤120字，通俗）",
+ "actions":[{"name":"...","args":{}}],
+ "profile_delta":{"horizon":"3-5 年"}}
 ```
 
-## 3. 后端 API 契约（Lead 实现，前端按此对接）
+| action | 何时允许 | 行为 |
+|---|---|---|
+| `confirm_profile` | 用户本轮明确确认（可以/确认/没问题/就按这个来）且画像必填齐全 | 写入 confirmed，返回 profile 卡，AI 回复确认 |
+| `run_selection` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
+| `explain_results` | 有最近一次选股结果 | 基于事实回答追问 |
+| `analyze_model` | 画像已确认即可 | AI 分析当前模型表现 → 生成候选方案（切模型/调参/改代码）→ 静态检查 → 冒烟 → 回测 → work 卡 + approval 卡，**不自动启用** |
+| `apply_pending_change` | 存在待审批方案且用户本轮明确同意 | 保存新模型版本并设为 active，返回 version 卡 |
+| `rollback_version` | 用户明确要求回滚 | 切回上一版本，返回 version 卡 |
 
-统一前缀 `/api`，JSON；SSE 格式 `event: <type>\ndata: <json>\n\n`。
+低风险动作不允许在缺少用户确认时触发；高影响动作必须有本轮明确同意。所有动作由后端校验，不信任前端。
 
-| 方法 | 路径 | 请求 | 响应 / SSE 事件 |
-|---|---|---|---|
-| GET | `/api/health` | — | `{ok, source, as_of, llm:"ok"}` |
-| POST | `/api/sessions` | — | `{session_id}` |
-| POST | `/api/sessions/{sid}/messages` | `{content}` | SSE：`token{text}`、`slots{slots}`、`profile_ready{profile}`、`error{message}` |
-| GET | `/api/sessions/{sid}/messages` | — | `{messages:[{role,content,created_at}]}` |
-| GET | `/api/sessions/{sid}/profile` | — | `{slots, risk_level, confirmed, complete}` |
-| PUT | `/api/sessions/{sid}/profile` | `{slots, confirmed}` | `{slots, risk_level, confirmed, complete}` |
-| POST | `/api/sessions/{sid}/selection` | `{top_n:"10"}` | `{task_id}` |
-| GET | `/api/sessions/{sid}/selection/events?task_id=` | — | SSE：`started`、`progress{stage,percent,message}`、`result{top,portfolio,metrics,nav}`、`error` |
-| POST | `/api/sessions/{sid}/tune` | `{trials:60}` | `{job_id}` |
-| GET | `/api/sessions/{sid}/tune/events?job_id=` | — | SSE：`tuning_started{job_id,trials_total,base_weights,base_metrics}`、`trial{trial_index,weights,metrics,objective,is_best}`、`best_update{best_weights,best_metrics}`、`done{candidate_version_id,compare}`、`error` |
-| GET | `/api/versions` | — | `{versions:[{id,weights,metrics,status,created_at,parent_id}], active_id}` |
-| POST | `/api/versions/{vid}/activate` | `{reason}` | `{active_id}` |
-| POST | `/api/versions/{vid}/rollback` | `{reason}` | `{active_id}` |
+## 5. 画像槽位（12 项，全部用生活化标签）
 
-`done` 事件中的 `compare` 额外携带调参净值曲线（真实回测数据，非前端模拟）：
+`goal`(投资目标)、`horizon`(投资期限)、`capital`(大致投入)、`liquidity_need`(多久可能要用钱)、`loss_reaction`(亏钱时的真实反应)、`drawdown_tolerance`(最多能接受亏多少)、`income_stability`(收入稳定程度)、`experience`(投资经验)、`preferred_industries`(偏好行业)、`excluded_industries`(不碰行业)、`trade_frequency`(希望多久调整一次)、`concerns`(最担心什么)。
+必填：`goal`、`horizon`、`drawdown_tolerance`、`loss_reaction`。风险等级由 AI 根据这些推导，不直接问“你是什么风险等级”。
+
+AI 追问原则：一次一个问题；先回应/共情，再问；提供生活化选项；不重复问已知信息；最多 3 轮内形成画像总结并请用户确认。
+
+## 6. AI 建模流水线（`backend/models/`）
+
+### 6.1 内置模型类型（registry）
+
+至少 5 种：`multi_factor`（均衡多因子）、`low_vol_quality`（低波质量）、`momentum_growth`（趋势成长）、`value_dividend`（价值红利）、`contrarian`（反转）。每个模型：`id/name/description/weights(10因子)`。
+
+### 6.2 LLM 提案 JSON（pipeline 输入）
 
 ```json
-{"nav": {"dates": ["2023-01-03", "..."],
-         "base_nav": [{"date": "2023-01-03", "value": 1.0}, "..."],
-         "candidate_nav": [{"date": "2023-01-03", "value": 1.0}, "..."]}}
+{"approach":"model_type|weights|code",
+ "summary":"一句普通用户能懂的话，说明为什么这样改",
+ "model_type":"low_vol_quality",
+ "weights":{"ep":0.1,...10项...},
+ "code":"python 源码（approach=code 时）",
+ "why":"数据依据（引用真实指标）",
+ "expected_effect":"预期改善方向",
+ "risks":["..."]}
 ```
 
-无 `nav` 字段时，调参台右栏显示空态“本次结果未返回调参净值曲线”，不伪造曲线。
+### 6.3 自定义模型代码契约
 
-画像槽位（`slots`，均字符串）：`risk_level`(conservative/balanced/aggressive)、`horizon`、`drawdown_tolerance`、`goal`、`experience`、`excluded_industries`（逗号分隔）、`capital`。`complete` 判定：`risk_level/horizon/drawdown_tolerance` 非空。
+AI 生成的代码必须定义：
+```python
+def build_transform():
+    def transform(z, weights):
+        # z: pandas.DataFrame，列含 z_ep/z_bp/...（10 个方向对齐后的因子 z 值）
+        # weights: dict[str,float]
+        # 返回 pandas.Series（index 与 z 对齐）
+        return ...
+    return transform
+```
+允许 import：`math`、`numpy as np`、`pandas as pd`；禁止：文件/网络/系统调用/动态执行/dunder 属性；源码 ≤6000 字符；必须通过 AST 白名单检查 + 子进程冒烟（10s 超时）。
 
-## 4. 前端契约（frontend-dev 实现）
+### 6.4 pipeline 公开函数
 
-- 文件：`frontend/index.html`、`app.js`、`charts.js`、`style.css`；可选 `mock-data.js`（仅在 `?mock=1` 时加载，用于无后端时查看 UI，代码中注明 dev-only；默认不启用）。
-- 零外部依赖：**不引入 ECharts/CDN/构建工具**，图表用纯 SVG/CSS 实现（`charts.js` 暴露 `Charts.bar/radar/line/scatter/gauge` 等函数即可）。
-- 深色科技风仪表盘，配色：背景 `#0B1220→#111C2E`、卡片 `#151F33`、边框 `#2A3A55`、主色 `#22D3EE`、强调橙 `#F59E0B`、成功 `#34D399`、危险 `#FB7185`。
-- 四个视图（顶部导航）：**AI 对话画像**（聊天气泡、流式 token、槽位 chips、画像卡确认/编辑）；**选股结果**（Top N 表、因子贡献条、组合权重、指标卡、净值线）；**AI 解读**（解读文本、追问输入、免责声明）；**AI 调参台**（三栏：左 AI 操作流时间轴 / 中因子权重对比条+雷达+候选散点 / 右指标卡+净值对比+版本时间轴；底部启用/回滚；由 `tune` SSE 驱动；支持无数据骨架屏）。
-- 交互：`localStorage.session_id`；SSE `EventSource`（对话用 fetch 流式读取，POST 无法用 EventSource，请用 `fetch`+`ReadableStream` 解析 SSE）；错误显示红色错误条+重试按钮；不实现降级/假数据（除 mock 模式）。
-- 验收：`node --check frontend/app.js`、`node --check frontend/charts.js` 通过；`frontend/index.html` 与后端 dev_server 联调可跑通对话→选股→解读→调参。
+```python
+def list_models() -> list[dict]                       # 内置模型清单
+def normalize_proposal(raw: dict) -> Proposal         # 校验字段、权重、模型类型
+def validate_code(code: str) -> dict                  # AST+冒烟，失败抛 ModelCodeError
+def compile_code(code: str) -> callable               # 返回 transform(z,weights)
+def build_candidate_proposal(llm, state) -> Proposal  # 调 LLM 生成提案（prompt 在 pipeline 内）
+```
+`selection.screen/run_backtest` 增加可选参数 `score_transform=None`（Lead 实现，供自定义代码接入）。
 
-## 5. 协作与交付
+## 7. 前端（单对话页）
 
-- engine-dev 只写：`backend/engine/*.py`、`tests/test_engine.py`。
-- frontend-dev 只写：`frontend/*`。
-- Lead 写其余全部后端文件与测试，并统一 git 提交。
-- 完成后向 Lead 报告：文件清单、运行过的命令与结果、遗留风险；不要执行 git/pip/git commit。
+- 文件：`frontend/index.html`、`app.js`、`style.css`、`charts.js`（可复用现有 SVG 图表函数并扩展）。
+- 布局：**左侧 = 唯一聊天流**（消息、AI 回复、内嵌卡片）；**右侧 = AI 工作台**（自动显示当前画像摘要、AI 活动时间线、当前模型/版本）；窄屏折叠为单列。没有页签/没有模块切换。
+- 交互：输入框即可完成全部操作；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。
+- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`ui` 事件按 id upsert 卡片（work 卡步骤实时更新）；`token` 逐字追加；`error` 显示错误条+重试。
+- 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧工作台与画像/最近结果摘要（聊天文本历史从 `/messages` 拉取）。
+- 视觉：深色科技风（沿用现配色：背景 #0B1220→#111C2E、卡片 #151F33、主色 #22D3EE、橙 #F59E0B、绿 #34D399、红 #FB7185）；卡片层次清晰，普通用户能看懂，指标旁有白话解释。
+- 禁止：mock 数据、独立页签、页面内直接调 selection/tune/profile 接口、伪造进度。
+
+## 8. 文件与分工
+
+- Lead：`backend/agent.py`、`backend/service.py`、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`tests/` 集成测试、文档。
+- **chat-ui-dev**：只写 `frontend/` 下 `index.html`、`app.js`、`style.css`、`charts.js`。
+- **model-pipeline-dev**：只写 `backend/models/*.py`、`tests/test_models.py`。
+- 完成标准：`node --check` 通过；后端 `unittest discover` 通过；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘帮我优化模型’→看 AI 步骤→聊天内同意→版本更新”全流程。

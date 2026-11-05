@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Store（SQLite）单元测试。"""
+"""SQLite 存储测试（v2：会话/消息/画像/模型版本/运行态）。"""
 from __future__ import annotations
 
 import unittest
 
-from backend.store import Store
+from backend.store import SCHEMA_VERSION, Store
 from tests import cleanup, workdir
 
 
@@ -17,42 +17,59 @@ class StoreTest(unittest.TestCase):
         self.store.close()
         cleanup(self.dir)
 
+    def test_schema_version(self) -> None:
+        value = self.store._conn.execute("PRAGMA user_version").fetchone()[0]  # noqa: SLF001
+        self.assertEqual(int(value), SCHEMA_VERSION)
+
     def test_session_and_messages(self) -> None:
         sid = self.store.create_session()
         self.assertTrue(self.store.session_exists(sid))
         self.store.add_message(sid, "user", "你好")
-        self.store.add_message(sid, "assistant", "您好")
+        self.store.add_message(sid, "assistant", "在的")
         messages = self.store.get_messages(sid)
-        self.assertEqual([m["role"] for m in messages], ["user", "assistant"])
-        self.assertEqual(messages[1]["content"], "您好")
-        self.assertEqual(self.store.get_messages(sid, limit=1)[0]["content"], "您好")
+        self.assertEqual([item["role"] for item in messages], ["user", "assistant"])
+        self.assertEqual(messages[-1]["content"], "在的")
 
     def test_profile_upsert(self) -> None:
         sid = self.store.create_session()
-        self.assertIsNone(self.store.get_profile(sid))
-        self.store.save_profile(sid, {"risk_level": "balanced"}, "balanced", False)
+        self.store.save_profile(sid, {"goal": "养老"}, "想养老", False)
         profile = self.store.get_profile(sid)
-        self.assertEqual(profile["risk_level"], "balanced")
+        self.assertEqual(profile["slots"]["goal"], "养老")
         self.assertFalse(profile["confirmed"])
-        self.store.save_profile(sid, {"risk_level": "aggressive"}, "aggressive", True)
+        self.store.save_profile(sid, {"goal": "养老", "horizon": "5 年"}, "想养老，5 年", True)
         profile = self.store.get_profile(sid)
-        self.assertEqual(profile["risk_level"], "aggressive")
+        self.assertEqual(profile["slots"]["horizon"], "5 年")
         self.assertTrue(profile["confirmed"])
 
-    def test_versions_activate_rollback(self) -> None:
-        v1 = self.store.create_version({"ep": 0.5, "bp": 0.5}, {"sharpe": 1.0}, "active", "manual")
-        v2 = self.store.create_version({"ep": 0.4, "bp": 0.6}, {"sharpe": 1.2}, "candidate", "auto_tune", v1)
-        self.assertEqual(self.store.active_version()["id"], v1)
-        self.store.activate(v2, reason="test")
-        self.assertEqual(self.store.active_version()["id"], v2)
-        self.assertEqual(self.store.get_version(v1)["status"], "archived")
-        self.store.rollback(v1, reason="test_rollback")
-        self.assertEqual(self.store.active_version()["id"], v1)
-        audit = self.store.list_audit()
-        self.assertEqual(audit[0]["action"], "rollback")
-        self.assertEqual(len(self.store.list_versions()), 2)
+    def test_runtime_state(self) -> None:
+        sid = self.store.create_session()
+        self.assertEqual(self.store.get_state(sid), {})
+        self.store.save_state(sid, {"pending": {"summary": "换模型"}})
+        self.assertEqual(self.store.get_state(sid)["pending"]["summary"], "换模型")
+        self.store.save_state(sid, {"last_selection": {"as_of": "2024-01-01"}})
+        state = self.store.get_state(sid)
+        self.assertNotIn("pending", state)
+        self.assertIn("last_selection", state)
 
-    def test_unknown_version_raises(self) -> None:
+    def test_versions_activate_rollback_and_parent(self) -> None:
+        base = self.store.create_version(
+            {"kind": "builtin", "model_id": "multi_factor", "name": "均衡多因子",
+             "weights": {"ep": 1.0}}, {"sharpe": 1.0}, status="active", parent_id=None)
+        candidate = self.store.create_version(
+            {"kind": "code", "model_id": "ai_generated", "name": "AI 生成模型",
+             "weights": {"ep": 0.5, "bp": 0.5}, "code": "def build_transform():\n    pass\n"},
+            {"sharpe": 1.2}, status="candidate", parent_id=base)
+        self.assertEqual(self.store.active_version()["id"], base)
+        self.store.activate(candidate, reason="test")
+        self.assertEqual(self.store.active_version()["id"], candidate)
+        parent = self.store.parent_version()
+        self.assertEqual(parent["id"], base)
+        self.store.rollback(base, reason="test")
+        self.assertEqual(self.store.active_version()["id"], base)
+        self.assertEqual(len(self.store.list_versions()), 2)
+        self.assertTrue(self.store.get_version(candidate)["model"]["code"])
+
+    def test_unknown_version(self) -> None:
         with self.assertRaises(KeyError):
             self.store.activate("not-exist")
 

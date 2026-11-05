@@ -1,61 +1,61 @@
-# 运行手册（Runbook）
+# 运行手册（v2：单对话 + AI 主动建模）
 
-## 1. 首次运行（离线演示，最快的路径）
+## 1. 最快跑起来（离线演示）
 
 ```powershell
 cd a-share-ai-screener
 $py = "C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
-& $py -m backend.data.build_cache --source sample     # 生成示例 A 股数据缓存（CSV/parquet 自动选择）
-$env:LLM_PROVIDER = "fake"                            # 无 Key 时仅本地联调；正式演示请配真实 Key
+
+& $py -m backend.data.build_cache --source sample
+$env:LLM_PROVIDER = "fake"          # 本地无 Key 演示；正式使用请配真实 Key
 & $py -m backend.dev_server --port 8000
 # 浏览器打开 http://127.0.0.1:8000
 ```
 
-正式环境（安装了 requirements 的 Python）：
+正式入口（需要 `pip install -r requirements.txt`）：
 
 ```powershell
-pip install -r requirements.txt
 $env:DEEPSEEK_API_KEY = "sk-..."
 $env:LLM_MODEL = "deepseek-chat"
-uvicorn backend.main:app --port 8000
+& $py -m uvicorn backend.main:app --port 8000
 ```
 
-## 2. 使用真实 A 股数据
+## 2. 演示脚本（3 分钟）
+
+1. 输入“我想为养老攒点钱”，AI 会先问一个缺失的信息；
+2. 补充“大概 5 年不用、最多能接受亏 15%、真亏了会有点慌但先不卖”；
+3. 回“可以，就按这个来”——AI 自己完成画像确认 + 选股，展示画像卡、选股卡、指标与解读；
+4. 追问“为什么最大回撤这么大”，AI 基于这次回测事实解释；
+5. 说“帮我优化一下模型”——AI 逐步展示：看表现 → 翻数据 → 生成方案 → 改代码 → 安全检查 → 回测 → 对比，并给审批卡；
+6. 点聊天里的“同意，启用吧”或直接说“同意启用这个改进”，版本更新；
+7. 说“回滚到上一个版本”，切回基线。
+
+## 3. 使用真实 A 股数据
 
 ```powershell
-& $py -m backend.data.build_cache --source akshare --universe csi800 --limit 300
-# 或（需要 TUSHARE_TOKEN，字段更全）
+& $py -m backend.data.build_cache --source akshare --limit 300
+# 或（需要 TUSHARE_TOKEN）
 & $py -m backend.data.build_cache --source tushare --limit 300
 ```
 
-- AkShare 免费、无需 token；数据量小时用 `--limit` 控制首次拉取时间。
-- 服务运行期只读 `data/a_share/` 缓存，不访问网络。
-- 历史数据只用于回测与演示，不构成投资建议。
-
-## 3. 演示流程（3 分钟）
-
-1. 打开页面 → 「AI 对话画像」：输入“稳健型、3-5 年、能接受 20% 回撤、偏好消费、不碰 ST”；
-2. AI 追问缺失项 → 画像卡确认；
-3. 点击「开始选股」→ 查看 Top N、10 因子贡献、组合权重、OOS 指标；
-4. 「AI 解读」：查看基于事实的解读，追问「为什么选它/风险在哪」；
-5. 「AI 调参台」：点击开始调优 → 观察参数演化与指标变化 → 启用候选版本 → 回滚；
-6. 收尾声明：历史模拟不代表未来收益，不构成投资建议。
+服务运行期只读 `data/a_share/` 缓存，不访问网络。历史数据仅用于回测演示，不构成投资建议。
 
 ## 4. 常见问题
 
 | 现象 | 处理 |
 |---|---|
-| 启动报“缺少 LLM API Key” | 设置 `DEEPSEEK_API_KEY`；无 Key 仅本地看 UI 可用 `LLM_PROVIDER=fake` |
-| 启动报“A 股数据缓存缺失” | 运行 `python -m backend.data.build_cache --source sample` |
-| AkShare 拉取慢/限流 | 加 `--limit 200`，或改用示例数据；服务运行期不联网 |
-| 端口占用 | `--port 8010` 换端口 |
-| 想重置演示状态 | `.\scripts\demo_reset.ps1`（清空 SQLite，保留数据缓存） |
-| 调参太慢 | 前端传入 trials 更小（如 8），或环境变量 `DEFAULT_TRIALS` 调小 |
+| 启动报缺少 LLM Key | 设置 `DEEPSEEK_API_KEY`；本地仅演示可 `LLM_PROVIDER=fake` |
+| 启动报数据缓存缺失 | `python -m backend.data.build_cache --source sample` |
+| AkShare 拉取慢 | 加 `--limit 200`，或先用示例数据演示 |
+| AI 生成的代码被拒绝 | 代码安全检查/冒烟/回测拦截属于预期；可再说一次“重新给个方案” |
+| 想清空会话和版本 | `.\scripts\demo_reset.ps1`（保留数据缓存） |
+| 端口占用 | 启动时换 `--port 8010` |
 
 ## 5. 验收命令
 
 ```powershell
 & $py -m unittest discover -s tests -v
-node --check frontend/app.js
-node --check frontend/charts.js
+$node --check frontend/app.js
+$node --check frontend/charts.js
+& $py scripts\e2e_smoke.py
 ```

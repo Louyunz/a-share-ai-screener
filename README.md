@@ -1,94 +1,100 @@
-# 智投罗盘 · A 股 AI 选股 MVP
+# 智投罗盘 · AI 选股助手（MVP）
 
-一个 3 天可交付的 A 股 AI 智能选股演示系统：AI 多轮对话建立投资画像 → 按画像适配 10 因子选股 → A 股规则回测 → AI 解读与追问 → AI 参数调优（带可视化调参台与版本回滚）。
+一个「只用一个聊天框」完成全部操作的 A 股 AI 选股应用：AI 先像朋友一样了解你，再自动完成选股、解读，并能自己分析模型、生成/修改选股代码、回测对比，最后等你点头后才启用。
 
-- 后端：FastAPI（轻量前后端分离，单进程同时托管页面与 API）+ SQLite + pandas
-- 前端：原生 JS + SSE + 纯 SVG/CSS 图表（无构建链、无 CDN 依赖）
-- 数据：AkShare 为主、Tushare 为辅；离线缓存（有 pyarrow 时 parquet，否则 CSV）；无网络时可用内置示例数据
+- 前端：原生 JS 单页（无构建链、无 CDN、纯 SVG 图表），一个聊天流 + 右侧 AI 工作台
+- 后端：FastAPI（单进程同时托管页面与 API）+ SQLite + pandas
+- 数据：AkShare 为主、Tushare 为辅；离线缓存自动选择 parquet/CSV；无网络时可用内置示例数据
+- 模型：10 因子选股引擎 + 5 种内置模型类型 + AI 生成自定义打分代码（AST 白名单 + 子进程冒烟 + 回测验证）
+
+## 它怎么工作
+
+1. **聊天建画像**：AI 用大白话一次问一个问题，自动补齐 12 个画像槽位；信息够了会先复述并请你确认。
+2. **AI 主动执行**：你回一句“可以”，AI 自己去确认画像并开始选股（无需点按钮、无需切页面）。
+3. **结果与解读**：选股卡展示 Top 10、白话指标、因子贡献、组合权重、净值曲线，并给出基于事实的解读；继续追问即可。
+4. **AI 参与建模**：你说“帮我优化模型”，AI 会：
+   - 看当前表现 → 翻因子数据找短板 → 提出改进方案（切换内置模型 / 调权重 / 直接生成新的策略代码）
+   - 对生成的代码做静态安全检查 + 子进程冒烟 + 全区间回测
+   - 把每一步实时展示在聊天里，给出对比指标和风险，**等你明确同意后才启用**，且随时可回滚
+5. **版本可回滚**：每次模型变更都落版本（基线 + 候选），聊天里说“回滚到上一个版本”即可。
 
 ## 快速开始
 
-```bash
-# 1) 安装依赖
-python -m venv .venv
-.venv\Scripts\activate        # Windows
+```powershell
+cd a-share-ai-screener
+$py = "C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+
+# 1) 数据缓存（示例数据，离线可用；真实数据用 --source akshare / tushare）
+& $py -m backend.data.build_cache --source sample
+
+# 2) 无 Key 本地体验（FakeLLM，仅用于演示与测试）
+$env:LLM_PROVIDER = "fake"
+& $py -m backend.dev_server --port 8000
+# 或正式入口：
+# & $py -m uvicorn backend.main:app --port 8000
+
+# 3) 浏览器打开 http://127.0.0.1:8000
+```
+
+正式使用需配置真实模型（OpenAI 兼容接口）：
+
+```powershell
 pip install -r requirements.txt
-
-# 2) 准备数据（三选一）
-python -m backend.data.build_cache --source sample     # 内置示例数据（离线可用）
-python -m backend.data.build_cache --source akshare    # AkShare 拉取 A 股真实数据
-python -m backend.data.build_cache --source tushare    # Tushare（需 TUSHARE_TOKEN）
-
-# 3) 配置环境变量
-set DEEPSEEK_API_KEY=sk-xxx
-set LLM_BASE_URL=https://api.deepseek.com/v1
-set LLM_MODEL=deepseek-chat
-
-# 4) 启动
-uvicorn backend.main:app --port 8000
-# 浏览器打开 http://localhost:8000
+$env:DEEPSEEK_API_KEY = "sk-..."
+$env:LLM_MODEL = "deepseek-chat"
+& $py -m uvicorn backend.main:app --port 8000
 ```
 
-无 FastAPI 环境下可用标准库预览服务器（功能等价，仅开发用）：
+真实 A 股数据：
 
-```bash
-python -m backend.dev_server --port 8000
+```powershell
+& $py -m backend.data.build_cache --source akshare --limit 300
+# 或 Tushare（需要 TUSHARE_TOKEN）
+& $py -m backend.data.build_cache --source tushare --limit 300
 ```
 
-## 目录结构
+## 界面
+
+| 对话建画像 | 选股结果 |
+|---|---|
+| ![对话建画像](docs/screenshots/01_ai_chat.png) | ![选股结果](docs/screenshots/02_selection.png) |
+
+| AI 优化过程（方案/代码/对比/审批） | 模型版本 |
+|---|---|
+| ![AI 优化过程](docs/screenshots/03_interpretation.png) | ![模型版本](docs/screenshots/04_tuning.png) |
+
+截图来自真实浏览器联调（示例数据 + FakeLLM）；真实模型下文字与解读由所选模型生成。
+
+## 代码结构
 
 ```
 backend/
-  main.py            # FastAPI 应用：REST + SSE + 静态托管
-  dev_server.py      # 标准库 HTTP 服务器（无 fastapi 时本地预览）
-  service.py         # 与框架无关的业务服务层（会话/选股/调优/版本）
-  events.py          # SSE 事件总线（channel → 多订阅者队列）
-  store.py           # SQLite：sessions/messages/profiles/versions/audit_logs
-  agent.py           # LLM 门面：多轮对话、画像抽取、解读、合规校验
-  llm.py             # OpenAI 兼容客户端（urllib）+ FakeLLM（测试用）
-  schemas.py         # 画像槽位、选股请求、事件负载等数据结构
-  engine/
-    factors.py       # A 股 10 因子计算 + 行业中性化 + 权重注册表
-    selection.py     # 筛选、组合构建、A 股规则回测
-    tuner.py         # 因子权重随机搜索（trial 事件回调）
-  data/
-    base.py          # IDataPort 协议与 DataBundle 数据包
-    sample.py        # 合成 A 股示例数据（离线演示）
-    akshare_adapter.py
-    tushare_adapter.py
-    build_cache.py   # 离线缓存构建 CLI
-frontend/            # 单页应用：index.html / app.js / charts.js / style.css
-tests/               # unittest 测试（引擎/存储/Agent/服务）
-docs/                # 设计说明书 PDF、接口契约、设计摘要、图表
-data/                # 运行期数据缓存与 SQLite（git 忽略）
+  main.py            FastAPI：页面 + 聊天 SSE + 状态接口
+  dev_server.py      标准库 HTTP 服务（无 fastapi 时本地预览）
+  service.py         对话编排：理解 → 回复 → 执行动作 → 生成卡片
+  agent.py           Planner 提示词、动作白名单、合规校验
+  llm.py             OpenAI 兼容客户端 + FakeLLM（测试/演示）
+  schemas.py         画像槽位、计划、白话文案
+  store.py           SQLite：会话/消息/画像/模型版本/运行态
+  events.py          SSE 格式化
+  data/              DataBundle、示例数据、AkShare/Tushare 适配器、缓存 CLI
+  engine/            A 股 10 因子、筛选/组合、T+1/涨跌停/停牌/成本回测
+  models/            内置模型类型、AI 代码安全校验与编译、提案流水线
+frontend/
+  index.html / app.js / style.css / charts.js
+tests/               87+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
+scripts/             构建缓存、启动、重置、全量测试、E2E 冒烟
+docs/                接口契约、运行手册、设计摘要、界面截图
 ```
 
-## 界面预览
+## 测试与验收
 
-| AI 对话画像 | 选股结果 |
-|---|---|
-| ![AI 对话画像](docs/screenshots/01_ai_chat.png) | ![选股结果](docs/screenshots/02_selection.png) |
-
-| AI 解读 | AI 调参台 |
-|---|---|
-| ![AI 解读](docs/screenshots/03_interpretation.png) | ![AI 调参台](docs/screenshots/04_tuning.png) |
-
-> 截图说明：对话页截图为连接真实后端（示例数据 + FakeLLM）的状态；其余三张使用 `?mock=1` 开发预览模式填充示例数据（截图右上角有 MOCK 标记）。生产路径不加载任何 mock 数据，真实后端下标的会展示代码+行业，AI 不可用时直接报错而不降级。
-
-## 测试
-
-```bash
-python -m unittest discover -s tests -v
-node --check frontend/app.js && node --check frontend/charts.js
+```powershell
+& $py -m unittest discover -s tests -v
+$node --check frontend/app.js; $node --check frontend/charts.js
+& $py scripts\e2e_smoke.py
 ```
 
-当前状态：30 个测试全部通过；FastAPI 与 dev_server 两种入口均完成 HTTP/SSE 全链路 E2E（对话→画像确认→选股→调参→启用→回滚）。
-
-## 设计文档
-
-- `docs/智投罗盘_A股AI选股_MVP精简设计说明书_v1.2.pdf`（40 页完整设计）
-- `docs/CONTRACT.md`（前后端与引擎接口契约，含调参 `compare.nav` 结构）
-- `docs/design-summary.md`（关键决策摘要）
-- `docs/RUNBOOK.md`（运行手册与排障）
-
-> 免责声明：本项目为比赛演示原型，仅用于技术方案展示与投资研究辅助，不构成任何投资建议，不承诺收益。
+- 全量测试：引擎、模型安全校验（含拒绝危险代码/死循环超时）、Agent 计划、对话全流程、SQLite、HTTP/SSE
+- 浏览器 E2E：真实 Edge 驱动“说话 → AI 追问 → 确认 → 选股 → 优化 → 同意 → 版本更新”全流程
+- 风险提示：本项目为比赛演示原型，历史回测不代表未来收益，不构成投资建议。

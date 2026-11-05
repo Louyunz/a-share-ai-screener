@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""AppService 集成测试（FakeLLM + 合成小数据，不依赖网络）。"""
+"""对话式服务集成测试：一次会话内完成画像→确认→选股→追问→AI优化→启用→回滚。"""
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from backend.data.base import save_bundle
 from backend.data.sample import generate_bundle
@@ -12,20 +11,15 @@ from backend.service import AppService
 from tests import cleanup, workdir
 
 
-def _try_import_engine() -> None:
-    try:
-        from backend.engine import factors, selection, tuner  # noqa: F401
-    except Exception as exc:  # noqa: BLE001
-        raise unittest.SkipTest(f"引擎尚未就绪：{exc}") from exc
+def _blocks(events: list[tuple[str, dict]]) -> list[dict]:
+    return [data["block"] for event, data in events if event == "ui"]
 
 
-class ServiceTest(unittest.TestCase):
+class ChatFlowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _try_import_engine()
-        cls.dir = workdir("service")
-        bundle = generate_bundle(n_stocks=30, n_days=340, seed=7)
-        save_bundle(bundle, cls.dir / "a_share")
+        cls.dir = workdir("chatflow")
+        save_bundle(generate_bundle(n_stocks=30, n_days=360, seed=7), cls.dir / "a_share")
         cls.service = AppService(data_dir=cls.dir / "a_share", db_path=cls.dir / "app.db",
                                  llm=FakeLLM())
         cls.sid = cls.service.create_session()["session_id"]
@@ -35,92 +29,84 @@ class ServiceTest(unittest.TestCase):
         cls.service.close()
         cleanup(cls.dir)
 
-    # ------------------------------------------------------------------
-    def _complete_profile(self) -> dict:
-        events = list(self.service.chat_events(
-            self.sid, "我是稳健型，打算持有 3 年，能接受 20% 回撤，偏好消费行业"))
-        self.assertTrue(any(e == "profile_ready" for e, _ in events) or
-                        self.service.get_profile(self.sid)["complete"])
-        profile = self.service.get_profile(self.sid)
-        confirmed = self.service.put_profile(self.sid, profile["slots"], confirmed=True)
-        self.assertTrue(confirmed["confirmed"])
-        return confirmed
+    def chat(self, content: str) -> tuple[list[tuple[str, dict]], str]:
+        events = list(self.service.chat_stream(self.sid, content))
+        text = "".join(data.get("text", "") for event, data in events if event == "token")
+        return events, text
 
-    def _collect_job(self, iterator, max_events: int = 500) -> list[tuple[str, dict]]:
-        events: list[tuple[str, dict]] = []
-        for event, data in iterator:
-            events.append((event, data))
-            if len(events) >= max_events:
-                break
-            if event in ("result", "done", "error"):
-                break
-        return events
+    def test_chat_flow(self) -> None:
+        # 1) 自然语言开始：AI 只问一个缺失问题
+        events, text = self.chat("我想为养老攒点钱")
+        self.assertTrue(text)
+        self.assertTrue(any(block["type"] == "profile" for block in _blocks(events)))
 
-    # ------------------------------------------------------------------
-    def test_01_health(self) -> None:
-        health = self.service.health()
-        self.assertTrue(health["ok"])
-        self.assertGreater(health["universe"], 0)
+        # 2) 补齐信息：AI 汇总并请确认
+        events, text = self.chat("大概 5 年不用这笔钱，最多能接受亏 15%，真亏了会有点慌但先不卖")
+        profile_block = next(block for block in _blocks(events) if block["type"] == "profile")
+        self.assertTrue(profile_block["complete"])
+        self.assertIn("可以", text)
 
-    def test_02_chat_and_profile(self) -> None:
-        profile = self._complete_profile()
-        self.assertEqual(profile["risk_level"], "balanced")
-        self.assertEqual(profile["slots"]["horizon"], "3 年")
-        messages = self.service.messages(self.sid)["messages"]
-        self.assertGreaterEqual(len(messages), 2)
+        # 3) 对话确认后 AI 自己完成确认 + 选股
+        events, text = self.chat("可以，就按这个来")
+        blocks = _blocks(events)
+        selection = next(block for block in blocks if block["type"] == "selection")
+        self.assertEqual(len(selection["top"]), 10)
+        self.assertIn("sharpe", selection["metrics"])
+        self.assertTrue(selection["explanation"])
+        active = self.service.store.get_profile(self.sid)
+        self.assertTrue(active["confirmed"])
+        self.assertIsNotNone(self.service.store.get_state(self.sid).get("last_selection"))
 
-    def test_03_selection_events(self) -> None:
-        self._complete_profile()
-        task = self.service.start_selection(self.sid, top_n=5)
-        events = self._collect_job(self.service.selection_events(self.sid, task["task_id"]))
-        kinds = [e for e, _ in events]
-        self.assertIn("started", kinds)
-        self.assertIn("result", kinds, msg=f"事件：{kinds}")
-        payload = next(data for event, data in events if event == "result")
-        self.assertTrue(payload["top"])
-        for key in ("cagr", "sharpe", "mdd", "ir", "win_rate"):
-            self.assertIn(key, payload["metrics"])
-        self.assertTrue(payload["explanation"])
+        # 4) 追问：基于已选结果解释
+        events, text = self.chat("为什么最大回撤会这么大？")
+        self.assertTrue(text)
+        self.assertIn("不构成投资建议", text)
 
-    def test_04_tuning_and_versions(self) -> None:
-        self._complete_profile()
-        job = self.service.start_tuning(self.sid, trials=3)
-        events = self._collect_job(self.service.tuning_events(self.sid, job["job_id"]))
-        kinds = [e for e, _ in events]
-        self.assertIn("tuning_started", kinds)
-        self.assertIn("trial", kinds)
-        self.assertIn("done", kinds, msg=f"事件：{kinds}")
-        done = next(data for event, data in events if event == "done")
-        candidate_id = done["candidate_version_id"]
-        compare_nav = (done.get("compare") or {}).get("nav") or {}
-        self.assertTrue(compare_nav.get("base_nav"), "tuning done 事件应包含基线净值")
-        self.assertTrue(compare_nav.get("candidate_nav"), "tuning done 事件应包含候选净值")
-        self.assertGreater(len(compare_nav["candidate_nav"]), 5)
-        versions = self.service.versions()
-        self.assertTrue(any(v["id"] == candidate_id for v in versions["versions"]))
-        self.service.activate_version(candidate_id, "test")
-        self.assertEqual(self.service.versions()["active_id"], candidate_id)
-        self.service.rollback_version(candidate_id, "test")
-        self.assertTrue(self.service.versions()["active_id"])
+        # 5) AI 主动优化：展示工作步骤，生成待审批方案
+        events, text = self.chat("帮我优化一下模型")
+        blocks = _blocks(events)
+        works = [block for block in blocks if block["type"] == "work"]
+        approvals = [block for block in blocks if block["type"] == "approval"]
+        self.assertTrue(works)
+        self.assertGreaterEqual(len(works[-1]["steps"]), 5)
+        self.assertEqual(works[-1]["status"], "done")
+        self.assertTrue(approvals)
+        self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
 
-    def test_05_selection_requires_confirmed_profile(self) -> None:
-        root = workdir("service_guard")
-        self.addCleanup(lambda: cleanup(root))
-        bundle = generate_bundle(n_stocks=10, n_days=200, seed=3)
-        save_bundle(bundle, root / "a_share")
-        service = AppService(data_dir=root / "a_share", db_path=root / "s.db", llm=FakeLLM())
+        # 6) 聊天内同意 → AI 应用并启用新模型
+        events, text = self.chat("同意，启用这个改进")
+        versions = [block for block in _blocks(events) if block["type"] == "version"]
+        self.assertTrue(versions)
+        active = self.service.store.active_version()
+        self.assertIsNotNone(active)
+        self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
+        self.assertIn("已启用", text)
+
+        # 7) 回滚
+        events, text = self.chat("回滚到上一个版本")
+        self.assertTrue([block for block in _blocks(events) if block["type"] == "version"])
+        rolled = self.service.store.active_version()
+        self.assertNotEqual(rolled["id"], active["id"])
+
+    def test_state_endpoint_payload(self) -> None:
+        state = self.service.get_state(self.sid)
+        self.assertIn("profile", state)
+        self.assertIn("versions", state)
+        self.assertIsNotNone(state["active_model"])
+
+    def test_confirm_requires_complete_profile(self) -> None:
+        local = workdir("chatflow_guard")
         try:
+            save_bundle(generate_bundle(n_stocks=10, n_days=220, seed=3), local / "a_share")
+            service = AppService(data_dir=local / "a_share", db_path=local / "app.db",
+                                 llm=FakeLLM())
             sid = service.create_session()["session_id"]
-            with self.assertRaises(Exception):
-                service.start_selection(sid, top_n=3)
-        finally:
+            list(service.chat_stream(sid, "可以，就按这个来"))
+            profile = service.store.get_profile(sid)
+            self.assertIsNone(profile)  # 信息不足时 AI 只追问，不会擅自确认画像
             service.close()
-
-    def test_06_missing_data_raises(self) -> None:
-        root = workdir("service_missing")
-        self.addCleanup(lambda: cleanup(root))
-        with self.assertRaises(Exception):
-            AppService(data_dir=root / "empty", db_path=root / "x.db", llm=FakeLLM())
+        finally:
+            cleanup(local)
 
 
 if __name__ == "__main__":

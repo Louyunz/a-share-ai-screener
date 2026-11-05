@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""标准库 dev_server 冒烟测试（不依赖 fastapi）。"""
+"""标准库 dev_server 的 HTTP/SSE 冒烟测试。"""
 from __future__ import annotations
 
 import http.client
@@ -16,22 +16,34 @@ from backend.service import AppService
 from tests import cleanup, workdir
 
 
+def _parse_sse(text: str) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    for block in text.split("\n\n"):
+        event, payload = None, None
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                payload = line[5:].strip()
+        if event and payload is not None:
+            try:
+                events.append((event, json.loads(payload)))
+            except json.JSONDecodeError:
+                continue
+    return events
+
+
 class DevServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        try:
-            from backend.engine import factors, selection, tuner  # noqa: F401
-        except Exception as exc:  # noqa: BLE001
-            raise unittest.SkipTest(f"引擎尚未就绪：{exc}") from exc
         cls.dir = workdir("devserver")
-        save_bundle(generate_bundle(n_stocks=12, n_days=220, seed=11), cls.dir / "a_share")
+        save_bundle(generate_bundle(n_stocks=12, n_days=240, seed=11), cls.dir / "a_share")
         cls.service = AppService(data_dir=cls.dir / "a_share", db_path=cls.dir / "app.db",
                                  llm=FakeLLM())
         ApiHandler.service = cls.service
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
         cls.port = cls.httpd.server_address[1]
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -40,35 +52,44 @@ class DevServerTest(unittest.TestCase):
         cls.service.close()
         cleanup(cls.dir)
 
-    def _conn(self) -> http.client.HTTPConnection:
-        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
-
-    def test_health(self) -> None:
-        conn = self._conn()
-        conn.request("GET", "/api/health")
-        resp = conn.getresponse()
-        data = json.loads(resp.read())
-        conn.close()
-        self.assertEqual(resp.status, 200)
-        self.assertTrue(data["ok"])
-
-    def test_session_and_profile(self) -> None:
-        conn = self._conn()
-        conn.request("POST", "/api/sessions", body=b"{}",
+    def _request(self, method: str, path: str, body: dict | None = None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=120)
+        conn.request(method, path, body=json.dumps(body or {}).encode(),
                      headers={"Content-Type": "application/json"})
-        sid = json.loads(conn.getresponse().read())["session_id"]
-        conn.request("GET", f"/api/sessions/{sid}/profile")
-        profile = json.loads(conn.getresponse().read())
+        response = conn.getresponse()
+        raw = response.read().decode("utf-8")
         conn.close()
-        self.assertFalse(profile["confirmed"])
-        self.assertTrue(sid)
+        return response.status, raw
 
-    def test_unknown_api_404(self) -> None:
-        conn = self._conn()
-        conn.request("GET", "/api/nope")
-        resp = conn.getresponse()
-        conn.close()
-        self.assertEqual(resp.status, 404)
+    def test_health_and_session(self) -> None:
+        status, body = self._request("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        status, body = self._request("POST", "/api/sessions")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["session_id"])
+
+    def test_chat_stream(self) -> None:
+        status, body = self._request("POST", "/api/sessions")
+        sid = json.loads(body)["session_id"]
+        status, text = self._request("POST", f"/api/sessions/{sid}/chat",
+                                     {"content": "我想为养老攒点钱"})
+        self.assertEqual(status, 200)
+        events = _parse_sse(text)
+        self.assertTrue(any(event == "token" for event, _ in events))
+        self.assertTrue(any(event == "done" for event, _ in events))
+        self.assertTrue(any(event == "ui" and data["block"]["type"] == "profile"
+                            for event, data in events))
+
+    def test_state_and_messages(self) -> None:
+        status, body = self._request("POST", "/api/sessions")
+        sid = json.loads(body)["session_id"]
+        self._request("POST", f"/api/sessions/{sid}/chat", {"content": "我想为养老攒点钱"})
+        status, body = self._request("GET", f"/api/sessions/{sid}/state")
+        self.assertEqual(status, 200)
+        self.assertIn("profile", json.loads(body))
+        status, body = self._request("GET", f"/api/sessions/{sid}/messages")
+        self.assertGreaterEqual(len(json.loads(body)["messages"]), 2)
 
 
 if __name__ == "__main__":
