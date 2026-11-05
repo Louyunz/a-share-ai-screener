@@ -63,6 +63,18 @@ docs/                # 设计说明书 PDF、接口契约、设计摘要、图�
 data/                # 运行期数据缓存与 SQLite（git 忽略）
 ```
 
+## 界面预览
+
+| AI 对话画像 | 选股结果 |
+|---|---|
+| ![AI 对话画像](docs/screenshots/01_ai_chat.png) | ![选股结果](docs/screenshots/02_selection.png) |
+
+| AI 解读 | AI 调参台 |
+|---|---|
+| ![AI 解读](docs/screenshots/03_interpretation.png) | ![AI 调参台](docs/screenshots/04_tuning.png) |
+
+> 截图说明：对话页截图为连接真实后端（示例数据 + FakeLLM）的状态；其余三张使用 `?mock=1` 开发预览模式填充示例数据（截图右上角有 MOCK 标记）。生产路径不加载任何 mock 数据，真实后端下标的会展示代码+行业，AI 不可用时直接报错而不降级。
+
 ## 测试
 
 ```bash
@@ -70,10 +82,13 @@ python -m unittest discover -s tests -v
 node --check frontend/app.js && node --check frontend/charts.js
 ```
 
+当前状态：30 个测试全部通过；FastAPI 与 dev_server 两种入口均完成 HTTP/SSE 全链路 E2E（对话→画像确认→选股→调参→启用→回滚）。
+
 ## 设计文档
 
 - `docs/智投罗盘_A股AI选股_MVP精简设计说明书_v1.2.pdf`（40 页完整设计）
-- `docs/CONTRACT.md`（前后端与引擎接口契约）
+- `docs/CONTRACT.md`（前后端与引擎接口契约，含调参 `compare.nav` 结构）
 - `docs/design-summary.md`（关键决策摘要）
+- `docs/RUNBOOK.md`（运行手册与排障）
 
 > 免责声明：本项目为比赛演示原型，仅用于技术方案展示与投资研究辅助，不构成任何投资建议，不承诺收益。
