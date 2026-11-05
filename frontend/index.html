@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0B1220">
+  <meta name="description" content="智投罗盘 · A 股 AI 多因子选股 MVP：对话画像、因子选股、AI 解读与可视调参台。">
+  <title>智投罗盘 · A 股 AI 选股</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 内联图标库：无字体、无 CDN、无第三方资源 -->
+  <svg class="svg-sprite" aria-hidden="true" focusable="false">
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5.8A2.8 2.8 0 0 1 6.8 3h10.4A2.8 2.8 0 0 1 20 5.8v7.4a2.8 2.8 0 0 1-2.8 2.8H10l-4.8 3.6a.7.7 0 0 1-1.2-.6V5.8Z"/><path d="M8 8h8M8 11.5h5"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.4"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.4"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.4"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.4"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 2.8 13.7 9l6.2 1.7-6.2 1.8L12 18.7l-1.7-6.2L4 10.7 10.3 9 12 2.8Z"/><path d="m18.4 16.2.8 2.6 2.6.8-2.6.8-.8 2.6-.8-2.6-2.6-.8 2.6-.8.8-2.6Z"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="7" cy="17" r="2.2"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4.5 12h15M13.5 6l6 6-6 6"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6.5v5h-5"/><path d="M19.2 11.5a7.5 7.5 0 1 0-1.4 6.1"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m4.5 12.5 5 5L20 6.8"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2.8 20 6v5.2c0 4.8-3.2 8.2-8 10-4.8-1.8-8-5.2-8-10V6l8-3.2Z"/><path d="m8.5 12 2.3 2.3 4.7-4.8"/></symbol>
+    <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2.2-5 3.6 10L16 12h5"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3.8 12 8.2 4.5 8.2-4.5M3.8 16.2l8.2 4.5 8.2-4.5"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 2.8h8l4 4V21H6V2.8Z"/><path d="M14 2.8v4h4M9 12h6M9 16h6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.2V12l3.2 2"/></symbol>
+    <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.7"/><circle cx="12" cy="12" r="1.2"/></symbol>
+  </svg>
+
+  <div class="ambient-grid" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="#chat" data-nav="chat" aria-label="智投罗盘首页">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16.5" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".45"/><circle cx="20" cy="20" r="11.5" fill="none" stroke="currentColor" stroke-width=".8" opacity=".24"/><path d="m25.6 14.4-3 8.2-8.2 3 3-8.2 8.2-3Z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="20" cy="20" r="1.8" fill="currentColor"/></svg>
+      </span>
+      <span class="brand-copy">
+        <strong>智投罗盘</strong>
+        <small>A-SHARE · AI SCREENER</small>
+      </span>
+    </a>
+
+    <nav class="main-nav" aria-label="主导航">
+      <button class="nav-item is-active" type="button" data-view="chat" aria-current="page">
+        <span class="nav-index">01</span><span>AI 对话画像</span>
+      </button>
+      <button class="nav-item" type="button" data-view="selection">
+        <span class="nav-index">02</span><span>选股结果</span>
+      </button>
+      <button class="nav-item" type="button" data-view="interpretation">
+        <span class="nav-index">03</span><span>AI 解读</span>
+      </button>
+      <button class="nav-item" type="button" data-view="tune">
+        <span class="nav-index">04</span><span>AI 调参台</span>
+      </button>
+    </nav>
+
+    <div class="topbar-meta">
+      <span class="mock-flag" id="mock-flag" hidden><i></i>MOCK</span>
+      <div class="health-pill" id="health-pill" title="后端与数据服务状态">
+        <span class="health-dot" id="health-dot"></span>
+        <span id="health-text">连接中</span>
+      </div>
+      <div class="session-chip" id="session-label" title="浏览器本地会话">SESSION —</div>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <!-- 全局错误条：SSE / 网络 / 接口异常统一展示，不静默降级 -->
+    <div class="error-banner" id="error-banner" role="alert" aria-live="assertive" hidden>
+      <span class="error-icon" aria-hidden="true">!</span>
+      <div class="error-copy">
+        <strong>操作未完成</strong>
+        <p id="error-message">网络连接异常，请稍后重试。</p>
+      </div>
+      <button class="btn btn-error" type="button" id="error-retry">重试</button>
+      <button class="icon-btn error-close" type="button" id="error-close" aria-label="关闭错误提示">
+        <svg class="icon"><use href="#i-close"></use></svg>
+      </button>
+    </div>
+
+    <!-- ============================================================
+         视图 01 · AI 对话画像
+    ============================================================= -->
+    <section class="view is-active" id="view-chat" data-view-panel="chat" aria-labelledby="chat-title">
+      <div class="view-head">
+        <div>
+          <div class="eyebrow"><span class="eyebrow-mark"></span>INVESTOR PROFILING <b>/</b> 01</div>
+          <h1 id="chat-title">AI 对话画像</h1>
+          <p class="view-lead">用自然语言描述你的目标与边界，AI 会逐轮补全投资画像，确认后再进入因子选股。</p>
+        </div>
+        <div class="head-notes">
+          <span class="head-note"><svg class="icon"><use href="#i-pulse"></use></svg>流式对话</span>
+          <span class="head-note"><svg class="icon"><use href="#i-shield"></use></svg>画像可编辑</span>
+        </div>
+      </div>
+
+      <div class="chat-layout">
+        <section class="panel chat-panel" aria-label="AI 画像对话">
+          <header class="chat-head">
+            <div class="agent-avatar" aria-hidden="true">
+              <svg class="icon"><use href="#i-spark"></use></svg>
+              <span class="avatar-ping"></span>
+            </div>
+            <div class="agent-info">
+              <h2>画像分析师</h2>
+              <p><span class="live-dot"></span>多轮追问 · 实时抽取槽位</p>
+            </div>
+            <span class="model-tag">AI ANALYST</span>
+          </header>
+
+          <div class="chat-scroll" id="chat-messages" aria-live="polite" aria-relevant="additions"></div>
+
+          <div class="quick-block" id="quick-prompts">
+            <span class="quick-label">试试这样描述</span>
+            <div class="quick-list">
+              <button type="button" class="quick-chip" data-prompt="我是稳健型投资者，计划投资 3 年以上，能接受最大回撤 10% 左右，目标是长期资产增值。">稳健 · 3 年 · 10% 回撤</button>
+              <button type="button" class="quick-chip" data-prompt="我比较积极，能承受 20% 左右的回撤，希望捕捉成长股的长期机会，不投白酒和地产。">积极 · 成长 · 排除行业</button>
+              <button type="button" class="quick-chip" data-prompt="我只想先了解一下，风险偏好中等，投资期限 1-3 年，回撤最好控制在 15% 以内。">平衡 · 1-3 年</button>
+            </div>
+          </div>
+
+          <form class="composer" id="chat-form">
+            <label class="sr-only" for="chat-input">描述你的投资画像</label>
+            <textarea id="chat-input" rows="1" maxlength="4000" placeholder="例如：我偏向稳健，能接受 10% 左右回撤，希望持有 3 年以上……"></textarea>
+            <div class="composer-bottom">
+              <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
+              <button class="btn btn-primary send-btn" id="chat-send" type="submit">
+                <span>发送</span><svg class="icon"><use href="#i-arrow"></use></svg>
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <aside class="profile-column">
+          <section class="panel profile-panel" aria-label="投资画像槽位">
+            <header class="card-head">
+              <div>
+                <div class="card-kicker">PROFILE SNAPSHOT</div>
+                <h2><span class="title-orb"></span>投资画像</h2>
+              </div>
+              <span class="status-label" id="profile-status">待补全</span>
+            </header>
+
+            <div class="profile-progress">
+              <div class="progress-line"><i id="profile-progress-bar"></i></div>
+              <span><b id="profile-required-count">0 / 3</b> 核心槽位</span>
+            </div>
+
+            <div class="slot-list" id="profile-slots"></div>
+
+            <form class="slot-editor" id="profile-editor" hidden>
+              <div class="editor-title">手动校准画像 <span>确认后将用于选股</span></div>
+              <div class="form-grid two-col">
+                <label>风险偏好
+                  <select id="slot-risk_level">
+                    <option value="">请选择</option>
+                    <option value="conservative">保守型</option>
+                    <option value="balanced">平衡型</option>
+                    <option value="aggressive">积极型</option>
+                  </select>
+                </label>
+                <label>投资期限
+                  <input id="slot-horizon" type="text" placeholder="如 3-5 年" maxlength="80">
+                </label>
+                <label>回撤容忍
+                  <input id="slot-drawdown_tolerance" type="text" placeholder="如 10%" maxlength="80">
+                </label>
+                <label>投资目标
+                  <input id="slot-goal" type="text" placeholder="如 长期增值" maxlength="120">
+                </label>
+                <label>投资经验
+                  <input id="slot-experience" type="text" placeholder="如 5 年" maxlength="80">
+                </label>
+                <label>可投资金
+                  <input id="slot-capital" type="text" placeholder="如 100 万" maxlength="80">
+                </label>
+              </div>
+              <label class="block-label">排除行业（逗号分隔）
+                <input id="slot-excluded_industries" type="text" placeholder="如 白酒, 房地产" maxlength="200">
+              </label>
+              <div class="editor-actions">
+                <button class="btn btn-ghost btn-sm" type="button" id="profile-cancel">取消</button>
+                <button class="btn btn-outline btn-sm" type="button" id="profile-save">保存并确认</button>
+              </div>
+            </form>
+
+            <div class="profile-actions">
+              <button class="btn btn-ghost" type="button" id="profile-edit">
+                <svg class="icon"><use href="#i-sliders"></use></svg>编辑画像
+              </button>
+              <button class="btn btn-outline" type="button" id="profile-confirm" disabled>确认画像</button>
+            </div>
+            <p class="micro-hint" id="profile-hint">补全风险偏好、投资期限、回撤容忍后可确认。</p>
+          </section>
+
+          <section class="panel launch-panel">
+            <div class="launch-top">
+              <span class="step-number">02</span>
+              <div>
+                <h3>开始智能选股</h3>
+                <p>画像确认后，将按风险等级适配 10 因子权重。</p>
+              </div>
+            </div>
+            <button class="btn btn-primary btn-block" id="start-selection" type="button" disabled>
+              开始选股 <svg class="icon"><use href="#i-arrow"></use></svg>
+            </button>
+            <p class="micro-hint" id="selection-start-hint">等待画像确认</p>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         视图 02 · 选股结果
+    ============================================================= -->
+    <section class="view" id="view-selection" data-view-panel="selection" aria-labelledby="selection-title" hidden>
+      <div class="view-head">
+        <div>
+          <div class="eyebrow"><span class="eyebrow-mark"></span>FACTOR SELECTION <b>/</b> 02</div>
+          <h1 id="selection-title">选股结果</h1>
+          <p class="view-lead">10 因子行业中性化打分，叠加流动性、涨跌停与交易成本约束后的 Top N 组合。</p>
+        </div>
+        <div class="head-actions">
+          <label class="select-wrap">Top N
+            <select id="selection-top-n">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="15">15</option>
+              <option value="20">20</option>
+            </select>
+          </label>
+          <button class="btn btn-outline" id="run-selection" type="button">
+            <svg class="icon"><use href="#i-refresh"></use></svg><span>重新选股</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="run-status panel" id="selection-progress" hidden>
+        <div class="run-status-icon"><span class="scan-dot"></span></div>
+        <div class="run-status-main">
+          <div class="run-status-line">
+            <strong id="selection-stage">准备中</strong>
+            <span id="selection-progress-message">正在读取因子数据…</span>
+            <b id="selection-progress-percent">0%</b>
+          </div>
+          <div class="progress-line"><i id="selection-progress-fill"></i></div>
+        </div>
+      </div>
+
+      <div class="empty-state panel" id="selection-empty">
+        <div class="empty-orbit" aria-hidden="true">
+          <svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="45" fill="none" stroke="currentColor" stroke-width="1" opacity=".2"/><circle cx="60" cy="60" r="31" fill="none" stroke="currentColor" stroke-width="1" opacity=".12"/><path d="M60 20v80M20 60h80" stroke="currentColor" stroke-width=".7" opacity=".1"/><path d="M38 74a26 26 0 1 1 44-32" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".65"/><circle cx="82" cy="42" r="5" fill="currentColor" opacity=".75"/></svg>
+        </div>
+        <div>
+          <span class="card-kicker">WAITING FOR RUN</span>
+          <h2 id="selection-empty-title">尚未生成选股结果</h2>
+          <p id="selection-empty-text">先完成 AI 对话并确认投资画像，再运行 10 因子选股。</p>
+          <div class="empty-actions">
+            <button class="btn btn-outline" id="selection-go-chat" type="button">返回完善画像</button>
+            <button class="btn btn-primary" id="selection-empty-run" type="button">开始选股 <svg class="icon"><use href="#i-arrow"></use></svg></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="selection-skeleton" id="selection-skeleton" hidden aria-hidden="true">
+        <div class="metric-grid">
+          <div class="skeleton skeleton-metric"></div><div class="skeleton skeleton-metric"></div><div class="skeleton skeleton-metric"></div><div class="skeleton skeleton-metric"></div><div class="skeleton skeleton-metric"></div>
+        </div>
+        <div class="selection-main-grid">
+          <div class="skeleton skeleton-block skeleton-table"></div>
+          <div class="skeleton skeleton-block"></div>
+        </div>
+      </div>
+
+      <div class="selection-content" id="selection-content" hidden>
+        <div class="result-meta">
+          <span class="data-badge"><i></i><span id="selection-asof">数据 —</span></span>
+          <span id="selection-meta">A 股多因子 · 行业中性化</span>
+        </div>
+        <div class="metric-grid" id="selection-metrics"></div>
+
+        <div class="selection-main-grid">
+          <div class="selection-left">
+            <section class="panel table-panel">
+              <header class="card-head">
+                <div>
+                  <div class="card-kicker">TOP PICKS</div>
+                  <h2><span class="title-orb"></span>精选股票</h2>
+                </div>
+                <span class="card-note" id="selection-count">Top 10</span>
+              </header>
+              <div class="table-scroll">
+                <table class="stock-table">
+                  <thead>
+                    <tr><th>#</th><th>股票</th><th>行业</th><th>综合得分</th><th>优势因子</th></tr>
+                  </thead>
+                  <tbody id="selection-table-body"></tbody>
+                </table>
+              </div>
+              <p class="table-foot">得分已做行业中性化；优势因子按方向对齐后的 z 值排序。仅供研究演示。</p>
+            </section>
+
+            <section class="panel nav-panel">
+              <header class="card-head">
+                <div>
+                  <div class="card-kicker">BACKTEST NAV</div>
+                  <h2><span class="title-orb"></span>策略净值曲线</h2>
+                </div>
+                <div class="legend" id="selection-nav-legend">
+                  <span><i class="legend-line cyan"></i>策略净值</span>
+                  <span><i class="legend-line slate"></i>沪深 300</span>
+                </div>
+              </header>
+              <div class="chart-box chart-nav" id="selection-nav-chart"></div>
+              <p class="chart-caption" id="selection-nav-caption">T+1 成交 · 双边成本 · 停牌与涨跌停约束已计入</p>
+            </section>
+          </div>
+
+          <div class="selection-right">
+            <section class="panel factor-panel">
+              <header class="card-head">
+                <div>
+                  <div class="card-kicker">FACTOR EXPOSURE</div>
+                  <h2><span class="title-orb"></span>因子贡献</h2>
+                </div>
+                <span class="card-note">组合平均 z</span>
+              </header>
+              <div class="chart-box" id="selection-factor-chart"></div>
+              <p class="chart-caption">正值代表组合在方向对齐后的因子暴露更强。</p>
+            </section>
+
+            <section class="panel portfolio-panel">
+              <header class="card-head">
+                <div>
+                  <div class="card-kicker">PORTFOLIO</div>
+                  <h2><span class="title-orb"></span>组合权重</h2>
+                </div>
+                <span class="card-note" id="portfolio-method">等权</span>
+              </header>
+              <div class="portfolio-summary">
+                <div class="mini-ring" id="portfolio-ring"><span>100<small>%</small></span></div>
+                <div>
+                  <strong id="portfolio-total">¥1,000,000</strong>
+                  <span id="portfolio-count">10 只标的 · 满仓</span>
+                </div>
+              </div>
+              <div class="allocation-list" id="portfolio-list"></div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         视图 03 · AI 解读
+    ============================================================= -->
+    <section class="view" id="view-interpretation" data-view-panel="interpretation" aria-labelledby="interpretation-title" hidden>
+      <div class="view-head">
+        <div>
+          <div class="eyebrow"><span class="eyebrow-mark"></span>AI COMMENTARY <b>/</b> 03</div>
+          <h1 id="interpretation-title">AI 解读</h1>
+          <p class="view-lead">基于本次选股与回测事实，由 AI 解释选股逻辑、组合特征和需要持续跟踪的风险。</p>
+        </div>
+        <div class="head-notes">
+          <span class="head-note"><svg class="icon"><use href="#i-doc"></use></svg>事实约束</span>
+          <span class="head-note"><svg class="icon"><use href="#i-shield"></use></svg>合规校验</span>
+        </div>
+      </div>
+
+      <div class="interpret-layout">
+        <section class="panel interpret-panel" aria-label="AI 研究解读">
+          <header class="card-head interpret-head">
+            <div class="agent-identity">
+              <span class="mini-agent"><svg class="icon"><use href="#i-spark"></use></svg></span>
+              <div>
+                <div class="card-kicker">RESEARCH ANALYST</div>
+                <h2>AI 研究员解读</h2>
+              </div>
+            </div>
+            <span class="status-label" id="interpret-status">待生成</span>
+          </header>
+
+          <div class="insight-context" id="interpret-context"></div>
+
+          <div class="insight-body" id="interpret-body">
+            <div class="empty-inline" id="interpret-empty">
+              <div class="empty-icon"><svg class="icon"><use href="#i-doc"></use></svg></div>
+              <h3>完成选股后生成解读</h3>
+              <p>AI 将结合选股结果、回测指标与因子暴露给出解读，不会编造未获得的行情事实。</p>
+              <button class="btn btn-primary" id="generate-interpretation" type="button">让 AI 解读本次结果 <svg class="icon"><use href="#i-arrow"></use></svg></button>
+            </div>
+          </div>
+
+          <div class="followup-block">
+            <div class="followup-head">
+              <h3>继续追问</h3>
+              <span>复用同一会话消息接口</span>
+            </div>
+            <div class="followup-thread" id="followup-thread"></div>
+            <form class="composer followup-form" id="followup-form">
+              <label class="sr-only" for="followup-input">向 AI 追问本次选股</label>
+              <textarea id="followup-input" rows="1" maxlength="4000" placeholder="例如：最大回撤可能来自哪些风险？候选组合更适合什么市场环境？" disabled></textarea>
+              <button class="btn btn-outline send-btn" id="followup-send" type="submit" disabled>
+                <span>追问</span><svg class="icon"><use href="#i-arrow"></use></svg>
+              </button>
+            </form>
+          </div>
+        </section>
+
+        <aside class="interpret-aside">
+          <section class="panel snapshot-panel">
+            <header class="card-head">
+              <div>
+                <div class="card-kicker">RUN CONTEXT</div>
+                <h2><span class="title-orb"></span>本次快照</h2>
+              </div>
+            </header>
+            <div id="interpret-snapshot">
+              <p class="muted-small">暂无已完成的选股任务。</p>
+            </div>
+          </section>
+
+          <section class="panel compliance-panel">
+            <span class="compliance-icon"><svg class="icon"><use href="#i-shield"></use></svg></span>
+            <div>
+              <h3>合规边界</h3>
+              <p>解读只依据系统提供的事实数据，不构成投资建议，不预测收益，不承诺保本。历史回测不代表未来表现。</p>
+            </div>
+          </section>
+
+          <section class="panel method-panel">
+            <div class="card-kicker">METHODOLOGY</div>
+            <h3>解读如何生成</h3>
+            <ol class="method-list">
+              <li><span>01</span>读取 Top N、因子暴露与回测指标</li>
+              <li><span>02</span>基于事实生成结构化解读</li>
+              <li><span>03</span>追问继续沿用同一会话上下文</li>
+            </ol>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         视图 04 · AI 调参台
+    ============================================================= -->
+    <section class="view" id="view-tune" data-view-panel="tune" aria-labelledby="tune-title" hidden>
+      <div class="tune-hero">
+        <div class="tune-title-block">
+          <div class="eyebrow"><span class="eyebrow-mark"></span>PARAMETER LAB <b>/</b> 04</div>
+          <h1 id="tune-title">AI 调参台 <span class="title-accent" id="tune-title-state">· 模型自动优化</span></h1>
+          <p class="view-lead">A 股多因子策略 · 在权重约束内随机搜索，样本外验证后交由人工启用。</p>
+        </div>
+        <div class="tune-hero-side">
+          <div class="tune-launch">
+            <label class="select-wrap compact">轮数
+              <select id="tune-trial-select">
+                <option value="12">12</option>
+                <option value="24" selected>24</option>
+                <option value="36">36</option>
+                <option value="60">60</option>
+              </select>
+            </label>
+            <button class="btn btn-primary btn-sm" id="start-tune" type="button">
+              <svg class="icon"><use href="#i-sliders"></use></svg><span>启动 AI 调参</span>
+            </button>
+          </div>
+          <div class="tune-status-cluster">
+            <span class="tune-status" id="tune-status-pill"><i></i><span id="tune-status-text">等待启动</span></span>
+            <div class="gauge-wrap" id="tune-gauge" aria-label="调参进度"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tune-grid is-loading" id="tune-grid">
+        <!-- 左栏：AI 操作流 -->
+        <section class="panel tune-col tune-left">
+          <header class="card-head tune-card-head">
+            <div>
+              <div class="card-kicker">AGENT LOOP</div>
+              <h2><span class="title-orb"></span>AI 操作流</h2>
+              <p class="card-sub">5 步自动调参闭环 <span class="dot-sep">·</span> 已用 <b id="tune-elapsed">00:00</b></p>
+            </div>
+            <span class="mini-tag" id="tune-run-tag">IDLE</span>
+          </header>
+          <div class="tune-content">
+            <div class="timeline" id="tune-timeline"></div>
+            <div class="agent-note" id="tune-agent-note">
+              <span class="note-mark"><svg class="icon"><use href="#i-spark"></use></svg></span>
+              <p>等待启动。AI 将在合法权重空间内生成候选并逐轮回测。</p>
+            </div>
+          </div>
+          <div class="tune-skeleton">
+            <div class="skeleton skeleton-line w-70"></div>
+            <div class="skeleton skeleton-step"></div>
+            <div class="skeleton skeleton-step"></div>
+            <div class="skeleton skeleton-step"></div>
+            <div class="skeleton skeleton-step"></div>
+            <div class="skeleton skeleton-step"></div>
+          </div>
+        </section>
+
+        <!-- 中栏：参数演化 -->
+        <section class="panel tune-col tune-center">
+          <header class="card-head tune-card-head">
+            <div>
+              <div class="card-kicker">PARAMETER EVOLUTION</div>
+              <h2><span class="title-orb"></span>参数演化 · 因子权重</h2>
+              <p class="card-sub" id="tune-compare-label">等待基线权重载入</p>
+            </div>
+            <span class="candidate-badge" id="candidate-badge"><i></i>候选发光</span>
+          </header>
+          <div class="tune-content">
+            <div class="factor-legend">
+              <span><i class="legend-line slate"></i>当前权重</span>
+              <span><i class="legend-line cyan"></i>候选权重</span>
+              <span class="legend-note">约束 0–40% · 总和 100%</span>
+            </div>
+            <div class="chart-box weight-chart" id="tune-weight-chart"></div>
+            <div class="split-charts">
+              <div class="sub-chart">
+                <div class="sub-chart-head"><h3>因子暴露雷达</h3><span>候选 vs 当前</span></div>
+                <div class="chart-box" id="tune-radar-chart"></div>
+              </div>
+              <div class="sub-chart">
+                <div class="sub-chart-head"><h3>候选参数空间</h3><span id="tune-scatter-count">0 组候选 · 按目标值着色</span></div>
+                <div class="chart-box" id="tune-scatter-chart"></div>
+              </div>
+            </div>
+            <p class="chart-caption center-caption">因子暴露雷达按权重归一展示，仅用于对比参数结构。</p>
+          </div>
+          <div class="tune-skeleton">
+            <div class="skeleton skeleton-line w-55"></div>
+            <div class="skeleton skeleton-bars"></div>
+            <div class="split-skeletons">
+              <div class="skeleton skeleton-radar"></div>
+              <div class="skeleton skeleton-radar"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 右栏：指标与版本 -->
+        <section class="panel tune-col tune-right">
+          <header class="card-head tune-card-head">
+            <div>
+              <div class="card-kicker">VALIDATION</div>
+              <h2><span class="title-orb"></span>指标对比</h2>
+              <p class="card-sub" id="tune-metric-label">候选 vs 当前 · 等待回测</p>
+            </div>
+            <span class="mini-tag" id="tune-best-tag">—</span>
+          </header>
+          <div class="tune-content">
+            <div class="tune-metric-grid" id="tune-metrics"></div>
+            <div class="tune-nav-block">
+              <div class="sub-chart-head">
+                <h3>累计净值曲线</h3>
+                <div class="tiny-legend">
+                  <span><i class="legend-line slate"></i>当前</span>
+                  <span><i class="legend-line cyan"></i>候选</span>
+                </div>
+              </div>
+              <div class="chart-box tune-nav-chart" id="tune-nav-chart"></div>
+              <div class="chart-empty small" id="tune-nav-empty" hidden>候选回测完成后显示净值对比</div>
+            </div>
+            <div class="version-block">
+              <div class="sub-chart-head"><h3>版本时间轴</h3><span id="version-active-label">—</span></div>
+              <div class="version-timeline" id="version-timeline"></div>
+            </div>
+            <p class="chart-caption tune-verdict" id="tune-verdict">等待候选版本回测完成。</p>
+          </div>
+          <div class="tune-skeleton">
+            <div class="tune-metric-skeletons">
+              <div class="skeleton skeleton-metric"></div><div class="skeleton skeleton-metric"></div>
+              <div class="skeleton skeleton-metric"></div><div class="skeleton skeleton-metric"></div>
+            </div>
+            <div class="skeleton skeleton-line w-65"></div>
+            <div class="skeleton skeleton-nav"></div>
+            <div class="skeleton skeleton-line w-45"></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="tune-action-bar panel">
+        <div class="tune-actions">
+          <button class="btn btn-primary" id="tune-activate" type="button" disabled>
+            <svg class="icon"><use href="#i-check"></use></svg>启用候选版本
+          </button>
+          <button class="btn btn-danger-ghost" id="tune-rollback" type="button" disabled>
+            <svg class="icon"><use href="#i-refresh"></use></svg>回滚
+          </button>
+        </div>
+        <p id="tune-action-hint">所有变更需人工确认 <span class="dot-sep">·</span> 历史版本可回滚</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <div class="disclaimer">
+      <svg class="icon"><use href="#i-shield"></use></svg>
+      <p><strong>免责声明</strong> 本系统为比赛演示原型，仅用于技术方案展示与投资研究辅助，不构成任何投资建议，不承诺收益。历史回测不代表未来表现，市场有风险，投资需谨慎。</p>
+    </div>
+    <div class="footer-meta">
+      <span>DATA · CSI 800 / SAMPLE</span>
+      <span>© 2026 智投罗盘</span>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <!-- dev-only：仅 ?mock=1 时同步加载本地 mock-data.js，默认不启用，不访问后端 -->
+  <script>
+    (function () {
+      var mock = new URLSearchParams(window.location.search).get('mock') === '1';
+      window.__MOCK_MODE__ = mock;
+      if (mock) {
+        document.write('<script src="mock-data.js"><\/script>');
+      }
+    })();
+  </script>
+  <script src="charts.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
