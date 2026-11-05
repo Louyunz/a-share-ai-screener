@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 数据缓存（由脚本生成，不入库）
+data/a_share/*
+!data/a_share/.gitkeep
+data/app.db
+data/*.db
+data/chat/
+data/versions/
+
+# 前端无构建产物；保留静态文件
+node_modules/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 临时
+*.log
+_tmp/

@@ -1,0 +1,20 @@
+# A 股 AI 选股 MVP — 运行依赖
+# Python 3.12+
+
+# Web 服务
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+
+# 数据处理
+pandas>=2.2
+numpy>=1.26
+scipy>=1.12
+pyarrow>=15.0
+
+# A 股数据源
+akshare>=1.14
+tushare>=1.4
+
+# 说明：
+# - 服务端只使用标准库 urllib 调用 OpenAI 兼容接口，不额外依赖 requests/httpx。
+# - 本地无网络时可用 `python -m backend.data.build_cache --source sample` 生成演示数据。
