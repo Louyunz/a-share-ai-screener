@@ -204,7 +204,7 @@
               </div>
             </div>
             <button class="btn btn-primary btn-block" id="start-selection" type="button" disabled>
-              开始选股 <svg class="icon"><use href="#i-arrow"></use></svg>
+              <span class="btn-label">开始选股</span><svg class="icon"><use href="#i-arrow"></use></svg>
             </button>
             <p class="micro-hint" id="selection-start-hint">等待画像确认</p>
           </section>
@@ -259,7 +259,7 @@
           <p id="selection-empty-text">先完成 AI 对话并确认投资画像，再运行 10 因子选股。</p>
           <div class="empty-actions">
             <button class="btn btn-outline" id="selection-go-chat" type="button">返回完善画像</button>
-            <button class="btn btn-primary" id="selection-empty-run" type="button">开始选股 <svg class="icon"><use href="#i-arrow"></use></svg></button>
+            <button class="btn btn-primary" id="selection-empty-run" type="button"><span>开始选股</span><svg class="icon"><use href="#i-arrow"></use></svg></button>
           </div>
         </div>
       </div>
@@ -457,10 +457,10 @@
           <div class="tune-launch">
             <label class="select-wrap compact">轮数
               <select id="tune-trial-select">
+                <option value="5" selected>5</option>
+                <option value="8">8</option>
                 <option value="12">12</option>
-                <option value="24" selected>24</option>
-                <option value="36">36</option>
-                <option value="60">60</option>
+                <option value="24">24</option>
               </select>
             </label>
             <button class="btn btn-primary btn-sm" id="start-tune" type="button">

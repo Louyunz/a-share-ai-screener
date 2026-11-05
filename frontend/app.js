@@ -1405,9 +1405,8 @@
     }
     if (emptyButton) {
       emptyButton.disabled = running || !state.booted || !state.profile.confirmed;
-      emptyButton.querySelector('span') ? null : null;
-      var emptySpan = emptyButton.firstChild;
-      if (emptySpan && emptySpan.nodeType === Node.TEXT_NODE) emptySpan.textContent = selection.status === 'error' ? '重试选股 ' : '开始选股 ';
+      var emptySpan = emptyButton.querySelector('span');
+      if (emptySpan) emptySpan.textContent = selection.status === 'error' ? '重试选股' : '开始选股';
     }
     if (select) select.disabled = running;
     if (running) {
