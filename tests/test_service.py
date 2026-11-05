@@ -2,14 +2,14 @@
 """AppService 集成测试（FakeLLM + 合成小数据，不依赖网络）。"""
 from __future__ import annotations
 
-import tempfile
 import unittest
 from pathlib import Path
 
-from backend.data.base import DataBundle, save_bundle
+from backend.data.base import save_bundle
 from backend.data.sample import generate_bundle
 from backend.llm import FakeLLM
 from backend.service import AppService
+from tests import cleanup, workdir
 
 
 def _try_import_engine() -> None:
@@ -23,18 +23,17 @@ class ServiceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         _try_import_engine()
-        cls.tmp = tempfile.TemporaryDirectory()
-        root = Path(cls.tmp.name)
+        cls.dir = workdir("service")
         bundle = generate_bundle(n_stocks=30, n_days=340, seed=7)
-        save_bundle(bundle, root / "a_share")
-        cls.service = AppService(data_dir=root / "a_share", db_path=root / "app.db",
+        save_bundle(bundle, cls.dir / "a_share")
+        cls.service = AppService(data_dir=cls.dir / "a_share", db_path=cls.dir / "app.db",
                                  llm=FakeLLM())
         cls.sid = cls.service.create_session()["session_id"]
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.service.close()
-        cls.tmp.cleanup()
+        cleanup(cls.dir)
 
     # ------------------------------------------------------------------
     def _complete_profile(self) -> dict:
@@ -77,7 +76,6 @@ class ServiceTest(unittest.TestCase):
         kinds = [e for e, _ in events]
         self.assertIn("started", kinds)
         self.assertIn("result", kinds, msg=f"事件：{kinds}")
-        result = dict(events)[("result")] if False else None  # noqa: F841
         payload = next(data for event, data in events if event == "result")
         self.assertTrue(payload["top"])
         for key in ("cagr", "sharpe", "mdd", "ir", "win_rate"):
@@ -102,9 +100,8 @@ class ServiceTest(unittest.TestCase):
         self.assertTrue(self.service.versions()["active_id"])
 
     def test_05_selection_requires_confirmed_profile(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
+        root = workdir("service_guard")
+        self.addCleanup(lambda: cleanup(root))
         bundle = generate_bundle(n_stocks=10, n_days=200, seed=3)
         save_bundle(bundle, root / "a_share")
         service = AppService(data_dir=root / "a_share", db_path=root / "s.db", llm=FakeLLM())
@@ -116,11 +113,10 @@ class ServiceTest(unittest.TestCase):
             service.close()
 
     def test_06_missing_data_raises(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        root = workdir("service_missing")
+        self.addCleanup(lambda: cleanup(root))
         with self.assertRaises(Exception):
-            AppService(data_dir=Path(tmp.name) / "empty", db_path=Path(tmp.name) / "x.db",
-                       llm=FakeLLM())
+            AppService(data_dir=root / "empty", db_path=root / "x.db", llm=FakeLLM())
 
 
 if __name__ == "__main__":

@@ -23,6 +23,9 @@ Thumbs.db
 .idea/
 .vscode/
 
+# 测试临时目录
+tests/_tmp/
+
 # 临时
 *.log
 _tmp/

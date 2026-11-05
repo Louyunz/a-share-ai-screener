@@ -2,13 +2,12 @@
 """Agent / GuardChain / FakeLLM 测试。"""
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 
 from backend.agent import AgentFacade, AgentError, ComplianceError, GuardChain
 from backend.llm import FakeLLM, extract_json
 from backend.store import Store
+from tests import cleanup, workdir
 
 
 class LlmHelperTest(unittest.TestCase):
@@ -36,14 +35,14 @@ class GuardChainTest(unittest.TestCase):
 
 class AgentFacadeTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "agent.db")
+        self.dir = workdir("agent")
+        self.store = Store(self.dir / "agent.db")
         self.agent = AgentFacade(FakeLLM(), self.store)
         self.sid = self.store.create_session()
 
     def tearDown(self) -> None:
         self.store.close()
-        self.tmp.cleanup()
+        cleanup(self.dir)
 
     def _collect(self, content: str) -> list[tuple[str, dict]]:
         return list(self.agent.stream_chat(self.sid, content))

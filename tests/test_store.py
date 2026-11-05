@@ -2,21 +2,20 @@
 """Store（SQLite）单元测试。"""
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 
 from backend.store import Store
+from tests import cleanup, workdir
 
 
 class StoreTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "test.db")
+        self.dir = workdir("store")
+        self.store = Store(self.dir / "test.db")
 
     def tearDown(self) -> None:
         self.store.close()
-        self.tmp.cleanup()
+        cleanup(self.dir)
 
     def test_session_and_messages(self) -> None:
         sid = self.store.create_session()
