@@ -2188,10 +2188,11 @@
     var tune = state.tune;
     var running = tune.status === 'starting' || tune.status === 'running';
     var done = tune.status === 'done';
-    var hasData = tune.status !== 'idle' && (tune.status !== 'starting');
+    // 只有收到 tuning_started（基线数据）或 trial 后才撤掉骨架屏。
+    var hasData = !!(tune.baseWeights || tune.baseMetrics || tune.trials.length || done);
     var grid = $('tune-grid');
     if (!grid) return;
-    grid.classList.toggle('is-loading', !hasData && !(tune.total > 0 || tune.trials.length));
+    grid.classList.toggle('is-loading', !hasData);
 
     var titleState = $('tune-title-state');
     if (titleState) {
@@ -2832,6 +2833,10 @@
     var tune = state.tune;
     if (!tune.candidateVersionId) return;
     var existingIndex = state.versions.findIndex(function (version) { return version.id === tune.candidateVersionId; });
+    // 新候选产生后，本地旧 candidate 状态归入历史；避免版本时间轴出现多个“候选”。
+    state.versions.forEach(function (version) {
+      if (version.id !== tune.candidateVersionId && version.status === 'candidate') version.status = 'archived';
+    });
     var candidate = {
       id: tune.candidateVersionId,
       weights: tune.bestWeights,
@@ -2879,6 +2884,18 @@
       if (!state.activeVersionId) {
         var active = state.versions.find(function (version) { return version.status === 'active'; });
         if (active) state.activeVersionId = active.id;
+      }
+      // done 事件已给出候选版本，若版本列表略滞后则保留本地占位，避免时间轴缺节点。
+      if (state.tune.candidateVersionId && state.tune.status === 'done' &&
+        !state.versions.some(function (version) { return version.id === state.tune.candidateVersionId; })) {
+        state.versions.push({
+          id: state.tune.candidateVersionId,
+          weights: state.tune.bestWeights,
+          metrics: state.tune.bestMetrics,
+          status: 'candidate',
+          created_at: nowIso(),
+          parent_id: state.activeVersionId || null
+        });
       }
       state.versionsLoaded = true;
       renderVersionTimeline();
