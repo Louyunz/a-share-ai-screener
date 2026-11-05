@@ -10,7 +10,10 @@ venv/
 data/a_share/*
 !data/a_share/.gitkeep
 data/app.db
+data/app.db-*
 data/*.db
+data/*.db-wal
+data/*.db-shm
 data/chat/
 data/versions/
 
