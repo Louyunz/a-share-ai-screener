@@ -4,7 +4,7 @@
 
 - 后端：FastAPI（轻量前后端分离，单进程同时托管页面与 API）+ SQLite + pandas
 - 前端：原生 JS + SSE + 纯 SVG/CSS 图表（无构建链、无 CDN 依赖）
-- 数据：AkShare 为主、Tushare 为辅；离线缓存到 parquet；无网络时可用内置示例数据
+- 数据：AkShare 为主、Tushare 为辅；离线缓存（有 pyarrow 时 parquet，否则 CSV）；无网络时可用内置示例数据
 
 ## 快速开始
 

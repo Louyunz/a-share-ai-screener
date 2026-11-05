@@ -222,11 +222,9 @@ class AppService:
                                                   method="equal_weight", capital=1_000_000.0)
             self._publish(job, "progress", {"stage": "回测验证", "percent": 65,
                                             "message": "按 A 股交易规则运行样本外回测"})
-            end = data.prices.index[-1]
-            start = end - pd.Timedelta(days=int(365 * BACKTEST_YEARS))
+            start_s, end_s = self._backtest_window()
             bt = selection.run_backtest(
-                data, weights, start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"), top_n=top_n,
+                data, weights, start=start_s, end=end_s, top_n=top_n,
                 rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY,
                 cost_sell=COST_SELL, risk_free_rate=RISK_FREE_RATE)
             self._publish(job, "progress", {"stage": "AI 解读", "percent": 85,
@@ -277,9 +275,7 @@ class AppService:
             profile = self.store.get_profile(session_id) or {}
             base_weights = self._weights_for(profile)
             active = self.store.active_version()
-            end = self.data.prices.index[-1]
-            start = end - pd.Timedelta(days=int(365 * BACKTEST_YEARS))
-            start_s, end_s = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+            start_s, end_s = self._backtest_window()
             from .engine import selection, tuner
 
             base_bt = selection.run_backtest(
@@ -433,6 +429,21 @@ class AppService:
         from .engine.factors import weights_for
         level = (profile or {}).get("risk_level", "balanced")
         return dict(weights_for(level))
+
+    def _backtest_window(self) -> tuple[str, str]:
+        """确定回测窗口：最近 N 年，且至少保留 200 个交易日用于因子热身。"""
+        index = self.data.prices.index
+        if len(index) == 0:
+            raise ServiceError("行情数据为空，无法回测")
+        end = index[-1]
+        warmup_pos = min(len(index) - 1, 200)
+        warmup_start = index[warmup_pos]
+        start = end - pd.Timedelta(days=int(365 * BACKTEST_YEARS))
+        if start < warmup_start:
+            start = warmup_start
+        if start >= end:
+            raise ServiceError("可用历史数据不足，无法回测（建议至少 260 个交易日）")
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
     def _last_result(self, session_id: str) -> dict[str, Any] | None:
         with self._results_lock:

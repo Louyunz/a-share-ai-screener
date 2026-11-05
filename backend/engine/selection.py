@@ -329,6 +329,7 @@ def build_portfolio(
                 index=volatility.index,
                 dtype=float,
             )
+        inverse = inverse.replace([np.inf, -np.inf], np.nan)
         valid = inverse.dropna()
         if valid.empty:
             raise ValueError("风险平价无法计算任何标的的 60 日波动率")

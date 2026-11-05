@@ -30,7 +30,7 @@ class IDataPort(Protocol):
     def load(self) -> DataBundle: ...
 ```
 
-缓存文件（`data/a_share/`）：`prices.parquet`、`close_raw.parquet`、`amount.parquet`、`fundamentals.parquet`、`industry.csv`、`benchmark.parquet`、`universe.csv`、`meta.json`。服务运行期只读缓存。
+缓存文件（`data/a_share/`）：`prices`、`close_raw`、`amount`、`fundamentals`、`benchmark` 五类数值表（有 pyarrow 时写 `.parquet`，否则写 `.csv`，读取时自动识别），以及 `industry.csv`、`universe.csv`、`meta.json`。服务运行期只读缓存。
 
 ## 2. 引擎契约（engine-dev 实现）
 
