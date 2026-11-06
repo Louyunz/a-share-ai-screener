@@ -29,6 +29,10 @@ Thumbs.db
 # 测试临时目录
 tests/_tmp/
 
+# 沙箱/冒烟测试遗留目录（Windows 权限探测产物）
+dsh_model_smoke_*/
+probe_*/
+
 # 本地密钥与临时文件
 .env
 .env.*
