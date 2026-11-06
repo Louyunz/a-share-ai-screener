@@ -32,6 +32,25 @@ class AgentPlanTest(unittest.TestCase):
         plan = self.agent.plan(_state(slots), [], "可以，按这个来")
         self.assertIn("confirm_profile", plan.action_names())
         self.assertIn("run_selection", plan.action_names())
+        self.assertIn("已收到确认", plan.reply)
+
+    def test_profile_confirmation_hint_is_explicit(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = self.agent.plan(_state(slots), [], "今天天气不错")
+        self.assertEqual(plan.actions, [])
+        self.assertIn("【请确认】", plan.reply)
+        self.assertIn("回复「确认」", plan.reply)
+
+    def test_pending_confirmation_hint_is_explicit(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = self.agent.plan(_state(slots, confirmed=True,
+                                      pending={"summary": "换低波模型"}),
+                               [], "今天市场怎么样")
+        self.assertEqual(plan.actions, [])
+        self.assertIn("【待确认】", plan.reply)
+        self.assertIn("同意启用", plan.reply)
 
     def test_optimize_requires_confirmed_profile(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
@@ -65,7 +84,8 @@ class AgentPlanTest(unittest.TestCase):
         text = self.agent.explain({"top": [{"code": "600000.SH"}],
                                    "metrics": {"cagr": 0.1, "mdd": -0.2, "sharpe": 1.1}})
         self.assertIn("不构成投资建议", text)
-        self.assertNotIn("夏普比率", text)
+        self.assertIn("结论", text)
+        self.assertIn("依据", text)
 
 
 class ComplianceTest(unittest.TestCase):

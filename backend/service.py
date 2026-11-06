@@ -11,7 +11,8 @@ from typing import Any, Iterator
 
 import pandas as pd
 
-from .agent import Agent, AgentError, chunk_text, safe_question
+from .agent import (Agent, AgentError, CONFIRM_PENDING_HINT, CONFIRM_PROFILE_HINT,
+                     chunk_text, has_confirmation_request, safe_question)
 from .config import (
     A_SHARE_DIR,
     BACKTEST_YEARS,
@@ -170,8 +171,17 @@ class AppService:
                 self.store.save_profile(session_id, slots, profile_summary(slots), confirmed)
                 yield "ui", {"block": self._profile_block(session_id)}
 
+        # 画像刚好在本轮补齐时，补上明确的确认要求
+        updated_profile = self.store.get_profile(session_id)
+        if (updated_profile and not updated_profile["confirmed"]
+                and profile_complete(updated_profile["slots"])
+                and not plan.has_action("confirm_profile")
+                and not has_confirmation_request(plan.reply)):
+            plan.reply = plan.reply.rstrip() + "\n\n" + CONFIRM_PROFILE_HINT
+
         # 2) 流式回复
         notes: list[str] = []
+        pending_before = bool(public_state.get("pending"))
         try:
             for piece in chunk_text(plan.reply):
                 yield "token", {"text": piece}
@@ -184,6 +194,16 @@ class AppService:
                         yield "token", {"text": piece}
                 if should_stop:
                     break
+            # 有待审批方案但没有处理时，明确提醒用户做决定
+            if (pending_before and not plan.has_action("apply_pending_change")
+                    and not plan.has_action("analyze_model")
+                    and self.store.get_state(session_id).get("pending")):
+                hint = CONFIRM_PENDING_HINT
+                if hint not in notes and hint not in plan.reply:
+                    yield "token", {"text": "\n\n"}
+                    for piece in chunk_text(hint):
+                        yield "token", {"text": piece}
+                    notes.append(hint)
         except (ServiceError, AgentError, ValidationError) as exc:
             self._remember_assistant(session_id, plan.reply, notes)
             yield "error", {"message": str(exc), "retryable": False}
@@ -431,7 +451,8 @@ class AppService:
             ],
         }
         yield "ui", {"block": approval}
-        return [], "新方案已经跑完回测，要不要启用由你决定。", False
+        return [], ("【待确认】新的模型方案已完成回测。是否启用？"
+                    "请回复「同意启用」应用该方案，或回复「先不启用」。"), False
 
     def _propose_change(self, model: dict[str, Any], base_metrics: dict[str, Any],
                         factor_stats: dict[str, Any],

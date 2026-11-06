@@ -238,31 +238,35 @@ class FakeLLM:
 
         if self._wants_rollback(message) and state.get("versions"):
             actions = [{"name": "rollback_version", "args": {}}]
-            reply = "好，我帮你切回上一个版本，马上就好。"
+            reply = "收到。我将切换回上一版本，随后给出当前生效的模型信息。"
         elif pending and self._agree(message):
             actions = [{"name": "apply_pending_change", "args": {}}]
-            reply = "收到，我这就把新模型换上，然后把对比结果告诉你。"
+            reply = "收到。我将应用该改进方案并切换模型版本，随后给出对比结果。"
         elif self._wants_optimize(message) and profile.get("confirmed"):
             actions = [{"name": "analyze_model", "args": {}}]
-            reply = "好，我先看看现在的模型哪里不顺手，再动手改；整个过程会一步步展示给你。"
+            reply = ("我会先评估当前模型的表现与不足，再给出可验证的改进方案；"
+                     "分析与回测过程会逐步展示，未经你确认不会启用。")
         elif self._confirm(message) and complete and not profile.get("confirmed"):
             actions = [{"name": "confirm_profile", "args": {}},
                        {"name": "run_selection", "args": {}}]
-            reply = "好，就按你说的来。我这就用这个画像去选一批股票，稍等。"
+            reply = "已收到确认。我将按该画像执行选股，并给出回测指标与风险说明。"
         elif not complete:
             missing = [key for key in ("goal", "horizon", "drawdown_tolerance", "loss_reaction")
                        if not slots.get(key)]
-            labels = {"goal": "这笔钱主要想做什么", "horizon": "大概多久不用这笔钱",
-                      "drawdown_tolerance": "最多能接受亏多少", "loss_reaction": "真亏了会怎么做"}
-            question = labels.get(missing[0], "再多和我说说你的情况")
-            reply = f"我大概有数了。还想确认一件事：{question}？"
+            labels = {"goal": "这笔钱主要计划用于什么", "horizon": "这笔钱大概多久不需要动用",
+                      "drawdown_tolerance": "最多能接受多大的亏损",
+                      "loss_reaction": "如果出现亏损，你通常会怎么处理"}
+            question = labels.get(missing[0], "请再补充一些你的情况")
+            reply = f"为了给出合适的方案，我还需要确认一点：{question}？"
         elif not profile.get("confirmed"):
-            reply = "我先把你的情况记下来了。要不要就按这个来？说一句“可以”，我就开始帮你选股票。"
+            reply = ("根据你目前提供的信息，我已整理出投资画像。\n\n"
+                     "【请确认】如果画像符合你的情况，请回复「确认」，我将按该画像开始选股；"
+                     "如需补充或调整，请直接说明。")
         elif state.get("last_selection") and self._is_question(message):
             actions = [{"name": "explain_results", "args": {"question": message}}]
-            reply = "好，我结合这次选股的数据给你讲讲。"
+            reply = "我会基于本次选股的真实回测数据说明，并标注数据边界。"
         else:
-            reply = "我记下了。你可以让我帮你选股票、解释这次结果，或者直接说“帮我优化模型”。"
+            reply = ("已记录。你可以继续补充投资情况，或让我执行：选股、解释本次结果、优化模型。")
 
         plan: dict[str, Any] = {"reply": reply, "actions": actions, "profile_delta": delta}
         return plan
@@ -315,17 +319,20 @@ class FakeLLM:
         top = facts.get("top") or []
         codes = "、".join(str(item.get("code", "")) for item in top[:3]) or "本次组合"
         parts = [
-            f"这次组合主要拿了 {codes}，整体思路是找「价格不贵、公司能赚钱、走势相对稳」的股票。",
+            f"结论：本次组合主要持有 {codes}，筛选逻辑侧重估值合理、盈利质量与走势稳定。",
         ]
         if metrics:
             parts.append(
-                f"回测里平均每年收益约 {float(metrics.get('cagr', 0)) * 100:.0f}%，"
+                f"依据：历史回测年化收益约 {float(metrics.get('cagr', 0)) * 100:.0f}%，"
                 f"最大回撤约 {abs(float(metrics.get('mdd', 0))) * 100:.0f}%，"
-                f"夏普约 {float(metrics.get('sharpe', 0)):.2f}。"
+                f"夏普比率约 {float(metrics.get('sharpe', 0)):.2f}。"
             )
         if question:
-            parts.append("你问的这点很关键：这些数字都是历史模拟，短期完全可能不按这个走，所以别把回测当成未来保证。")
-        parts.append("以上只是基于历史数据的演示，不构成投资建议，也不承诺收益。")
+            parts.append("风险与局限：上述指标均为历史模拟结果，短期表现可能明显偏离；"
+                         "回测无法覆盖政策、流动性与市场结构变化。")
+        else:
+            parts.append("风险与局限：历史回测无法覆盖未来政策、流动性与市场结构变化。")
+        parts.append("以上基于历史回测数据，不代表未来收益，不构成投资建议。")
         return "".join(parts)
 
 

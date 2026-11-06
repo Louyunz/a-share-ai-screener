@@ -126,17 +126,17 @@ def profile_summary(slots: dict[str, str]) -> str:
     parts: list[str] = []
     risk = slots.get("risk_level")
     if risk:
-        parts.append(RISK_LEVEL_LABELS.get(risk, risk))
+        parts.append(f"风险偏好：{RISK_LEVEL_LABELS.get(risk, risk)}")
     if slots.get("goal"):
-        parts.append(f"目标是{slots['goal']}")
+        parts.append(f"投资目标：{slots['goal']}")
     if slots.get("horizon"):
-        parts.append(f"大概 {slots['horizon']} 内用不到这笔钱")
+        parts.append(f"投资期限：{slots['horizon']}")
     if slots.get("drawdown_tolerance"):
-        parts.append(f"最多能接受亏 {slots['drawdown_tolerance']}")
+        parts.append(f"亏损承受：最多 {slots['drawdown_tolerance']}")
     if slots.get("loss_reaction"):
-        parts.append(f"真亏了会{slots['loss_reaction']}")
+        parts.append(f"亏损反应：{slots['loss_reaction']}")
     if not parts:
-        return "还在了解你的投资情况。"
+        return "尚未收集到足够的画像信息。"
     return "；".join(parts) + "。"
 
 

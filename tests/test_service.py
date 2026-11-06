@@ -44,7 +44,7 @@ class ChatFlowTest(unittest.TestCase):
         events, text = self.chat("大概 5 年不用这笔钱，最多能接受亏 15%，真亏了会有点慌但先不卖")
         profile_block = next(block for block in _blocks(events) if block["type"] == "profile")
         self.assertTrue(profile_block["complete"])
-        self.assertIn("可以", text)
+        self.assertIn("【请确认】", text)
 
         # 3) 对话确认后 AI 自己完成确认 + 选股
         events, text = self.chat("可以，就按这个来")
@@ -71,6 +71,8 @@ class ChatFlowTest(unittest.TestCase):
         self.assertGreaterEqual(len(works[-1]["steps"]), 5)
         self.assertEqual(works[-1]["status"], "done")
         self.assertTrue(approvals)
+        self.assertIn("【待确认】", text)
+        self.assertIn("同意启用", text)
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
 
         # 6) 聊天内同意 → AI 应用并启用新模型
