@@ -668,6 +668,23 @@
     if (force || isNearBottom()) dom.scroll.scrollTop = dom.scroll.scrollHeight;
   }
 
+  var cardRevealTimer = null;
+
+  function scheduleCardReveal(node) {
+    // 新卡片先让用户看清楚，不立刻把页面拽到底部；稍后平滑聚焦。
+    node.__revealAfter = Date.now() + 1000;
+    if (cardRevealTimer) clearTimeout(cardRevealTimer);
+    cardRevealTimer = setTimeout(function () {
+      cardRevealTimer = null;
+      if (!node.isConnected || !state.following) return;
+      node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 1000);
+  }
+
+  function isCardHeld(node) {
+    return !!node && Date.now() < (node.__revealAfter || 0);
+  }
+
   function isNearBottom() {
     if (!dom.scroll) return true;
     return dom.scroll.scrollHeight - dom.scroll.scrollTop - dom.scroll.clientHeight < 160;
@@ -1414,6 +1431,7 @@
     var key = String(block.id);
     var node = state.cardNodes.get(key);
     if (node && !node.isConnected) node = null;
+    var isNew = !node;
     if (node && turn.node && node.closest('.msg') !== turn.node) {
       turn.cards.appendChild(node);
       turn.cardCount += 1;
@@ -1431,7 +1449,11 @@
     node.innerHTML = html;
     mountCardCharts(node, block);
     syncFromBlock(block);
-    if (state.following) scrollToBottom(true);
+    if (isNew) {
+      scheduleCardReveal(node);
+    } else if (state.following && !isCardHeld(node)) {
+      scrollToBottom(true);
+    }
   }
 
   function mountCardCharts(node, block) {

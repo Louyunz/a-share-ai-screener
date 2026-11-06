@@ -19,6 +19,8 @@
 ## 技术取舍
 - 轻量前后端分离：FastAPI 单进程同时托管静态页面与 API；聊天用 `fetch + ReadableStream` 解析 SSE（POST 不能使用 EventSource）。
 - **真流式回复**：LLM 客户端使用 OpenAI 兼容 `stream=true` 解析 SSE，content delta 实时转发为 `token` 事件；前端收到即渲染，不再等整段结束后再打字机播放。tool_calls 随流增量拼接，流结束后校验执行；画像更新走 `update_profile` 工具，content 不再包 JSON。
+- **代码改动先展示**：`approach=code` 时先逐行推送 `work.code_change.diff`，让客户先看清 AI 写/改了什么，再进入服务端网格寻优；tuning 卡不允许先于代码改动出现。
+- **卡片聚焦**：前端新卡首次插入后延迟约 1s 再平滑滚动到卡片；用户已向上滚动时不抢滚动；卡片内内容更新仍保持跟随。
 - 无构建链、无 CDN、纯 SVG 图表，保证比赛现场一键启动、弱网可演示。
 - SQLite 存会话/画像/模型版本/审计；`version` 表带 `session_id`，`session` 表带 `active_version_id`（SCHEMA_VERSION=5）。
 - 真实模型路径走 OpenAI 兼容接口；LLM 客户端自实现 `chat_tools` / `chat_tools_stream`（复用现有 urllib 传输，未引入额外 SDK），支持一次工具参数修复与“无工具调用时的语义复核”。

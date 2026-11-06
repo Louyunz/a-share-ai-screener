@@ -166,6 +166,16 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue(works and approvals)
         self.assertTrue((works[-1].get("code_change") or {}).get("diff"),
                         "点名自定义模型时应生成代码改动")
+        first_code = next(
+            index for index, (event, data) in enumerate(events)
+            if event == "ui"
+            and (data.get("block") or {}).get("type") == "work"
+            and ((data.get("block") or {}).get("code_change") or {}).get("diff"))
+        first_tuning = next(
+            index for index, (event, data) in enumerate(events)
+            if event == "ui" and (data.get("block") or {}).get("type") == "tuning")
+        self.assertLess(first_code, first_tuning,
+                        "代码改动卡必须先于网格寻优卡出现")
         self.assertEqual(works[-1]["status"], "done")
         self.assertTrue(_typed(events, "tuning"), "自定义引擎同样应由服务端寻优")
 

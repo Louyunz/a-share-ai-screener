@@ -606,6 +606,37 @@ class AppService:
             add_step("提出调参方案", self._plan_detail(plan), "done", "plan")
         yield "ui", publish(proposal=self._proposal_public(plan))
 
+        # 代码改动必须在网格寻优之前逐行展示，让客户先看清 AI 改了什么
+        pre_code_change: dict[str, Any] | None = None
+        if plan["approach"] == "code":
+            pre_code_change = self._change_preview(model, plan)
+            pre_lines = str(pre_code_change.get("diff") or "").split("\n")
+            add_step("写入 AI 重写的模型引擎",
+                     "AI 已完成代码改写，正在逐行写入…", "running", "code")
+            empty_change = dict(pre_code_change)
+            empty_change.update({"diff": "", "added": 0, "removed": 0})
+            yield "ui", publish(proposal=self._proposal_public(plan),
+                                extra={"code_change": empty_change})
+            for index, line in enumerate(pre_lines):
+                if not line and index == len(pre_lines) - 1:
+                    continue
+                partial = pre_lines[:index + 1]
+                partial_change = dict(pre_code_change)
+                partial_change["diff"] = "\n".join(partial)
+                partial_change["added"] = len([item for item in partial
+                                               if item.startswith("+") and not item.startswith("+++")])
+                partial_change["removed"] = len([item for item in partial
+                                                 if item.startswith("-") and not item.startswith("---")])
+                yield "ui", publish(proposal=self._proposal_public(plan),
+                                    extra={"code_change": partial_change})
+                time.sleep(0.03)
+            steps[-1] = dict(
+                steps[-1], status="done",
+                detail=(f"AI 重写的模型代码已写入：新增 {pre_code_change['added']} 行、"
+                        f"删除 {pre_code_change['removed']} 行；接下来在代码框架内做参数寻优。"))
+            yield "ui", publish(proposal=self._proposal_public(plan),
+                                extra={"code_change": pre_code_change})
+
         if switch_only:
             engine_kind = "weight"
             candidate_weights = normalize_weights(plan.get("weights") or base_weights)
@@ -782,45 +813,47 @@ class AppService:
         final_plan = dict(plan)
         final_plan["weights"] = candidate_weights
         model_name = self._candidate_model_name(final_plan)
-        change_preview = self._change_preview(model, final_plan)
+        change_preview = pre_code_change or self._change_preview(model, final_plan)
         diff_lines = str(change_preview.get("diff") or "").split("\n")
-        if final_plan["approach"] == "code":
-            step_title = "写入 AI 重写的模型引擎"
-            running_detail = "AI 已重写打分逻辑，代码逐行写入中…"
-        elif final_plan["approach"] == "model_type":
-            step_title = "写入模型配置" if switch_only else "切换基础模型并写入寻优权重"
-            running_detail = ("正在写入切换后的模型类型与预设权重…" if switch_only else
-                              "正在写入模型类型与寻优后的配置，改动逐行展示中…")
-        else:
-            step_title = "写入寻优后的因子权重"
-            running_detail = "正在写入网格寻优得到的因子权重，改动逐行展示中…"
-        add_step(step_title, running_detail, "running", "code")
-        partial_change = dict(change_preview)
-        partial_change["diff"] = ""
-        partial_change["added"] = 0
-        partial_change["removed"] = 0
-        yield "ui", publish(proposal=self._proposal_public(final_plan, model_name=model_name),
-                            extra={"code_change": partial_change})
-        for index, line in enumerate(diff_lines):
-            if not line and index == len(diff_lines) - 1:
-                continue
-            partial = diff_lines[:index + 1]
+        if pre_code_change is None:
+            if final_plan["approach"] == "code":
+                step_title = "写入 AI 重写的模型引擎"
+                running_detail = "AI 已重写打分逻辑，代码逐行写入中…"
+            elif final_plan["approach"] == "model_type":
+                step_title = "写入模型配置" if switch_only else "切换基础模型并写入寻优权重"
+                running_detail = ("正在写入切换后的模型类型与预设权重…" if switch_only else
+                                  "正在写入模型类型与寻优后的配置，改动逐行展示中…")
+            else:
+                step_title = "写入寻优后的因子权重"
+                running_detail = "正在写入网格寻优得到的因子权重，改动逐行展示中…"
+            add_step(step_title, running_detail, "running", "code")
             partial_change = dict(change_preview)
-            partial_change["diff"] = "\n".join(partial)
-            partial_change["added"] = len([item for item in partial
-                                           if item.startswith("+") and not item.startswith("+++")])
-            partial_change["removed"] = len([item for item in partial
-                                             if item.startswith("-") and not item.startswith("---")])
+            partial_change["diff"] = ""
+            partial_change["added"] = 0
+            partial_change["removed"] = 0
             yield "ui", publish(proposal=self._proposal_public(final_plan, model_name=model_name),
                                 extra={"code_change": partial_change})
-            time.sleep(0.03)
+            for index, line in enumerate(diff_lines):
+                if not line and index == len(diff_lines) - 1:
+                    continue
+                partial = diff_lines[:index + 1]
+                partial_change = dict(change_preview)
+                partial_change["diff"] = "\n".join(partial)
+                partial_change["added"] = len([item for item in partial
+                                               if item.startswith("+") and not item.startswith("+++")])
+                partial_change["removed"] = len([item for item in partial
+                                                 if item.startswith("-") and not item.startswith("---")])
+                yield "ui", publish(proposal=self._proposal_public(final_plan, model_name=model_name),
+                                    extra={"code_change": partial_change})
+                time.sleep(0.03)
 
         if final_plan["approach"] == "code":
-            steps[-1] = dict(steps[-1], status="done",
-                             detail=f"改写策略打分引擎：新增 {change_preview['added']} 行、"
-                                    f"删除 {change_preview['removed']} 行；"
-                                    f"通过安全检查（{checks or '导入、危险调用、返回格式'}）"
-                                    "及子进程冒烟测试，最优参数已写入。")
+            if pre_code_change is None:
+                steps[-1] = dict(steps[-1], status="done",
+                                 detail=f"改写策略打分引擎：新增 {change_preview['added']} 行、"
+                                        f"删除 {change_preview['removed']} 行；"
+                                        f"通过安全检查（{checks or '导入、危险调用、返回格式'}）"
+                                        "及子进程冒烟测试，最优参数已写入。")
         elif final_plan["approach"] == "model_type":
             info = registry.get_model(str(final_plan.get("model_type")))
             steps[-1] = dict(
