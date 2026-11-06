@@ -171,13 +171,15 @@ class AppService:
                 self.store.save_profile(session_id, slots, profile_summary(slots), confirmed)
                 yield "ui", {"block": self._profile_block(session_id)}
 
-        # 画像刚好在本轮补齐时，补上明确的确认要求
+        # 画像齐全等待确认时，用确定的专业总结覆盖自相矛盾的追问，保证确认要求唯一且明确
         updated_profile = self.store.get_profile(session_id)
         if (updated_profile and not updated_profile["confirmed"]
                 and profile_complete(updated_profile["slots"])
-                and not plan.has_action("confirm_profile")
-                and not has_confirmation_request(plan.reply)):
-            plan.reply = plan.reply.rstrip() + "\n\n" + CONFIRM_PROFILE_HINT
+                and not plan.has_action("confirm_profile")):
+            if not has_confirmation_request(plan.reply):
+                plan.reply = ("我已根据你提供的信息整理出投资画像："
+                              + profile_summary(updated_profile["slots"])
+                              + "\n\n" + CONFIRM_PROFILE_HINT)
 
         # 2) 流式回复
         notes: list[str] = []

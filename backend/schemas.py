@@ -132,7 +132,7 @@ def profile_summary(slots: dict[str, str]) -> str:
     if slots.get("horizon"):
         parts.append(f"投资期限：{slots['horizon']}")
     if slots.get("drawdown_tolerance"):
-        parts.append(f"亏损承受：最多 {slots['drawdown_tolerance']}")
+        parts.append(f"亏损承受：{slots['drawdown_tolerance']}")
     if slots.get("loss_reaction"):
         parts.append(f"亏损反应：{slots['loss_reaction']}")
     if not parts:
