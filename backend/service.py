@@ -14,9 +14,7 @@ from typing import Any, Iterator
 
 import pandas as pd
 
-from .agent import (Agent, AgentError, CONFIRM_PROFILE_HINT,
-                     asks_clarifying_question, chunk_text, has_confirmation_request, safe_question,
-                     strip_confirmation_tail, trim_duplicate_confirmation)
+from .agent import Agent, AgentError, chunk_text, safe_question
 from .chat.directives import EngineDirective, build_expectation, resolve_directive
 from .config import (
     A_SHARE_DIR,
@@ -200,32 +198,33 @@ class AppService:
         public_state = self._planner_state(session_id)
 
         try:
-            plan = self.agent.plan(public_state, history[:-1], content)
-        except Exception as exc:  # noqa: BLE001
+            for kind, payload in self.agent.stream_plan(public_state, history[:-1], content):
+                if kind == "token":
+                    yield "token", {"text": payload}
+                elif kind == "plan":
+                    plan = payload
+        except (ServiceError, AgentError, ValidationError) as exc:
             yield "error", {"message": str(exc), "retryable": True}
+            yield "done", {"message_id": uuid.uuid4().hex[:8]}
+            return
+        if plan is None:
+            yield "error", {"message": "AI 没有返回规划结果", "retryable": True}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
 
         # 同一待执行动作最多澄清一次：客户已回答后直接执行，避免无限追问
         pending_intent = public_state.get("pending_intent")
         if pending_intent and plan.deferred_intent:
-            plan.reply = ("已收到您的确认，现按该方向执行，分析与回测过程将逐步展示。")
             plan.actions = [{"name": str(pending_intent), "args": {}}]
             plan.deferred_intent = ""
 
-        # 动作前置校验：这里只校验“当前状态是否允许执行该动作”，不做任何语义判断。
-        # 不合法时把结构化错误回传 LLM，让它依据状态重新调用工具（最多一次）。
+        # 动作前置校验：只校验“当前状态是否允许执行该动作”，不做语义判断。
         state_errors = self._action_state_errors(session_id, plan)
         if state_errors:
-            try:
-                plan = self.agent.replan(public_state, history[:-1], content, state_errors)
-            except Exception as exc:  # noqa: BLE001
-                yield "error", {"message": f"AI 重新规划失败：{exc}", "retryable": True}
-                yield "done", {"message_id": uuid.uuid4().hex[:8]}
-                return
-            state_errors = self._action_state_errors(session_id, plan)
-            if state_errors:
-                raise ServiceError("AI 的动作与当前会话状态不一致：" + "；".join(state_errors))
+            yield "error", {"message": "AI 的动作与当前会话状态不一致："
+                                      + "；".join(state_errors), "retryable": False}
+            yield "done", {"message_id": uuid.uuid4().hex[:8]}
+            return
 
         # 澄清与执行分离：提问轮只记录待执行意图与客户原始诉求，等客户回答后再执行
         runtime_before = self.store.get_state(session_id)
@@ -241,7 +240,7 @@ class AppService:
 
         saved_blocks: dict[str, dict[str, Any]] = {}
 
-        # 1) 先更新画像，让客户马上看到
+        # 1) 更新画像（由 update_profile 工具携带），卡片在回复流之后补上
         profile = self._profile(session_id)
         slots = profile["slots"] if profile else {}
         confirmed = profile["confirmed"] if profile else False
@@ -254,22 +253,9 @@ class AppService:
                 saved_blocks[profile_block["id"]] = profile_block
                 yield "ui", {"block": profile_block}
 
-        # 画像齐全等待确认时，用确定的专业总结覆盖自相矛盾的追问，保证确认要求唯一且明确
-        updated_profile = self.store.get_profile(session_id)
-        if (updated_profile and not updated_profile["confirmed"]
-                and profile_complete(updated_profile["slots"])
-                and not plan.has_action("confirm_profile")):
-            if not has_confirmation_request(plan.reply):
-                plan.reply = ("我已根据你提供的信息整理出投资画像："
-                              + profile_summary(updated_profile["slots"])
-                              + "\n\n" + CONFIRM_PROFILE_HINT)
-
-        # 2) 流式回复（去掉模型自行重复的确认段落）
-        plan.reply = trim_duplicate_confirmation(plan.reply)
+        # 2) 执行工具调用，并把服务端动作结果作为备注追加
         notes: list[str] = []
         try:
-            for piece in chunk_text(plan.reply):
-                yield "token", {"text": piece}
             for action in plan.actions:
                 events, note, should_stop = yield from self._run_action(
                     session_id, action, request_text)
@@ -277,15 +263,10 @@ class AppService:
                     if isinstance(block, dict) and block.get("id"):
                         saved_blocks[str(block["id"])] = block
                 if note:
-                    if has_confirmation_request(note) and (
-                            has_confirmation_request(plan.reply)
-                            or asks_clarifying_question(plan.reply)):
-                        note = strip_confirmation_tail(note).strip()
-                    if note:
-                        notes.append(note)
-                        yield "token", {"text": "\n\n"}
-                        for piece in chunk_text(note):
-                            yield "token", {"text": piece}
+                    notes.append(note)
+                    yield "token", {"text": "\n\n"}
+                    for piece in chunk_text(note):
+                        yield "token", {"text": piece}
                 if should_stop:
                     break
         except (ServiceError, AgentError, ValidationError) as exc:

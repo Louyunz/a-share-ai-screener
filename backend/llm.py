@@ -45,6 +45,13 @@ class LLMClient(Protocol):
                    tools: list[dict[str, Any]],
                    tool_choice: str = "auto") -> ToolChatResult: ...
 
+    def chat_tools_stream(self, system: str, messages: list[dict[str, Any]],
+                          tools: list[dict[str, Any]],
+                          tool_choice: str = "auto") -> Iterator[tuple[str, Any]]: ...
+
+    def chat_text_stream(self, system: str,
+                         messages: list[dict[str, str]]) -> Iterator[str]: ...
+
 
 def extract_json(text: str) -> dict[str, Any]:
     """从模型输出中提取第一个 JSON 对象（容忍 ```json 包裹）。"""
@@ -126,21 +133,51 @@ class OpenAICompatClient:
             raise LLMError("模型返回空文本")
         return text
 
-    def chat_tools(self, system: str, messages: list[dict[str, Any]],
-                   tools: list[dict[str, Any]],
-                   tool_choice: str = "auto") -> ToolChatResult:
-        """OpenAI 兼容的 function calling：模型主动调用工具并返回参数。"""
-        if not tools:
-            raise LLMError("chat_tools 至少需要一个工具定义")
+    def chat_text_stream(self, system: str,
+                         messages: list[dict[str, str]]) -> Iterator[str]:
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
-            "tools": tools,
-            "tool_choice": tool_choice,
-            "temperature": 0.2,
+            "temperature": 0.6,
+            "stream": True,
         }
-        message = self._post(payload)
-        content = str(message.get("content") or "").strip()
+        request = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.api_key}"},
+            method="POST",
+        )
+        produced = False
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    text = (choices[0].get("delta") or {}).get("content") or ""
+                    if text:
+                        produced = True
+                        yield text
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise LLMError(f"模型接口 HTTP {exc.code}：{detail}") from exc
+        except urllib.error.URLError as exc:
+            raise LLMError(f"模型接口连接失败：{exc.reason}") from exc
+        except (TimeoutError, json.JSONDecodeError) as exc:
+            raise LLMError(f"模型接口流式响应异常：{exc}") from exc
+        if not produced:
+            raise LLMError("模型返回空文本")
+
+    @staticmethod
+    def _tool_calls_from_message(message: dict[str, Any]) -> list[ToolCall]:
         calls: list[ToolCall] = []
         for index, item in enumerate(message.get("tool_calls") or []):
             if not isinstance(item, dict):
@@ -170,9 +207,105 @@ class OpenAICompatClient:
                 arguments=arguments,
                 raw_arguments=raw_text,
             ))
+        return calls
+
+    def chat_tools(self, system: str, messages: list[dict[str, Any]],
+                   tools: list[dict[str, Any]],
+                   tool_choice: str = "auto") -> ToolChatResult:
+        """OpenAI 兼容的 function calling：模型主动调用工具并返回参数。"""
+        if not tools:
+            raise LLMError("chat_tools 至少需要一个工具定义")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "temperature": 0.2,
+        }
+        message = self._post(payload)
+        content = str(message.get("content") or "").strip()
+        calls = self._tool_calls_from_message(message)
         if not content and not calls:
             raise LLMError("模型既没有返回文本，也没有调用工具")
         return ToolChatResult(content=content, tool_calls=calls, message=message)
+
+    def chat_tools_stream(self, system: str, messages: list[dict[str, Any]],
+                          tools: list[dict[str, Any]],
+                          tool_choice: str = "auto") -> Iterator[tuple[str, Any]]:
+        """流式 function calling：逐个产出 ("content", 增量) / ("result", ToolChatResult)。"""
+        if not tools:
+            raise LLMError("chat_tools_stream 至少需要一个工具定义")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "temperature": 0.2,
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.api_key}"},
+            method="POST",
+        )
+        content_parts: list[str] = []
+        pending: dict[int, dict[str, str]] = {}
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    text = delta.get("content") or ""
+                    if text:
+                        content_parts.append(text)
+                        yield "content", text
+                    for item in delta.get("tool_calls") or []:
+                        index = int(item.get("index", len(pending)))
+                        entry = pending.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        if item.get("id"):
+                            entry["id"] = str(item["id"])
+                        function = item.get("function") or {}
+                        if function.get("name"):
+                            entry["name"] += str(function["name"])
+                        if function.get("arguments"):
+                            entry["arguments"] += str(function["arguments"])
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise LLMError(f"模型接口 HTTP {exc.code}：{detail}") from exc
+        except urllib.error.URLError as exc:
+            raise LLMError(f"模型接口连接失败：{exc.reason}") from exc
+        except (TimeoutError, json.JSONDecodeError) as exc:
+            raise LLMError(f"模型接口流式响应异常：{exc}") from exc
+
+        message: dict[str, Any] = {"role": "assistant",
+                                   "content": "".join(content_parts)}
+        if pending:
+            wire_calls = []
+            for index in sorted(pending):
+                entry = pending[index]
+                wire_calls.append({
+                    "id": entry["id"] or f"call_{index + 1}",
+                    "type": "function",
+                    "function": {"name": entry["name"],
+                                 "arguments": entry["arguments"] or "{}"},
+                })
+            message["tool_calls"] = wire_calls
+        calls = self._tool_calls_from_message(message)
+        content = message["content"].strip()
+        if not content and not calls:
+            raise LLMError("模型既没有返回文本，也没有调用工具")
+        yield "result", ToolChatResult(content=content, tool_calls=calls, message=message)
 
 
 def build_llm() -> LLMClient:

@@ -44,15 +44,13 @@ class ScriptedLLM:
             return self._explain(payload["facts"], payload.get("question", ""))
         return str(payload.get("text", "我在，有什么可以帮你？"))
 
-    def chat_tools(self, system: str, messages: list[dict[str, Any]],
-                   tools: list[dict[str, Any]],
-                   tool_choice: str = "auto") -> ToolChatResult:
-        """确定性测试替身：把 ``_plan`` 的规则结果包装成原生 tool_calls。
+    def chat_text_stream(self, system, messages):
+        text = self.chat_text(system, messages)
+        for start in range(0, len(text), 6):
+            yield text[start:start + 6]
 
-        注意：这里的意图映射规则只服务于无 Key 的自动化测试/结构演示；
-        真实语义判断由真实 LLM 的 tool_calls 参数完成（见 action_schema）。
-        """
-        payload = {}
+    def _plan_for_messages(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
         for message in reversed(messages):
             if str(message.get("role")) != "user":
                 continue
@@ -62,26 +60,58 @@ class ScriptedLLM:
                 if parsed:
                     payload = parsed
                     break
-        plan = self._plan(payload)
-        reply = str(plan.get("reply") or "")
-        delta = plan.get("profile_delta") if isinstance(plan.get("profile_delta"), dict) else {}
-        content = json.dumps({"reply": reply, "profile_delta": delta}, ensure_ascii=False)
+        return self._plan(payload)
+
+    @staticmethod
+    def _calls_from_plan(plan: dict[str, Any]) -> list[ToolCall]:
         calls: list[ToolCall] = []
-        wire_calls: list[dict[str, Any]] = []
+        delta = plan.get("profile_delta") if isinstance(plan.get("profile_delta"), dict) else {}
+        if delta:
+            calls.append(ToolCall(id="call_update_profile", name="update_profile",
+                                  arguments={"slots": delta},
+                                  raw_arguments=json.dumps({"slots": delta}, ensure_ascii=False)))
         for index, action in enumerate(plan.get("actions") or []):
             if not isinstance(action, dict):
                 continue
             name = str(action.get("name") or "").strip()
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            call_id = f"call_{index + 1}"
-            raw = json.dumps(args, ensure_ascii=False)
-            calls.append(ToolCall(id=call_id, name=name, arguments=args, raw_arguments=raw))
-            wire_calls.append({"id": call_id, "type": "function",
-                               "function": {"name": name, "arguments": raw}})
-        message = {"role": "assistant", "content": content}
-        if wire_calls:
-            message["tool_calls"] = wire_calls
-        return ToolChatResult(content=content, tool_calls=calls, message=message)
+            calls.append(ToolCall(
+                id=f"call_{index + 1}", name=name, arguments=args,
+                raw_arguments=json.dumps(args, ensure_ascii=False)))
+        return calls
+
+    @staticmethod
+    def _wire_message(reply: str, calls: list[ToolCall]) -> dict[str, Any]:
+        message: dict[str, Any] = {"role": "assistant", "content": reply}
+        if calls:
+            message["tool_calls"] = [
+                {"id": call.id, "type": "function",
+                 "function": {"name": call.name,
+                              "arguments": call.raw_arguments or "{}"}}
+                for call in calls
+            ]
+        return message
+
+    def chat_tools(self, system: str, messages: list[dict[str, Any]],
+                   tools: list[dict[str, Any]],
+                   tool_choice: str = "auto") -> ToolChatResult:
+        """确定性测试替身：把 ``_plan`` 的规则结果包装成原生 tool_calls。"""
+        plan = self._plan_for_messages(messages)
+        reply = str(plan.get("reply") or "")
+        calls = self._calls_from_plan(plan)
+        return ToolChatResult(content=reply, tool_calls=calls,
+                              message=self._wire_message(reply, calls))
+
+    def chat_tools_stream(self, system: str, messages: list[dict[str, Any]],
+                          tools: list[dict[str, Any]],
+                          tool_choice: str = "auto"):
+        plan = self._plan_for_messages(messages)
+        reply = str(plan.get("reply") or "")
+        for start in range(0, len(reply), 6):
+            yield "content", reply[start:start + 6]
+        calls = self._calls_from_plan(plan)
+        yield "result", ToolChatResult(content=reply, tool_calls=calls,
+                                       message=self._wire_message(reply, calls))
 
     # ------------------------------------------------------------------
     # 工具

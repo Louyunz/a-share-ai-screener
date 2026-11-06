@@ -70,6 +70,12 @@ class ActionSchemaTest(unittest.TestCase):
         args = validate_tool_call("explain_results", {"question": "为什么回撤大"})
         self.assertEqual(args["question"], "为什么回撤大")
 
+    def test_update_profile_args(self) -> None:
+        args = validate_tool_call("update_profile", {"slots": {"horizon": "5 年"}})
+        self.assertEqual(args, {"slots": {"horizon": "5 年"}})
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("update_profile", {"slots": {"unknown": "x"}})
+
 
 class DirectivePolicyTest(unittest.TestCase):
     def test_explicit_engine(self) -> None:

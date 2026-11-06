@@ -45,10 +45,12 @@
 
 ## 3. 聊天 SSE 事件
 
-`event: token` → `{text}`：AI 自然语言增量。
+`event: token` → `{text}`：**LLM 流式生成的真实文本增量**（content 直接以 delta 形式转发，前端收到即渲染）。
 `event: ui` → `{block: {...}}`：插入或更新一个富卡片（按 `id` upsert）。
 `event: done` → `{message_id}`。
 `event: error` → `{message, retryable}`。
+
+Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 实时发给浏览器；tool_calls 在本轮流结束后由服务端校验执行。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
 
 ### 3.1 卡片（block）
 
@@ -123,22 +125,20 @@
 
 ## 4. AI 动作与权限（原生 function calling，服务端只执行）
 
-Planner 通过 OpenAI 兼容的 **tools / tool_calls** 表达动作；`content` 只输出客户可见 JSON：
+Planner 每轮输出：
+- `content`：直接给客户看的纯文本回复（模型流式生成，不加 JSON 包装）；
+- `tool_calls`：动作，由 Action Gateway 按 schema 校验后执行。
 
 ```json
-// content（模型文本）
-{"reply":"给用户看的自然语言（≤180字，干净中文）","profile_delta":{"horizon":"3-5 年"}}
-```
-
-```json
-// tool_calls（模型主动调用，由 Action Gateway 校验）
+// tool_calls（模型主动调用）
 [{"name":"analyze_model","args":{"engine":"code","model_type":"","objective":"","escalate":false,"reason":"客户要求更换数学模型"}}]
 ```
 
 工具 schema 的唯一来源：`backend/chat/action_schema.py`（Pydantic 模型同时用于运行时校验、发给模型的 JSON Schema、测试）。服务端不再解析自然语言判断意图。
 
-| tool | args（截图） | 何时允许 | 行为 |
+| tool | args | 何时允许 | 行为 |
 |---|---|---|---|
+| `update_profile` | `{slots:{key:value}}` | 客户本轮提供画像信息 | 合并画像槽位，返回/更新 profile 卡 |
 | `confirm_profile` | `{}` | 画像必填齐全且用户本轮明确确认 | 写入 confirmed，返回 profile 卡 |
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
@@ -273,7 +273,7 @@ def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 - 布局：**顶部工具栏 56px + 左侧导航 224px + 中间 AI 对话工作区（最小 560px）+ 右侧投资上下文 320px**；页面边距 24px、栏间距 16px。小于 1024px 时导航收为图标，移动端为抽屉；小于 1200px 时右侧上下文改为可开合抽屉。
 - 导航：左侧为 AI 投资顾问 / 投资组合 / 策略分析 / 历史记录 / 模型管理 / 系统设置；投资组合、策略分析、模型管理、设置使用当前会话状态渲染只读弹窗，不改后端接口。对话区头部提供历史、清空、新对话；输入区支持快捷操作、停止生成、重新生成、清空输入与文本附件。
 - 交互：对话是唯一的写操作入口；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。
-- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`token` 事件逐字追加（前端打字机渲染）；`ui` 事件按 id upsert 卡片（work 卡步骤、tuning 卡进度与得分走势实时更新）。**代码/权重/模型类型改动流式契约**：服务端先发一个 `work` 块（`status=running`、最后一步 `写入寻优后的因子权重/切换基础模型并写入寻优权重/写入 AI 重写的模型引擎` 为 running、`code_change.diff` 为空），随后按行重复发同一 id 的 `work` 块，`code_change.diff` 逐行增长，最后发 `status=done` 的完整块；前端按 id 覆盖渲染，因此代码框逐行出现。**寻优进度契约**：服务端先发 `tuning` 块（`status=running`、`progress.trial=0`），之后每完成一组回测就发同一 id、同一范围的 `tuning` 块（`progress`、`current`、`best`、`history` 更新），结束时发 `status=done/progress.percent=100` 的块。`error` 显示错误条+重试；停止生成通过 `AbortController` 取消请求。
+- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`token` 事件是 **LLM 流式增量**，前端收到即追加渲染（不再等待整段完成后再打字机播放）；`ui` 事件按 id upsert 卡片。**代码/权重/模型类型改动流式契约**：服务端先发一个 `work` 块（`status=running`、最后一步 `写入寻优后的因子权重/切换基础模型并写入寻优权重/写入 AI 重写的模型引擎` 为 running、`code_change.diff` 为空），随后按行重复发同一 id 的 `work` 块，`code_change.diff` 逐行增长，最后发 `status=done` 的完整块；前端按 id 覆盖渲染，因此代码框逐行出现。**寻优进度契约**：服务端先发 `tuning` 块（`status=running`、`progress.trial=0`），之后每完成一组回测就发同一 id、同一范围的 `tuning` 块（`progress`、`current`、`best`、`history` 更新），结束时发 `status=done/progress.percent=100` 的块。`error` 显示错误条+重试；停止生成通过 `AbortController` 取消请求。
 - 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧上下文（会话级 active_model/versions），从 `/messages` 恢复聊天文本与富卡片（`blocks`，含 tuning 卡）；历史对话通过 `GET /api/sessions` 归档列表切换，切换后右侧模型/版本随会话同步。新建对话必须回到默认「均衡多因子」模型。
 - 视觉：**Professional Financial SaaS / Light Mode**，参考 Linear + Bloomberg Terminal + Stripe Dashboard。Token：背景 `#F8FAFC`、卡片 `#FFFFFF`、品牌 Navy `#1E3A5F`、交互蓝 `#2563EB`、边框 `#E2E8F0`；卡片 1px 边框 / 10px 圆角 / 默认无阴影，按钮 6px 圆角，输入框 8px 圆角；正文 14px、辅助 12px、卡片标题 16px。**不使用动态渐变背景、玻璃拟态与大阴影**。
 - 模型切换：内置 5 种基础风格；客户点名其他模型时，服务端强制 `approach=code`，由 AI 用 numpy/pandas/sklearn/scipy 写参数化模型代码并通过静态检查+冒烟，再由服务端网格寻优；不再由 LLM 以“没有对应选项”拒绝。模型代码只允许基于当前截面做转导/无监督拟合或伪标签蒸馏。
@@ -284,7 +284,7 @@ def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 
 ## 8. 文件与分工
 
-- Lead：`backend/agent.py`、`backend/llm.py`（原生 function calling 客户端）、`backend/chat/action_schema.py`（工具契约）、`backend/chat/directives.py`（确定性策略）、`backend/service.py`（编排）、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`（会话 active_version_id 单一状态源）、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`backend/engine/tuning.py`（服务端网格寻优）、`tests/` 集成测试、`scripts/e2e_smoke.py`、`scripts/semantic_eval.py`、文档。
+- Lead：`backend/agent.py`（流式规划 + tool_calls）、`backend/llm.py`（chat_tools / chat_tools_stream）、`backend/chat/action_schema.py`（工具契约）、`backend/chat/directives.py`（确定性策略）、`backend/service.py`（编排）、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`（会话 active_version_id 单一状态源）、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`backend/engine/tuning.py`（服务端网格寻优）、`tests/` 集成测试、`scripts/e2e_smoke.py`、`scripts/semantic_eval.py`、文档。
 - **chat-ui-dev**：只写 `frontend/` 下 `index.html`、`app.js`、`style.css`、`charts.js`（含 tuning 卡与实时进度）。
 - **model-pipeline-dev**：只写 `backend/models/*.py`、`tests/test_models.py`。
 - 完成标准：`node --check` 通过；后端 `unittest discover` 通过；`scripts/e2e_smoke.py` 通过；真实 LLM 语义矩阵 `scripts/semantic_eval.py` ≥10/10；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘更换数学模型’→AI 写新引擎+寻优进度→审批→当前会话模型更新→新对话回到默认模型→回滚”全流程。

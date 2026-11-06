@@ -17,6 +17,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from ..models.registry import MODEL_TYPES
+from ..schemas import SLOT_KEYS
 
 __all__ = [
     "ACTION_NAMES",
@@ -27,6 +28,7 @@ __all__ = [
 ]
 
 ACTION_NAMES = (
+    "update_profile",
     "confirm_profile",
     "run_selection",
     "explain_results",
@@ -62,6 +64,24 @@ class ExplainResultsArgs(_StrictModel):
         return {"question": self.question.strip()[:500]}
 
 
+class UpdateProfileArgs(_StrictModel):
+    """客户本轮新提供的画像信息（工具调用，不再混在回复 JSON 里）。"""
+
+    slots: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("slots")
+    @classmethod
+    def _check_slots(cls, value: dict[str, str]) -> dict[str, str]:
+        cleaned: dict[str, str] = {}
+        for key, raw in value.items():
+            if key not in SLOT_KEYS:
+                raise ValueError(f"未知画像槽位 {key!r}")
+            text = str(raw).strip()
+            if text:
+                cleaned[key] = text[:200]
+        return cleaned
+
+
 class AnalyzeModelArgs(_StrictModel):
     """模型优化动作：AI 必须明确本轮用哪种引擎、什么目标、是否结构性升级。"""
 
@@ -92,6 +112,7 @@ class AnalyzeModelArgs(_StrictModel):
 
 
 _TOOL_MODELS: dict[str, type[BaseModel]] = {
+    "update_profile": UpdateProfileArgs,
     "confirm_profile": EmptyArgs,
     "run_selection": EmptyArgs,
     "explain_results": ExplainResultsArgs,
@@ -101,6 +122,7 @@ _TOOL_MODELS: dict[str, type[BaseModel]] = {
 }
 
 _TOOL_DESCRIPTIONS: dict[str, str] = {
+    "update_profile": "把客户本轮新提供的画像信息写入 slots（只放本轮新事实，没有就不调用）。",
     "confirm_profile": "客户本轮明确同意其投资画像时调用；画像必填项必须已齐全。",
     "run_selection": "画像已确认后，按当前会话模型执行 A 股筛选与回测；客户说开始/帮我选股时调用。",
     "explain_results": "最近已有选股结果、客户在追问原因/风险/怎么看时调用，回答只基于给定事实。",
@@ -162,4 +184,6 @@ def validate_tool_call(name: str, arguments: Any) -> dict[str, Any]:
         return model.clean()
     if isinstance(model, ExplainResultsArgs):
         return model.clean()
+    if isinstance(model, UpdateProfileArgs):
+        return {"slots": dict(model.slots)}
     return {}

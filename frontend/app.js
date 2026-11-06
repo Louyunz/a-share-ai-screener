@@ -585,8 +585,6 @@
       bubble: wrap.querySelector('.bubble'),
       cards: wrap.querySelector('.cards'),
       text: '',
-      rendered: 0,
-      typingTimer: null,
       cardCount: 0,
       failed: false
     };
@@ -605,45 +603,17 @@
     return bubble;
   }
 
-  function tickTurnText(turn) {
-    if (!turn || !turn.bubble || !turn.bubble.isConnected) {
-      if (turn) turn.typingTimer = null;
-      return;
-    }
-    var total = turn.text.length;
-    if (turn.rendered >= total) {
-      turn.typingTimer = null;
-      turn.bubble.classList.remove('is-typing');
-      return;
-    }
-    var remaining = total - turn.rendered;
-    var step = Math.max(1, Math.ceil(remaining / 50));
-    turn.rendered = Math.min(total, turn.rendered + step);
-    turn.bubble.textContent = turn.text.slice(0, turn.rendered);
-    if (state.following) scrollToBottom(true);
-    turn.typingTimer = setTimeout(function () { tickTurnText(turn); }, 22);
-  }
-
   function appendToken(turn, text) {
     if (!turn || !text) return;
     var bubble = ensureBubble(turn);
     turn.text += String(text);
-    if (!turn.rendered) turn.rendered = 0;
-    if (bubble) bubble.classList.add('is-typing');
-    bubble.textContent = turn.text.slice(0, turn.rendered);
-    if (!turn.typingTimer) tickTurnText(turn);
+    if (bubble) bubble.textContent = turn.text;
+    if (state.following) scrollToBottom(true);
   }
 
   function flushTurnText(turn) {
-    if (!turn) return;
-    if (turn.typingTimer) {
-      clearTimeout(turn.typingTimer);
-      turn.typingTimer = null;
-    }
-    turn.rendered = turn.text.length;
-    if (turn.bubble && turn.bubble.isConnected) {
+    if (turn && turn.bubble && turn.bubble.isConnected) {
       turn.bubble.textContent = turn.text;
-      turn.bubble.classList.remove('is-typing');
     }
   }
 
@@ -651,13 +621,8 @@
     if (!turn) return;
     turn.node.classList.remove('is-streaming');
     if (!turn.text) {
-      if (turn.typingTimer) {
-        clearTimeout(turn.typingTimer);
-        turn.typingTimer = null;
-      }
       if (turn.bubble && turn.bubble.isConnected) turn.bubble.remove();
     }
-    // 流结束后不强制补全文本，让打字机动画继续播放完，避免长回复瞬间整段出现
     if (state.activeTurn === turn) state.activeTurn = null;
   }
 
