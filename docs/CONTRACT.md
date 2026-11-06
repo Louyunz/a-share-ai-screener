@@ -117,6 +117,8 @@ Planner 每轮输出：
 
 低风险动作不允许在缺少用户确认时触发；高影响动作必须有本轮明确同意。所有动作由后端校验，不信任前端。
 
+**动作前置校验（防止状态不一致）**：若模型输出 `apply_pending_change` 但 runtime 中没有 pending 方案，服务端不执行该动作、不报错，而是自动改为 `analyze_model` 重新分析并生成候选；若回复声称有模型改进方案待确认但既没有 pending 也没有动作，同样自动进入分析。历史版本为空时 `rollback_version` 也会被拦截并给出说明。
+
 ## 5. 画像槽位（12 项，全部用生活化标签）
 
 `goal`(投资目标)、`horizon`(投资期限)、`capital`(大致投入)、`liquidity_need`(多久可能要用钱)、`loss_reaction`(亏钱时的真实反应)、`drawdown_tolerance`(最多能接受亏多少)、`income_stability`(收入稳定程度)、`experience`(投资经验)、`preferred_industries`(偏好行业)、`excluded_industries`(不碰行业)、`trade_frequency`(希望多久调整一次)、`concerns`(最担心什么)。

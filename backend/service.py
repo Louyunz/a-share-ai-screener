@@ -240,6 +240,34 @@ class AppService:
                               + profile_summary(updated_profile["slots"])
                               + "\n\n" + CONFIRM_PROFILE_HINT)
 
+        # 1.5) 动作前置校验：没有 pending 时不能让模型直接假设已审批，
+        #       自动转为重新分析，避免“回复说已启用、随后报错”的不一致。
+        runtime_pre = self.store.get_state(session_id)
+        action_names = plan.action_names()
+        fallback_analyze = False
+        if "apply_pending_change" in action_names and not runtime_pre.get("pending"):
+            plan.actions = [item for item in plan.actions
+                            if str(item.get("name")) != "apply_pending_change"]
+            if not any(str(item.get("name")) == "analyze_model" for item in plan.actions):
+                plan.actions.append({"name": "analyze_model", "args": {}})
+            plan.reply = ("当前没有等待您确认的模型改进方案。我会按最新模型重新分析，"
+                          "生成候选方案并完成回测，结果仍需要您确认后才会启用。")
+            fallback_analyze = True
+        if "rollback_version" in action_names and self.store.parent_version() is None:
+            plan.actions = [item for item in plan.actions
+                            if str(item.get("name")) != "rollback_version"]
+            if not plan.actions:
+                plan.reply = ("当前没有可以回滚的历史模型版本。您可以先让我分析当前模型，"
+                              "生成新的改进方案。")
+        if (not plan.actions and not runtime_pre.get("pending")
+                and "模型改进方案" in plan.reply and "同意启用" in plan.reply):
+            plan.actions = [{"name": "analyze_model", "args": {}}]
+            plan.reply = ("我先对当前模型做一次完整分析与回测，生成候选方案；"
+                          "方案不会自动启用，仍需您确认。")
+            fallback_analyze = True
+        if fallback_analyze:
+            request_text = "根据当前对话重新分析模型并生成候选方案"
+
         # 2) 流式回复（去掉模型自行重复的确认段落）
         plan.reply = trim_duplicate_confirmation(plan.reply)
         notes: list[str] = []

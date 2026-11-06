@@ -7,6 +7,7 @@ import unittest
 from backend.data.base import save_bundle
 from backend.data.sample import generate_bundle
 from backend.llm import FakeLLM
+from backend.schemas import Plan
 from backend.service import AppService
 from tests import cleanup, workdir
 
@@ -110,6 +111,22 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue(works and approvals)
         self.assertTrue((works[-1].get("code_change") or {}).get("diff"), "点名自定义模型时应生成代码改动")
         self.assertEqual(works[-1]["status"], "done")
+
+        # 9) 没有 pending 时模型仍要求“同意启用”：不能报错，应自动重新分析并生成候选
+        self.service._save_runtime(self.sid, pending=None)
+        original_plan = self.service.agent.plan
+        try:
+            self.service.agent.plan = lambda state, history, message: Plan(
+                reply="已按您的确认启用模型改进方案：提高盈利质量。",
+                actions=[{"name": "apply_pending_change", "args": {}}],
+            )
+            events, text = self.chat("同意")
+        finally:
+            self.service.agent.plan = original_plan
+        self.assertFalse([data for event, data in events if event == "error"])
+        self.assertTrue([block for block in _blocks(events) if block["type"] == "work"])
+        self.assertIn("没有等待您确认", text)
+        self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
 
     def test_state_endpoint_payload(self) -> None:
         state = self.service.get_state(self.sid)
