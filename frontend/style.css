@@ -1431,6 +1431,23 @@ a {
   background: rgba(34, 211, 238, 0.07);
 }
 
+.code-head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.code-kind {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 4px;
+  color: #A9F2FC;
+  font-size: 10px;
+  background: rgba(34, 211, 238, 0.10);
+}
+
 .code-file {
   overflow: hidden;
   color: #A9F2FC;

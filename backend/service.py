@@ -419,32 +419,36 @@ class AppService:
         candidate_weights = proposal.get("weights") or weights
         transform = None
         checks = ""
-        code_change = None
+        change_preview = self._change_preview(model, proposal)
         if proposal["approach"] == "code":
             from .models import custom
             validation = custom.validate_code(proposal["code"])
             checks = "、".join(str(item.get("name")) for item in validation.get("checks", []))
-            code_change = self._code_change(model, proposal["code"])
             add_step("修改模型代码",
-                     f"改写策略打分逻辑：新增 {code_change['added']} 行、"
-                     f"删除 {code_change['removed']} 行，具体改动见下方代码框。", "done", "code")
+                     f"改写策略打分逻辑：新增 {change_preview['added']} 行、"
+                     f"删除 {change_preview['removed']} 行，具体改动见下方代码框。", "done", "code")
             yield "ui", publish(proposal=self._proposal_public(proposal),
-                                extra={"code_change": code_change})
+                                extra={"code_change": change_preview})
             add_step("执行代码安全检查", f"通过静态检查（{checks or '导入、危险调用、返回格式'}）"
                                     "及子进程冒烟测试。", "done", "check")
             transform = custom.compile_code(proposal["code"])
             yield "ui", publish(proposal=self._proposal_public(proposal),
-                                extra={"code_change": code_change})
+                                extra={"code_change": change_preview})
         elif proposal["approach"] == "model_type":
             info = registry.get_model(str(proposal.get("model_type")))
             candidate_weights = info["weights"]
-            add_step("修改模型代码",
-                     f"切换模型类型为「{info.get('name')}」：{info.get('description')}",
-                     "done", "code")
-            yield "ui", publish(proposal=self._proposal_public(proposal, model_name=info.get("name")))
+            add_step("切换模型类型",
+                     f"切换模型类型为「{info.get('name')}」：{info.get('description')}；"
+                     "具体配置改动见下方改动框。", "done", "code")
+            yield "ui", publish(proposal=self._proposal_public(proposal, model_name=info.get("name")),
+                                extra={"code_change": change_preview})
         else:
-            add_step("修改模型代码", "不写新代码，直接调整 10 个因子的权重分配。", "done", "code")
-            yield "ui", publish(proposal=self._proposal_public(proposal))
+            changed = len([line for line in change_preview["diff"].splitlines()
+                           if line.startswith("+") and not line.startswith("+++")])
+            add_step("调整因子权重",
+                     f"调整 {changed} 个因子权重，具体改动见下方改动框。", "done", "code")
+            yield "ui", publish(proposal=self._proposal_public(proposal),
+                                extra={"code_change": change_preview})
 
         start, end = self._backtest_window()
         candidate_bt = selection.run_backtest(
@@ -475,8 +479,7 @@ class AppService:
         }
         self._save_runtime(session_id, pending=pending)
         final_extra = {"nav": _downsample(candidate_bt["nav"])}
-        if code_change:
-            final_extra["code_change"] = code_change
+        final_extra["code_change"] = change_preview
         final_work = publish(status="done",
                              proposal=self._proposal_public(proposal),
                              comparison=comparison,
@@ -536,25 +539,67 @@ class AppService:
             raw["weights"] = weights
         return pipeline.normalize_proposal(raw, base_weights=weights)
 
+    @classmethod
+    def _change_preview(cls, current_model: dict[str, Any],
+                        proposal: dict[str, Any]) -> dict[str, Any]:
+        """生成模型改动预览：代码方案展示源码 diff，权重/模型类型展示配置 diff。"""
+        approach = proposal.get("approach")
+        if approach == "code":
+            return cls._code_change(current_model, proposal["code"])
+        from .engine.factors import FACTOR_NAMES
+        from .models import registry
+
+        if approach == "model_type":
+            info = registry.get_model(str(proposal.get("model_type")))
+            file_name = "models/strategy.py · 模型类型"
+            diff_lines = [
+                "--- " + file_name + "（当前）",
+                "+++ " + file_name + "（候选）",
+                "- model_type: " + str((current_model or {}).get("model_id") or "multi_factor"),
+                "+ model_type: " + str(info.get("id")),
+                "- name: " + str((current_model or {}).get("name") or "均衡多因子"),
+                "+ name: " + str(info.get("name")),
+            ]
+            return {"file": file_name, "language": "text", "kind": "model_type",
+                    "diff": "\n".join(diff_lines), "added": 2, "removed": 2}
+
+        current = (current_model or {}).get("weights") or {}
+        candidate = proposal.get("weights") or {}
+        file_name = "models/strategy.py · 因子权重"
+        diff_lines = ["--- " + file_name + "（当前）", "+++ " + file_name + "（候选）"]
+        added = removed = 0
+        for name in FACTOR_NAMES:
+            old_value = round(float(current.get(name, 0.0)), 4)
+            new_value = round(float(candidate.get(name, 0.0)), 4)
+            if abs(old_value - new_value) < 0.0005:
+                continue
+            diff_lines.append(f"- {name}: {old_value:.4f}")
+            diff_lines.append(f"+ {name}: {new_value:.4f}")
+            added += 1
+            removed += 1
+        if not added:
+            diff_lines.append("  （权重无显著变化）")
+        return {"file": file_name, "language": "text", "kind": "weights",
+                "diff": "\n".join(diff_lines), "added": added, "removed": removed}
+
     @staticmethod
     def _code_change(current_model: dict[str, Any], code: str) -> dict[str, Any]:
-        """生成代码改动 diff，供前端代码框展示。"""
+        """生成代码方案的行级 diff。"""
         current_code = str((current_model or {}).get("code") or "")
         new_lines = str(code or "").splitlines()
+        file_name = "models/strategy.py"
         if current_code.strip():
-            file_name = "models/strategy.py"
             diff_lines = list(difflib.unified_diff(
                 current_code.splitlines(), new_lines,
                 fromfile=file_name + "（当前）", tofile=file_name + "（候选）", lineterm=""))
         else:
-            file_name = "models/strategy.py"
             diff_lines = ["--- /dev/null", "+++ " + file_name + "（AI 新增）"]
             diff_lines += ["+" + line for line in new_lines]
         added = sum(1 for line in diff_lines
                     if line.startswith("+") and not line.startswith("+++"))
         removed = sum(1 for line in diff_lines
                       if line.startswith("-") and not line.startswith("---"))
-        return {"file": file_name, "language": "python",
+        return {"file": file_name, "language": "python", "kind": "code",
                 "diff": "\n".join(diff_lines), "added": added, "removed": removed}
 
     @staticmethod

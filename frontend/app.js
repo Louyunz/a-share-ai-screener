@@ -908,10 +908,13 @@
     }).join('');
     var added = Number(change.added) || 0;
     var removed = Number(change.removed) || 0;
+    var kind = change.kind === 'code' ? '代码改动'
+      : change.kind === 'model_type' ? '模型类型改动' : '因子权重改动';
     return '<div class="code-change">'
-      + '<div class="code-head"><span class="code-file">' + esc(change.file || 'models/strategy.py') + '</span>'
+      + '<div class="code-head"><span class="code-head-left"><span class="code-kind">' + esc(kind) + '</span>'
+      + '<span class="code-file">' + esc(change.file || 'models/strategy.py') + '</span></span>'
       + '<span class="code-stats">+' + added + ' / -' + removed + '</span></div>'
-      + '<pre class="code-box" aria-label="AI 正在修改的代码">' + rows + '</pre></div>';
+      + '<pre class="code-box" aria-label="AI 正在修改的模型内容">' + rows + '</pre></div>';
   }
 
   function proposalHtml(proposal, showCodeDiff) {
