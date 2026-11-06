@@ -30,6 +30,16 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([item["role"] for item in messages], ["user", "assistant"])
         self.assertEqual(messages[-1]["content"], "在的")
 
+    def test_message_blocks_persisted(self) -> None:
+        sid = self.store.create_session()
+        blocks = [{"id": "work-1", "type": "work", "status": "done",
+                   "code_change": {"file": "models/strategy.py", "diff": "+x", "added": 1,
+                                   "removed": 0}}]
+        self.store.add_message(sid, "assistant", "已生成代码方案", blocks)
+        messages = self.store.get_messages(sid)
+        self.assertTrue(messages[0]["blocks"])
+        self.assertEqual(messages[0]["blocks"][0]["code_change"]["diff"], "+x")
+
     def test_profile_upsert(self) -> None:
         sid = self.store.create_session()
         self.store.save_profile(sid, {"goal": "养老"}, "想养老", False)

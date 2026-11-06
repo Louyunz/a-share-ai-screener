@@ -488,13 +488,33 @@
     return wrap;
   }
 
+  function renderHistoryBlocks(wrap, blocks) {
+    if (!wrap || !Array.isArray(blocks) || !blocks.length) return;
+    var main = wrap.querySelector('.msg-main');
+    if (!main) return;
+    var cards = document.createElement('div');
+    cards.className = 'cards history-cards';
+    blocks.forEach(function (block) {
+      if (!block || !block.id || !block.type) return;
+      if (block.type === 'profile') return;  // 当前画像由右侧工作台常驻展示
+      var slot = document.createElement('div');
+      slot.className = 'card-slot';
+      slot.setAttribute('data-card-id', 'history-' + block.id);
+      slot.innerHTML = renderCard(block);
+      cards.appendChild(slot);
+      mountCardCharts(slot, block);
+    });
+    if (cards.children.length) main.appendChild(cards);
+  }
+
   function renderHistory(messages) {
     messages.forEach(function (message) {
       if (!message) return;
       var role = message.role === 'user' ? 'user' : 'assistant';
       var content = message.content === null || message.content === undefined ? '' : String(message.content);
-      if (!content.trim()) return;
-      appendTextMessage(role, content, message.created_at);
+      if (!content.trim() && !(message.blocks && message.blocks.length)) return;
+      var wrap = appendTextMessage(role, content, message.created_at);
+      if (role === 'assistant') renderHistoryBlocks(wrap, message.blocks);
       if (role === 'user') state.lastUserMessage = content;
     });
   }

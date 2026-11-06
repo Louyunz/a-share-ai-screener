@@ -160,6 +160,13 @@ class AppService:
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
 
+        # 同一待执行动作最多澄清一次：客户已回答后直接执行，避免无限追问
+        pending_intent = public_state.get("pending_intent")
+        if pending_intent and plan.deferred_intent:
+            plan.reply = ("已收到您的确认，现按该方向执行，分析与回测过程将逐步展示。")
+            plan.actions = [{"name": str(pending_intent), "args": {}}]
+            plan.deferred_intent = ""
+
         # 澄清与执行分离：提问轮只记录待执行意图与客户原始诉求，等客户回答后再执行
         runtime_before = self.store.get_state(session_id)
         deferred_request = str(runtime_before.get("deferred_request") or "")
@@ -172,6 +179,8 @@ class AppService:
                 request_text = deferred_request + "；" + content
             self._save_runtime(session_id, pending_intent=None, deferred_request=None)
 
+        saved_blocks: dict[str, dict[str, Any]] = {}
+
         # 1) 先更新画像，让客户马上看到
         profile = self._profile(session_id)
         slots = profile["slots"] if profile else {}
@@ -181,7 +190,9 @@ class AppService:
             if merged != slots:
                 slots = merged
                 self.store.save_profile(session_id, slots, profile_summary(slots), confirmed)
-                yield "ui", {"block": self._profile_block(session_id)}
+                profile_block = self._profile_block(session_id)
+                saved_blocks[profile_block["id"]] = profile_block
+                yield "ui", {"block": profile_block}
 
         # 画像齐全等待确认时，用确定的专业总结覆盖自相矛盾的追问，保证确认要求唯一且明确
         updated_profile = self.store.get_profile(session_id)
@@ -202,6 +213,9 @@ class AppService:
             for action in plan.actions:
                 events, note, should_stop = yield from self._run_action(
                     session_id, action, request_text)
+                for block in events or []:
+                    if isinstance(block, dict) and block.get("id"):
+                        saved_blocks[str(block["id"])] = block
                 if note:
                     notes.append(note)
                     yield "token", {"text": "\n\n"}
@@ -220,17 +234,17 @@ class AppService:
                         yield "token", {"text": piece}
                     notes.append(hint)
         except (ServiceError, AgentError, ValidationError) as exc:
-            self._remember_assistant(session_id, plan.reply, notes)
+            self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
             yield "error", {"message": str(exc), "retryable": False}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
         except Exception as exc:  # noqa: BLE001
-            self._remember_assistant(session_id, plan.reply, notes)
+            self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
             yield "error", {"message": f"处理这句时出了点问题：{exc}", "retryable": True}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
 
-        self._remember_assistant(session_id, plan.reply, notes)
+        self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
         yield "done", {"message_id": uuid.uuid4().hex[:8]}
 
     def _run_action(self, session_id: str, action: dict[str, Any], request_text: str = ""):
@@ -261,8 +275,9 @@ class AppService:
                                                      "loss_reaction") if not slots.get(key)]
             raise ConflictError("画像还差一点信息：" + "、".join(missing))
         self.store.save_profile(session_id, slots, profile_summary(slots), True)
-        yield "ui", {"block": self._profile_block(session_id)}
-        return [], "画像已经确认。", False
+        block = self._profile_block(session_id)
+        yield "ui", {"block": block}
+        return [block], "画像已经确认。", False
 
     # ------------------------------------------------------------------
     # 动作：选股
@@ -327,7 +342,7 @@ class AppService:
         }
         self._save_runtime(session_id, last_selection=block)
         yield "ui", {"block": block}
-        return [], "已经选好 10 只股票，理由和回测结果都在上面的卡片里。", False
+        return [block], "已经选好 10 只股票，理由和回测结果都在上面的卡片里。", False
 
     # ------------------------------------------------------------------
     # 动作：解释追问
@@ -462,10 +477,11 @@ class AppService:
         final_extra = {"nav": _downsample(candidate_bt["nav"])}
         if code_change:
             final_extra["code_change"] = code_change
-        yield "ui", publish(status="done",
-                            proposal=self._proposal_public(proposal),
-                            comparison=comparison,
-                            extra=final_extra)
+        final_work = publish(status="done",
+                             proposal=self._proposal_public(proposal),
+                             comparison=comparison,
+                             extra=final_extra)
+        yield "ui", final_work
         approval = {
             "id": "approval-" + uuid.uuid4().hex[:8],
             "type": "approval",
@@ -480,7 +496,7 @@ class AppService:
             ],
         }
         yield "ui", {"block": approval}
-        return [], ("需要您确认：新的模型方案已完成回测。是否启用？"
+        return [final_work["block"], approval], ("需要您确认：新的模型方案已完成回测。是否启用？"
                     "请回复「同意启用」应用该方案，或回复「先不启用」保留现有模型。"), False
 
     def _propose_change(self, model: dict[str, Any], base_metrics: dict[str, Any],
@@ -579,9 +595,10 @@ class AppService:
         self.store.audit("ai_apply", from_version=previous["id"] if previous else None,
                          to_version=version_id, reason="user_approved_in_chat")
         self._save_runtime(session_id, pending=None)
-        yield "ui", {"block": self._version_block()}
+        version_block = self._version_block()
+        yield "ui", {"block": version_block}
         metrics = active.get("metrics") or {}
-        return [], (f"已启用「{self._model_name(active)}」；回测夏普 "
+        return [version_block], (f"已启用「{self._model_name(active)}」；回测夏普 "
                     f"{float(metrics.get('sharpe', 0)):.2f}，之后选股会用这个新模型。"), False
 
     def _rollback(self, session_id: str):
@@ -589,8 +606,9 @@ class AppService:
         if previous is None:
             raise ConflictError("找不到可以回滚的旧版本")
         self.store.rollback(previous["id"], reason="user_rollback")
-        yield "ui", {"block": self._version_block()}
-        return [], f"已切回「{self._model_name(previous)}」。", False
+        version_block = self._version_block()
+        yield "ui", {"block": version_block}
+        return [version_block], f"已切回「{self._model_name(previous)}」。", False
 
     # ------------------------------------------------------------------
     # 状态与模型
@@ -805,10 +823,11 @@ class AppService:
         clean_notes = [note for note in notes if note]
         return reply + ("\n\n" + "\n".join(clean_notes) if clean_notes else "")
 
-    def _remember_assistant(self, session_id: str, reply: str, notes: list[str]) -> None:
+    def _remember_assistant(self, session_id: str, reply: str, notes: list[str],
+                            blocks: list[dict[str, Any]] | None = None) -> None:
         text = self._assistant_text(reply, notes)
         if text.strip():
-            self.store.add_message(session_id, "assistant", text)
+            self.store.add_message(session_id, "assistant", text, blocks or [])
 
     def close(self) -> None:
         self.store.close()

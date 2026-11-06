@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _now() -> str:
@@ -41,10 +41,6 @@ class Store:
     # 初始化
     # ------------------------------------------------------------------
     def _migrate(self) -> None:
-        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        if version != SCHEMA_VERSION:
-            for table in ("message", "session_state", "version", "profile", "audit_log", "session"):
-                self._conn.execute(f"DROP TABLE IF EXISTS {table}")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS session (
@@ -56,6 +52,7 @@ class Store:
                 session_id TEXT NOT NULL REFERENCES session(id),
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                blocks_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, id);
@@ -91,6 +88,10 @@ class Store:
             );
             """
         )
+        columns = [row[1] for row in self._conn.execute("PRAGMA table_info(message)")]
+        if "blocks_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE message ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]'")
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -111,20 +112,28 @@ class Store:
                 "SELECT 1 FROM session WHERE id = ?", (session_id,)).fetchone()
         return row is not None
 
-    def add_message(self, session_id: str, role: str, content: str) -> None:
+    def add_message(self, session_id: str, role: str, content: str,
+                    blocks: list[dict[str, Any]] | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO message(session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (session_id, role, content, _now()))
+                "INSERT INTO message(session_id, role, content, blocks_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, role, content,
+                 json.dumps(blocks or [], ensure_ascii=False), _now()))
             self._conn.commit()
 
     def get_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT role, content, created_at FROM message "
+                "SELECT role, content, blocks_json, created_at FROM message "
                 "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                 (session_id, int(limit))).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        messages: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["blocks"] = json.loads(item.pop("blocks_json") or "[]")
+            messages.append(item)
+        return messages
 
     # ------------------------------------------------------------------
     # 画像

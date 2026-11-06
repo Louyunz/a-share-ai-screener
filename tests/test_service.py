@@ -77,6 +77,10 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("需要您确认", text)
         self.assertIn("同意启用", text)
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
+        history = self.service.messages(self.sid)["messages"]
+        persisted = [block for message in history for block in (message.get("blocks") or [])]
+        self.assertTrue(any(block.get("type") == "work" and block.get("code_change")
+                            for block in persisted), "AI 代码改动应随消息持久化，刷新后可恢复")
 
         # 6) 聊天内同意 → AI 应用并启用新模型
         events, text = self.chat("同意，启用这个改进")
