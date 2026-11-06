@@ -59,11 +59,22 @@ $env:LLM_MODEL = "deepseek-chat"
 |---|---|
 | ![对话建画像](docs/screenshots/01_ai_chat.png) | ![选股结果](docs/screenshots/02_selection.png) |
 
-| AI 优化过程（方案/代码/对比/审批） | 模型版本 |
+| AI 优化过程（方案/对比/审批） | 模型版本 |
 |---|---|
 | ![AI 优化过程](docs/screenshots/03_interpretation.png) | ![模型版本](docs/screenshots/04_tuning.png) |
 
+AI 修改策略代码时，聊天内实时展示带行号的代码框（逐行 diff，新增/删除高亮）：
+
+![AI 代码框](docs/screenshots/05_ai_code.png)
+
 截图来自真实浏览器联调（示例数据 + FakeLLM）；真实模型下文字与解读由所选模型生成。
+
+## AI 表达与确认规范
+
+- **金融机构服务口吻**：称呼“您”、结论先行、数据只引用真实回测结果、不做自我叙述（禁止“先问第一个问题/接下来我会”等 AI 套话），风险提示使用“历史业绩不代表未来表现，市场有风险，投资需谨慎”。提示词参考了公募基金销售与投资者适当性管理中的规范话术（见文末参考）。
+- **澄清与执行分离**：AI 需要客户补充信息时只提问、本轮不执行任何动作；客户回答后的下一轮才执行。服务端对“边问边改”做硬性拦截，并记录待执行意图（`pending_intent`）。
+- **确认话术唯一明确**：画像确认、模型方案审批均使用“需要您确认：……请回复「确认」/「同意启用」/「先不启用」”格式；服务端会兜底补全，避免模型漏说。
+- **代码改动可见**：AI 生成/修改策略代码时，聊天内展示 `models/strategy.py` 的行号 diff 代码框，并在审批卡中给出风险与回测对比。
 
 ## 代码结构
 
@@ -82,7 +93,7 @@ backend/
   models/            内置模型类型、AI 代码安全校验与编译、提案流水线
 frontend/
   index.html / app.js / style.css / charts.js
-tests/               87+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
+tests/               92+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
 scripts/             构建缓存、启动、重置、全量测试、E2E 冒烟
 docs/                接口契约、运行手册、设计摘要、界面截图
 ```
@@ -98,3 +109,11 @@ $node --check frontend/app.js; $node --check frontend/charts.js
 - 全量测试：引擎、模型安全校验（含拒绝危险代码/死循环超时）、Agent 计划、对话全流程、SQLite、HTTP/SSE
 - 浏览器 E2E：真实 Edge 驱动“说话 → AI 追问 → 确认 → 选股 → 优化 → 同意 → 版本更新”全流程
 - 风险提示：本项目为比赛演示原型，历史回测不代表未来收益，不构成投资建议。
+
+## 参考话术来源（提示词依据）
+
+- 公募基金销售适当性与风险揭示流程话术：[德邦基金公募产品开立交易操作指南](https://www.dbfund.com.cn/upload/pdf/1698046211058-debangjijinguanliyouxiangongsigongmuchanpinkaihujiaoyicaozuozhinan.pdf)
+- 理财产品销售告知与期限/风险披露话术：[杭银理财产品话术](http://jsbchina.cn/files/licai/FYG25031A.pdf)
+- 高净值客户 KYC 与沟通技巧：[《高净值客户深度 KYC 及沟通技巧》](https://m.jiangshi99.com/course/content/185767.html)
+- 证券投资顾问业务与适当性管理要求：[证券投资顾问业务暂行规定](https://www.10jqka.com.cn)
+- 财富管理路演支持话术参考：[FinClaw bank wealth-management skill](https://github.com/aifinlab/finclaw/blob/main/skills/bank-t191-wealth-management-roadshow-support-assistant/SKILL.md)

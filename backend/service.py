@@ -160,7 +160,19 @@ class AppService:
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
 
-        # 1) 先更新画像，让用户马上看到
+        # 澄清与执行分离：提问轮只记录待执行意图与客户原始诉求，等客户回答后再执行
+        runtime_before = self.store.get_state(session_id)
+        deferred_request = str(runtime_before.get("deferred_request") or "")
+        request_text = content
+        if plan.deferred_intent:
+            self._save_runtime(session_id, pending_intent=plan.deferred_intent,
+                               deferred_request=content)
+        elif plan.actions:
+            if deferred_request:
+                request_text = deferred_request + "；" + content
+            self._save_runtime(session_id, pending_intent=None, deferred_request=None)
+
+        # 1) 先更新画像，让客户马上看到
         profile = self._profile(session_id)
         slots = profile["slots"] if profile else {}
         confirmed = profile["confirmed"] if profile else False
@@ -188,7 +200,8 @@ class AppService:
             for piece in chunk_text(plan.reply):
                 yield "token", {"text": piece}
             for action in plan.actions:
-                events, note, should_stop = yield from self._run_action(session_id, action)
+                events, note, should_stop = yield from self._run_action(
+                    session_id, action, request_text)
                 if note:
                     notes.append(note)
                     yield "token", {"text": "\n\n"}
@@ -220,7 +233,7 @@ class AppService:
         self._remember_assistant(session_id, plan.reply, notes)
         yield "done", {"message_id": uuid.uuid4().hex[:8]}
 
-    def _run_action(self, session_id: str, action: dict[str, Any]):
+    def _run_action(self, session_id: str, action: dict[str, Any], request_text: str = ""):
         name = action.get("name")
         if name == "confirm_profile":
             return (yield from self._confirm_profile(session_id))
@@ -230,7 +243,7 @@ class AppService:
             question = str(action.get("args", {}).get("question", ""))
             return (yield from self._explain_results(session_id, question))
         if name == "analyze_model":
-            return (yield from self._analyze_model(session_id))
+            return (yield from self._analyze_model(session_id, request_text))
         if name == "apply_pending_change":
             return (yield from self._apply_pending(session_id))
         if name == "rollback_version":
@@ -335,7 +348,7 @@ class AppService:
     # ------------------------------------------------------------------
     # 动作：AI 分析和建模
     # ------------------------------------------------------------------
-    def _analyze_model(self, session_id: str):
+    def _analyze_model(self, session_id: str, request_text: str = ""):
         from .models import registry
 
         model = self._active_model()
@@ -376,26 +389,37 @@ class AppService:
 
         factor_stats = self._factor_stats(_scores, weights)
         recent_metrics = self._recent_metrics(model)
-        proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics)
+        force_code = self._wants_code_change(request_text)
+        proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
+                                            request_text, force_code)
         proposal = self._normalize_proposal(proposal_raw, weights)
+        if force_code and proposal["approach"] != "code":
+            # 客户明确要求改代码时，再明确约束一次
+            proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
+                                                request_text, True, strict=True)
+            proposal = self._normalize_proposal(proposal_raw, weights)
         add_step("提出改进方案", str(proposal.get("summary", "")), "done", "plan")
         yield "ui", publish(proposal=self._proposal_public(proposal))
 
         candidate_weights = proposal.get("weights") or weights
         transform = None
         checks = ""
+        code_change = None
         if proposal["approach"] == "code":
             from .models import custom
             validation = custom.validate_code(proposal["code"])
             checks = "、".join(str(item.get("name")) for item in validation.get("checks", []))
+            code_change = self._code_change(model, proposal["code"])
             add_step("修改模型代码",
-                     f"新增策略代码 {len(proposal['code'].splitlines())} 行，"
-                     "让它自己决定低波动和反转因子怎么加权。", "done", "code")
-            yield "ui", publish(proposal=self._proposal_public(proposal))
-            add_step("检查代码安不安全", f"静态检查通过：{checks or '导入、危险调用、返回格式'}；"
-                                    "并在小样本上跑通。", "done", "check")
+                     f"改写策略打分逻辑：新增 {code_change['added']} 行、"
+                     f"删除 {code_change['removed']} 行，具体改动见下方代码框。", "done", "code")
+            yield "ui", publish(proposal=self._proposal_public(proposal),
+                                extra={"code_change": code_change})
+            add_step("执行代码安全检查", f"通过静态检查（{checks or '导入、危险调用、返回格式'}）"
+                                    "及子进程冒烟测试。", "done", "check")
             transform = custom.compile_code(proposal["code"])
-            yield "ui", publish(proposal=self._proposal_public(proposal))
+            yield "ui", publish(proposal=self._proposal_public(proposal),
+                                extra={"code_change": code_change})
         elif proposal["approach"] == "model_type":
             info = registry.get_model(str(proposal.get("model_type")))
             candidate_weights = info["weights"]
@@ -435,10 +459,13 @@ class AppService:
             "created_at": pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
         self._save_runtime(session_id, pending=pending)
+        final_extra = {"nav": _downsample(candidate_bt["nav"])}
+        if code_change:
+            final_extra["code_change"] = code_change
         yield "ui", publish(status="done",
                             proposal=self._proposal_public(proposal),
                             comparison=comparison,
-                            extra={"nav": _downsample(candidate_bt["nav"])})
+                            extra=final_extra)
         approval = {
             "id": "approval-" + uuid.uuid4().hex[:8],
             "type": "approval",
@@ -453,12 +480,13 @@ class AppService:
             ],
         }
         yield "ui", {"block": approval}
-        return [], ("【待确认】新的模型方案已完成回测。是否启用？"
-                    "请回复「同意启用」应用该方案，或回复「先不启用」。"), False
+        return [], ("需要您确认：新的模型方案已完成回测。是否启用？"
+                    "请回复「同意启用」应用该方案，或回复「先不启用」保留现有模型。"), False
 
     def _propose_change(self, model: dict[str, Any], base_metrics: dict[str, Any],
-                        factor_stats: dict[str, Any],
-                        recent_metrics: dict[str, Any]) -> dict[str, Any]:
+                        factor_stats: dict[str, Any], recent_metrics: dict[str, Any],
+                        request_text: str = "", force_code: bool = False,
+                        strict: bool = False) -> dict[str, Any]:
         from .models import pipeline
         state = {
             "proposal_request": True,
@@ -469,8 +497,12 @@ class AppService:
             "current_metrics": _json_safe(base_metrics),
             "factor_stats": factor_stats,
             "recent_metrics": recent_metrics,
+            "user_request": request_text,
+            "force_approach": "code" if force_code else "",
             "market": {"as_of": self.data.as_of, "universe": len(self.data.universe)},
         }
+        if strict:
+            state["strict_requirement"] = "客户已明确要求修改策略代码，本次必须输出 approach=code 的代码方案。"
         try:
             raw = pipeline.build_candidate_proposal(self.llm, state)
         except Exception as exc:  # noqa: BLE001
@@ -487,6 +519,27 @@ class AppService:
             raw = dict(raw)
             raw["weights"] = weights
         return pipeline.normalize_proposal(raw, base_weights=weights)
+
+    @staticmethod
+    def _code_change(current_model: dict[str, Any], code: str) -> dict[str, Any]:
+        """生成代码改动 diff，供前端代码框展示。"""
+        current_code = str((current_model or {}).get("code") or "")
+        new_lines = str(code or "").splitlines()
+        if current_code.strip():
+            file_name = "models/strategy.py"
+            diff_lines = list(difflib.unified_diff(
+                current_code.splitlines(), new_lines,
+                fromfile=file_name + "（当前）", tofile=file_name + "（候选）", lineterm=""))
+        else:
+            file_name = "models/strategy.py"
+            diff_lines = ["--- /dev/null", "+++ " + file_name + "（AI 新增）"]
+            diff_lines += ["+" + line for line in new_lines]
+        added = sum(1 for line in diff_lines
+                    if line.startswith("+") and not line.startswith("+++"))
+        removed = sum(1 for line in diff_lines
+                      if line.startswith("-") and not line.startswith("---"))
+        return {"file": file_name, "language": "python",
+                "diff": "\n".join(diff_lines), "added": added, "removed": removed}
 
     @staticmethod
     def _proposal_public(proposal: dict[str, Any], model_name: str | None = None) -> dict[str, Any]:
@@ -592,6 +645,15 @@ class AppService:
             transform = custom.compile_code(str(model["code"]))
         return weights, transform
 
+    @staticmethod
+    def _wants_code_change(text: str) -> bool:
+        raw = str(text or "")
+        negative = ("不要改代码", "不用改代码", "别改代码", "不需要改代码")
+        if any(word in raw for word in negative):
+            return False
+        return any(word in raw for word in (
+            "修改代码", "改代码", "源代码", "build_transform", "自定义代码", "代码方案"))
+
     def _candidate_model(self, proposal: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
         from .models import registry
         if proposal["approach"] == "model_type":
@@ -680,6 +742,7 @@ class AppService:
                           "status": item["status"]} for item in self.store.list_versions()[-5:]],
             "pending": ({"summary": (pending.get("proposal") or {}).get("summary", "")}
                         if pending else None),
+            "pending_intent": runtime.get("pending_intent"),
             "last_selection": ({"as_of": last.get("as_of"),
                                 "top": [item.get("code") for item in (last.get("top") or [])[:5]],
                                 "metrics": last.get("metrics")} if last else None),

@@ -122,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
         approval = _blocks(events, "approval")[-1]
         assert work["status"] == "done" and len(work["steps"]) >= 5, work
         assert approval["actions"], approval
+        code_change = work.get("code_change") or {}
+        assert code_change.get("diff"), "AI 修改代码时应返回逐行 diff"
+        assert code_change.get("added", 0) > 0
         print(f"[e2e] AI 完成 {len(work['steps'])} 步建模，等待用户审批："
               f"{work['proposal']['summary']}")
 

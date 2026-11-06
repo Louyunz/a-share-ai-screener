@@ -875,18 +875,37 @@
       + '<p class="chart-note">灰色为当前模型，青色为候选模型；回撤越接近 0 越好，其余指标越大越好。</p></div>';
   }
 
-  function proposalHtml(proposal) {
+  function codeBoxHtml(change) {
+    if (!change || !change.diff) return '';
+    var lines = String(change.diff).split('\n');
+    var rows = lines.map(function (line, index) {
+      var cls = 'code-line';
+      if (line.indexOf('+++') === 0 || line.indexOf('---') === 0) cls += ' is-file';
+      else if (line.indexOf('@@') === 0) cls += ' is-hunk';
+      else if (line.charAt(0) === '+') cls += ' is-add';
+      else if (line.charAt(0) === '-') cls += ' is-del';
+      return '<div class="' + cls + '"><span class="code-ln">' + (index + 1) + '</span><span class="code-text">' + esc(line) + '</span></div>';
+    }).join('');
+    var added = Number(change.added) || 0;
+    var removed = Number(change.removed) || 0;
+    return '<div class="code-change">'
+      + '<div class="code-head"><span class="code-file">' + esc(change.file || 'models/strategy.py') + '</span>'
+      + '<span class="code-stats">+' + added + ' / -' + removed + '</span></div>'
+      + '<pre class="code-box" aria-label="AI 正在修改的代码">' + rows + '</pre></div>';
+  }
+
+  function proposalHtml(proposal, showCodeDiff) {
     if (!proposal || typeof proposal !== 'object') return '';
     var approachLabels = { model_type: '切换内置模型', weights: '调整因子权重', code: '修改模型代码' };
     var summary = proposal.summary ? '<p class="proposal-summary">' + esc(proposal.summary) + '</p>' : '';
     var tags = [];
     if (proposal.approach) tags.push('<span class="tag is-amber">' + esc(approachLabels[proposal.approach] || proposal.approach) + '</span>');
     if (proposal.model_name) tags.push('<span class="tag">模型 · ' + esc(proposal.model_name) + '</span>');
-    var diff = proposal.diff
+    var diff = (showCodeDiff !== false && proposal.diff)
       ? '<details class="diff"><summary>展开查看代码改动</summary><pre>' + esc(proposal.diff) + '</pre></details>'
       : '';
     var risks = Array.isArray(proposal.risks) && proposal.risks.length
-      ? '<div class="risk-list"><h5>需要注意</h5><ul>' + proposal.risks.map(function (risk) {
+      ? '<div class="risk-list"><h5>风险提示</h5><ul>' + proposal.risks.map(function (risk) {
         return '<li>' + esc(risk) + '</li>';
       }).join('') + '</ul></div>'
       : '';
@@ -915,7 +934,8 @@
       + '<div class="card-title"><span class="card-kicker">AI WORK LOG</span><h3>' + esc(block.title || 'AI 正在工作') + '</h3></div>'
       + statusPill + '</header>'
       + '<div class="card-body">' + progressHtml + stepsHtml
-      + comparisonHtml(block.comparison) + proposalHtml(block.proposal)
+      + codeBoxHtml(block.code_change)
+      + comparisonHtml(block.comparison) + proposalHtml(block.proposal, !block.code_change)
       + '</div></article>';
   }
 

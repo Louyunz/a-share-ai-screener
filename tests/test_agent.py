@@ -39,8 +39,31 @@ class AgentPlanTest(unittest.TestCase):
                  "loss_reaction": "会有点慌，但先不卖"}
         plan = self.agent.plan(_state(slots), [], "今天天气不错")
         self.assertEqual(plan.actions, [])
-        self.assertIn("【请确认】", plan.reply)
+        self.assertIn("需要您确认", plan.reply)
         self.assertIn("回复「确认」", plan.reply)
+
+    def test_question_defers_actions(self) -> None:
+        class QuestionLLM:
+            def chat_json(self, system, messages):
+                return {"reply": "在开始模型优化前，需要向您确认：您更希望改善回撤还是收益？",
+                        "actions": [{"name": "analyze_model"}], "profile_delta": {}}
+
+            def chat_text(self, system, messages):
+                return ""
+
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = Agent(QuestionLLM()).plan(_state(slots, confirmed=True), [], "帮我优化模型")
+        self.assertEqual(plan.actions, [])
+        self.assertEqual(plan.deferred_intent, "analyze_model")
+        self.assertIn("需要向您确认", plan.reply)
+
+    def test_pending_intent_executes_after_answer(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        state = _state(slots, confirmed=True, pending_intent="analyze_model")
+        plan = self.agent.plan(state, [], "回撤小一点更重要")
+        self.assertIn("analyze_model", plan.action_names())
 
     def test_pending_confirmation_hint_is_explicit(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
@@ -49,7 +72,7 @@ class AgentPlanTest(unittest.TestCase):
                                       pending={"summary": "换低波模型"}),
                                [], "今天市场怎么样")
         self.assertEqual(plan.actions, [])
-        self.assertIn("【待确认】", plan.reply)
+        self.assertIn("需要您确认", plan.reply)
         self.assertIn("同意启用", plan.reply)
 
     def test_optimize_requires_confirmed_profile(self) -> None:
@@ -93,6 +116,11 @@ class ComplianceTest(unittest.TestCase):
         with self.assertRaises(ComplianceError):
             ensure_compliance("这只股票稳赚，放心买")
         self.assertTrue(ensure_compliance("历史回测不代表未来"))
+
+    def test_strips_meta_phrases(self) -> None:
+        cleaned = ensure_compliance("先问第一个问题，您的投资期限是多久？")
+        self.assertNotIn("先问第一个问题", cleaned)
+        self.assertIn("投资期限", cleaned)
 
     def test_empty_reply(self) -> None:
         with self.assertRaises(AgentError):

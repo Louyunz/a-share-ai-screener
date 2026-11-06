@@ -176,6 +176,7 @@ class Plan:
     reply: str = ""
     actions: list[dict[str, Any]] = field(default_factory=list)
     profile_delta: dict[str, Any] = field(default_factory=dict)
+    deferred_intent: str = ""
 
     def action_names(self) -> list[str]:
         return [str(action.get("name", "")) for action in self.actions]

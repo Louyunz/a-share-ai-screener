@@ -234,11 +234,16 @@ class FakeLLM:
         slots.update(delta)
         complete = all(slots.get(key) for key in ("goal", "horizon", "drawdown_tolerance", "loss_reaction"))
         pending = state.get("pending")
+        pending_intent = state.get("pending_intent")
         actions: list[dict[str, Any]] = []
 
-        if self._wants_rollback(message) and state.get("versions"):
+        if pending_intent and not self._is_question(message):
+            actions = [{"name": str(pending_intent), "args": {}}]
+            reply = ("已记录您的补充信息。我将按此执行模型优化，分析与回测过程会逐步展示，"
+                     "方案不会自动启用，需经您确认。")
+        elif self._wants_rollback(message) and state.get("versions"):
             actions = [{"name": "rollback_version", "args": {}}]
-            reply = "收到。我将切换回上一版本，随后给出当前生效的模型信息。"
+            reply = "收到。我将为您切换回上一版本，随后提供当前生效的模型信息。"
         elif pending and self._agree(message):
             actions = [{"name": "apply_pending_change", "args": {}}]
             reply = "收到。我将应用该改进方案并切换模型版本，随后给出对比结果。"
@@ -257,16 +262,16 @@ class FakeLLM:
                       "drawdown_tolerance": "最多能接受多大的亏损",
                       "loss_reaction": "如果出现亏损，你通常会怎么处理"}
             question = labels.get(missing[0], "请再补充一些你的情况")
-            reply = f"为了给出合适的方案，我还需要确认一点：{question}？"
+            reply = f"在为您提供适配建议前，需要向您确认一项信息：{question}？"
         elif not profile.get("confirmed"):
-            reply = ("根据你目前提供的信息，我已整理出投资画像。\n\n"
-                     "【请确认】如果画像符合你的情况，请回复「确认」，我将按该画像开始选股；"
-                     "如需补充或调整，请直接说明。")
+            reply = ("根据您目前提供的信息，我已整理出投资画像。\n\n"
+                     "需要您确认：以上画像信息是否准确？如无补充，请回复「确认」，我将按该画像为您筛选标的；"
+                     "如需调整，请直接告知。")
         elif state.get("last_selection") and self._is_question(message):
             actions = [{"name": "explain_results", "args": {"question": message}}]
-            reply = "我会基于本次选股的真实回测数据说明，并标注数据边界。"
+            reply = "我将基于本次选股的回测数据说明，并注明数据边界与风险提示。"
         else:
-            reply = ("已记录。你可以继续补充投资情况，或让我执行：选股、解释本次结果、优化模型。")
+            reply = ("已记录。您可以继续补充投资情况，或指示我执行选股、结果解读或模型优化。")
 
         plan: dict[str, Any] = {"reply": reply, "actions": actions, "profile_delta": delta}
         return plan
