@@ -877,8 +877,6 @@ class AppService:
                  f"最大回撤 {abs(float(candidate_metrics.get('mdd', 0))) * 100:.1f}%。",
                  "done", "backtest")
         comparison = {"current": _json_safe(base_metrics), "candidate": candidate_metrics}
-        yield "ui", publish(proposal=self._proposal_public(final_plan, model_name=model_name),
-                            comparison=comparison)
         add_step("和现在比一比",
                  f"夏普从 {float(base_metrics.get('sharpe', 0)):.2f} 变为 "
                  f"{float(candidate_metrics.get('sharpe', 0)):.2f}，等你确认后再启用。",
@@ -889,7 +887,7 @@ class AppService:
                  "done" if expectation_met else "error", "check")
         proposal_public = self._proposal_public(final_plan, model_name=model_name)
         proposal_public["tuning"] = tune_public
-        yield "ui", publish(proposal=proposal_public, comparison=comparison)
+        yield "ui", publish(proposal=proposal_public)
 
         candidate_model = self._candidate_model_from_plan(final_plan, tuned_params)
         pending = {
@@ -905,8 +903,19 @@ class AppService:
         self._save_runtime(session_id, pending=pending)
         final_extra = {"code_change": change_preview, "tuning": tune_public}
         final_work = publish(status="done", proposal=proposal_public,
-                             comparison=comparison, extra=final_extra)
+                             extra=final_extra)
         yield "ui", final_work
+
+        # 效果对比独立成卡，排在网格寻优卡之后（晚于寻优结果出现）
+        comparison_block = {
+            "id": "compare-" + uuid.uuid4().hex[:8],
+            "type": "comparison",
+            "title": "效果对比",
+            "status": "done",
+            "comparison": comparison,
+            "note": "历史回测数据，不代表未来实际表现；候选方案需您确认后才会启用。",
+        }
+        yield "ui", {"block": comparison_block}
 
         approval_actions = [
             {"label": "同意", "message": "同意启用这个改进"},
@@ -954,9 +963,10 @@ class AppService:
             note_text = ("候选方案未达到您的目标：" + expectation_reason
                          + " 您可以先不启用，或回复继续优化；我会更换基础引擎或重写打分逻辑，"
                            "再由服务端在新的参数范围内重新寻优。")
-        blocks = [final_work["block"], approval]
+        blocks = [final_work["block"]]
         if not switch_only:
-            blocks.insert(1, final_tuning_block)
+            blocks.append(final_tuning_block)
+        blocks.extend([comparison_block, approval])
         return blocks, note_text, False
 
     def _tuning_state(self, model: dict[str, Any], base_metrics: dict[str, Any],

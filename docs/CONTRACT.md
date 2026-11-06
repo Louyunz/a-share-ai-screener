@@ -76,18 +76,18 @@ Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 实时发给�
  "explanation":"给普通用户看的解读"}
 ```
 
-**work**（AI 工作过程卡，优化/分析时出现）
+**work**（AI 工作过程卡，优化/分析时出现；代码类方案会先于此卡逐行写入 diff）
 ```json
 {"id":"work-1","type":"work","title":"AI 正在优化模型",
  "status":"running|done|error",
  "steps":[{"title":"看当前表现","detail":"近两年年化 12%，最大回撤 18%","status":"done","kind":"analysis"},
           {"title":"运行因子网格寻优","detail":"已评估 18/21 组，当前最优夏普 0.83","status":"running","kind":"tune"}],
- "comparison":{"current":{"sharpe":1.0},"candidate":{"sharpe":1.2}},
  "code_change":{"file":"models/strategy.py","language":"python","kind":"code|weights|model_type",
                 "diff":"逐行 diff","added":12,"removed":3},
  "proposal":{"summary":"...","approach":"服务端网格寻优（因子权重）",
              "model_name":"网格寻优权重","why":"...","expected_effect":"...","risks":["..."]}}
 ```
+`work` 卡不承载效果对比；代码类改动的 `code_change.diff` 必须在 `tuning` 卡出现之前逐行推送完成。
 
 **tuning**（服务端参数网格寻优进度卡；同一 id 实时 upsert）
 ```json
@@ -105,6 +105,15 @@ Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 实时发给�
  "note":"网格寻优基于历史回测逐组评估，最优参数可能存在过拟合；候选仍需确认后才会启用。"}
 ```
 说明：`space` 是 AI 给出的搜索范围（权重类为 10 因子，代码类为引擎参数）；进度、最优指标与得分走势由服务端每次回测后实时推送，前端不得伪造。`best.score`/`history.score` 是展示用真实目标指标（如夏普），选取排序时若回撤超限会在内部使用 `rank_score` 惩罚，`constraint_ok` 表示最优组是否满足回撤约束。
+
+**comparison**（效果对比卡；独立卡，必须晚于 `tuning` 的 `done` 出现）
+```json
+{"id":"compare-1","type":"comparison","title":"效果对比","status":"done",
+ "comparison":{"current":{"cagr":0.09,"sharpe":0.4,"mdd":-0.19},
+               "candidate":{"cagr":0.12,"sharpe":0.8,"mdd":-0.15}},
+ "note":"历史回测数据，不代表未来实际表现；候选方案需您确认后才会启用。"}
+```
+卡片顺序固定为：`work`（含代码改动）→ `tuning`（寻优结果）→ `comparison`（效果对比）→ `approval`（审批）。
 
 **approval**（审批卡；用户可在聊天里点快捷回复，也可直接说话）
 ```json

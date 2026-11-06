@@ -699,6 +699,8 @@
         return selectionCardHtml(normalizeSelection(block));
       case 'work':
         return workCardHtml(block);
+      case 'comparison':
+        return comparisonCardHtml(block);
       case 'approval':
         return approvalCardHtml(block);
       case 'version':
@@ -971,6 +973,7 @@
     if (!items.length) return '';
     return '<div class="sub-block"><div class="sub-title"><h4>效果对比</h4><span class="sub-meta">当前 → 候选</span></div>'
       + '<div class="chart-box" data-chart="compare"></div>'
+      + '</div></div>';
   }
 
   var CODE_TOKEN_RE = /(#[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|class|return|import|from|as|if|elif|else|for|while|in|not|and|or|is|None|True|False|lambda|with|try|except|finally|raise|yield|pass|break|continue|global|nonlocal|assert|del|async|await)\b|\b(\d+(?:\.\d+)?)\b|([A-Za-z_][A-Za-z0-9_]*)(?=\s*\()/g;
@@ -1057,6 +1060,17 @@
       + '<div class="card-body">' + progressHtml + stepsHtml
       + codeBoxHtml(block.code_change)
       + comparisonHtml(block.comparison) + proposalHtml(block.proposal, !block.code_change)
+      + '</div></article>';
+  }
+
+  function comparisonCardHtml(block) {
+    var body = comparisonHtml(block.comparison || {});
+    if (!body) return '';
+    return '<article class="card card-work is-done">'
+      + '<header class="card-head"><div class="card-title"><h3>' + esc(block.title || '效果对比')
+      + '</h3></div><span class="status-pill is-ok">寻优结果</span></header>'
+      + '<div class="card-body">' + body
+      + (block.note ? '<p class="tuning-note">' + esc(block.note) + '</p>' : '')
       + '</div></article>';
   }
 
@@ -1484,7 +1498,7 @@
         });
       }
     }
-    if (block.type === 'work') {
+    if (block.type === 'work' || block.type === 'comparison') {
       var compareHost = node.querySelector('[data-chart="compare"]');
       var items = comparisonItems(block.comparison);
       if (compareHost && items.length) {

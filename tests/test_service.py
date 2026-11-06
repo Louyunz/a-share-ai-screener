@@ -86,10 +86,22 @@ class ChatFlowTest(unittest.TestCase):
         events, text = self.chat("帮我优化一下模型")
         works = _typed(events, "work")
         tunings = _typed(events, "tuning")
+        comparisons = _typed(events, "comparison")
         approvals = _typed(events, "approval")
         self.assertTrue(works)
         self.assertTrue(tunings, "应推送网格寻优进度卡片")
+        self.assertTrue(comparisons, "应推送独立的效果对比卡片")
         self.assertTrue(approvals)
+        self.assertFalse(works[-1].get("comparison"),
+                         "效果对比不应再塞回网格寻优上方的 work 卡")
+        last_tuning_index = max(
+            index for index, (event, data) in enumerate(events)
+            if event == "ui" and (data.get("block") or {}).get("type") == "tuning")
+        first_compare_index = next(
+            index for index, (event, data) in enumerate(events)
+            if event == "ui" and (data.get("block") or {}).get("type") == "comparison")
+        self.assertGreater(first_compare_index, last_tuning_index,
+                           "效果对比必须晚于网格寻优结果出现")
         step_titles = [step.get("title") for step in works[-1].get("steps", [])]
         self.assertIn("运行参数网格寻优", step_titles)
         self.assertGreaterEqual(len(works[-1]["steps"]), 6)
