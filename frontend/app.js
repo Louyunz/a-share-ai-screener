@@ -286,6 +286,26 @@
     return data === null ? {} : data;
   }
 
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  async function apiGet(path, attempts) {
+    var max = Math.max(1, attempts || 2);
+    var lastError = null;
+    for (var attempt = 0; attempt < max; attempt += 1) {
+      try {
+        return await api(path);
+      } catch (error) {
+        lastError = error;
+        var retryable = !error.status || error.status >= 500;
+        if (!retryable || attempt === max - 1) break;
+        await delay(350 * (attempt + 1));
+      }
+    }
+    throw lastError || new Error('请求失败');
+  }
+
   async function checkHealth() {
     try {
       var data = await api('/api/health');
@@ -315,7 +335,7 @@
 
   async function fetchMessages(sessionId) {
     try {
-      var data = await api('/api/sessions/' + encodeURIComponent(sessionId) + '/messages');
+      var data = await apiGet('/api/sessions/' + encodeURIComponent(sessionId) + '/messages', 2);
       return { ok: true, messages: Array.isArray(data.messages) ? data.messages : [] };
     } catch (error) {
       return { ok: false, notFound: error.status === 404, error: error };
@@ -324,7 +344,7 @@
 
   async function loadState() {
     try {
-      var data = await api('/api/sessions/' + encodeURIComponent(state.sessionId) + '/state');
+      var data = await apiGet('/api/sessions/' + encodeURIComponent(state.sessionId) + '/state', 2);
       state.profile = normalizeProfile(data.profile);
       state.activeModel = normalizeModel(data.active_model);
       state.versions = normalizeVersions(data.versions);
@@ -340,7 +360,7 @@
 
   async function loadVersions() {
     try {
-      var data = await api('/api/versions');
+      var data = await apiGet('/api/versions', 2);
       var list = data && (data.versions || data.items) ? (data.versions || data.items) : data;
       var versions = normalizeVersions(list);
       if (versions.length) state.versions = versions;
@@ -601,6 +621,9 @@
   }
 
   function showTurnError(turn, title, message, retryEnabled) {
+    if (typeof console !== 'undefined' && console.error) {
+      console.error('[chat error]', title, message, 'session=' + (state.sessionId || 'none'));
+    }
     if (!turn) {
       appendSystemError(title, message, retryEnabled === false ? null : 'retry');
       return;
@@ -1382,11 +1405,24 @@
   }
 
   /* ============================== SSE 发送与解析 ============================== */
+  function isActionMessage(content) {
+    var text = String(content || '').trim();
+    if (!text) return false;
+    return /^(确认|同意|启用|开始选股|开始筛选|继续选股|先不启用|先不调整|暂不选股|回滚)/.test(text)
+      || /(同意启用|同意分析|确认画像|回滚到|先不启用|先不调整|暂不选股|开始选股)/.test(text);
+  }
+
   function updateComposerState() {
     var busy = state.streaming;
     dom.sendBtn.disabled = busy;
     if (dom.stopBtn) dom.stopBtn.hidden = !busy;
-    if (dom.regenerateBtn) dom.regenerateBtn.disabled = busy || !state.lastUserMessage;
+    if (dom.regenerateBtn) {
+      var actionMessage = isActionMessage(state.lastUserMessage);
+      dom.regenerateBtn.disabled = busy || !state.lastUserMessage || actionMessage;
+      dom.regenerateBtn.title = actionMessage
+        ? '确认 / 启用类消息不能直接重新生成，请重新描述需求'
+        : '重新生成回答';
+    }
     if (dom.clearInput) dom.clearInput.disabled = busy;
     dom.input.placeholder = busy
       ? 'AI 正在回复，可点击停止生成…'
@@ -1625,7 +1661,7 @@
   }
 
   async function fetchSessions() {
-    var data = await api('/api/sessions');
+    var data = await apiGet('/api/sessions', 2);
     return Array.isArray(data.sessions) ? data.sessions : [];
   }
 
@@ -1933,8 +1969,16 @@
       if (state.abortController) state.abortController.abort();
     });
     if (dom.regenerateBtn) dom.regenerateBtn.addEventListener('click', function () {
-      if (!state.streaming && state.lastUserMessage) sendMessage(state.lastUserMessage);
-      else dom.input.focus();
+      if (state.streaming) return;
+      if (!state.lastUserMessage) {
+        dom.input.focus();
+        return;
+      }
+      if (isActionMessage(state.lastUserMessage)) {
+        appendTextMessage('ai', '这是确认 / 启用类消息，不能直接重新生成，以免重复执行业务动作。请重新描述你的需求，或直接输入新的问题。', null);
+        return;
+      }
+      sendMessage(state.lastUserMessage);
     });
 
     if (dom.attachBtn) dom.attachBtn.addEventListener('click', function () { dom.attachInput.click(); });
