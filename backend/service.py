@@ -249,9 +249,12 @@ class AppService:
             if merged != slots:
                 slots = merged
                 self.store.save_profile(session_id, slots, profile_summary(slots), confirmed)
-                profile_block = self._profile_block(session_id)
-                saved_blocks[profile_block["id"]] = profile_block
-                yield "ui", {"block": profile_block}
+                # 画像卡只在信息齐全、进入最终确认时出现；逐题作答不弹卡。
+                if (profile_complete(slots) and not confirmed
+                        and not plan.has_action("confirm_profile")):
+                    profile_block = self._profile_block(session_id)
+                    saved_blocks[profile_block["id"]] = profile_block
+                    yield "ui", {"block": profile_block}
 
         # 2) 执行工具调用，并把服务端动作结果作为备注追加
         notes: list[str] = []

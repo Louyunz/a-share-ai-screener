@@ -56,7 +56,8 @@ class ChatFlowTest(unittest.TestCase):
         # 1) 自然语言开始：AI 只问一个缺失问题
         events, text = self.chat("我想为养老攒点钱")
         self.assertTrue(text)
-        self.assertTrue(any(block["type"] == "profile" for block in _blocks(events)))
+        self.assertFalse(any(block["type"] == "profile" for block in _blocks(events)),
+                         "逐题作答阶段不应弹出画像卡")
 
         # 2) 补齐信息：AI 汇总并请确认
         events, text = self.chat("大概 5 年不用这笔钱，最多能接受亏 15%，真亏了会有点慌但先不卖")

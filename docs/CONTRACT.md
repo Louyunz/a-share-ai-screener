@@ -69,6 +69,7 @@ Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 实时发给�
  "completeness":0.75,"missing":["投资期限"],
  "confirmed":false}
 ```
+画像卡只在四项必填信息齐全、进入最终确认时首次发送；逐题作答阶段不发送。客户确认后用同一 id 更新 `confirmed=true`，不新弹一张卡。
 
 **selection**（选股结果卡）
 ```json

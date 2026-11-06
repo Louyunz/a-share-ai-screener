@@ -72,8 +72,9 @@ class DevServerTest(unittest.TestCase):
     def test_chat_stream(self) -> None:
         status, body = self._request("POST", "/api/sessions")
         sid = json.loads(body)["session_id"]
-        status, text = self._request("POST", f"/api/sessions/{sid}/chat",
-                                     {"content": "我想为养老攒点钱"})
+        status, text = self._request(
+            "POST", f"/api/sessions/{sid}/chat",
+            {"content": "我想为养老攒点钱，大概 5 年不用，最多能接受亏 15%，真亏了会有点慌但先不卖"})
         self.assertEqual(status, 200)
         events = _parse_sse(text)
         self.assertTrue(any(event == "token" for event, _ in events))
