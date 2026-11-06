@@ -176,7 +176,7 @@ Planner 每轮输出：
 ## 5. 画像槽位（生活化标签）
 
 `name`(称呼，可选)、`goal`(投资目标)、`horizon`(投资期限)、`capital`(大致投入)、`liquidity_need`(多久可能要用钱)、`loss_reaction`(亏钱时的真实反应)、`drawdown_tolerance`(最多能接受亏多少)、`income_stability`(收入稳定程度)、`experience`(投资经验)、`preferred_industries`(偏好行业)、`excluded_industries`(不碰行业)、`trade_frequency`(希望多久调整一次)、`concerns`(最担心什么)。
-必填：`goal`、`horizon`、`drawdown_tolerance`、`loss_reaction`。`name` 只用于称呼，不参与适当性判断。
+必填：`goal`、`horizon`、`drawdown_tolerance`、`loss_reaction`。`name` 只用于称呼，不参与适当性判断，也不能单独推导风险等级；风险等级只有在四项必填信息齐全后才生成。
 首次对话先简短自我介绍并自然询问怎么称呼，再进入适当性问题；客户直接提出投资需求或不想透露称呼时不纠缠，顺着客户内容继续。风险等级由 AI 根据信息推导，不直接问“你是什么风险等级”。
 
 AI 追问原则：一次一个问题；先回应/共情，再问；提供生活化选项；不重复问已知信息；最多 3 轮内形成画像总结并请用户确认。

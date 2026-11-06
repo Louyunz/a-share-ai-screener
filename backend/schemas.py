@@ -99,7 +99,7 @@ def normalize_slots(raw: dict[str, Any] | None) -> dict[str, str]:
         text = str(value).strip()
         if text:
             slots[mapped] = text[:200]
-    if slots and "risk_level" not in slots:
+    if profile_complete(slots) and "risk_level" not in slots:
         slots["risk_level"] = _risk_level(slots)
     return slots
 

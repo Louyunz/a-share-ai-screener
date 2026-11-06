@@ -297,5 +297,20 @@ class ComplianceTest(unittest.TestCase):
             ensure_compliance("   ")
 
 
+class ProfilePayloadTest(unittest.TestCase):
+    def test_name_alone_does_not_infer_risk(self) -> None:
+        payload = profile_payload({"name": "罗先生"})
+        self.assertNotIn("risk_level", payload["slots"])
+        self.assertNotIn("风险偏好", payload["summary"])
+
+    def test_risk_level_requires_complete_profile(self) -> None:
+        partial = profile_payload({"name": "罗先生", "goal": "养老"})
+        self.assertNotIn("risk_level", partial["slots"])
+        complete = profile_payload({"name": "罗先生", "goal": "养老", "horizon": "5 年",
+                                    "drawdown_tolerance": "10%", "loss_reaction": "先不卖"})
+        self.assertIn("risk_level", complete["slots"])
+        self.assertIn("风险偏好", complete["summary"])
+
+
 if __name__ == "__main__":
     unittest.main()
