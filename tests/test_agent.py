@@ -52,6 +52,21 @@ class ExplanationStyleTest(unittest.TestCase):
         self.assertNotIn("回复对应选项即可", plan.reply)
         self.assertNotIn("您指的是刚才那个问题", plan.reply)
 
+    def test_interrogation_style_is_regenerated_without_question(self) -> None:
+        reply = ("回撤指的是账户净值从阶段高点回落到低点的幅度。结合您三年后购房的用途，"
+                 "请按实际情况描述：持有期间若出现阶段性亏损，您最多能接受本金回落多少？")
+        self.assertTrue(has_mechanical_style(reply))
+        self.assertTrue(is_explanation_question("什么是回撤"))
+        llm = _RewriteLLM(reply)
+        agent = Agent(llm)
+        state = {"profile": {"complete": False, "confirmed": False,
+                             "missing": ["能接受的最大亏损"], "summary": ""},
+                 "pending": None, "versions": [], "last_selection": None}
+        plan = agent.plan(state, [], "什么是回撤")
+        self.assertEqual(llm.text_calls, 1)
+        self.assertNotIn("请按实际情况描述", plan.reply)
+        self.assertNotIn("您最多能接受", plan.reply)
+
     def test_normal_reply_is_not_rewritten(self) -> None:
         llm = _RewriteLLM("这笔钱大概多久可以不用？您按实际情况说一个大致年限即可。")
         agent = Agent(llm)
