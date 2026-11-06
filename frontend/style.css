@@ -1057,3 +1057,99 @@ body.ai-working .ambient::after {
     display: none;
   }
 }
+
+
+/* ================================================================
+ * v7：全宽顶栏 + 右侧贴边工作台 + wb-scroll 间距与透明背景
+ * ================================================================ */
+
+.topbar {
+  top: 0;
+  width: 100%;
+  max-width: none;
+  height: 64px;
+  margin: 0;
+  padding: 0 clamp(16px, 2.2vw, 32px);
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.86);
+  border-radius: 0;
+  box-shadow: 0 12px 40px rgba(32, 44, 78, 0.10);
+}
+
+.workspace {
+  width: 100%;
+  max-width: none;
+  margin: 16px 0 10px;
+  padding: 0 0 0 clamp(16px, 2.2vw, 32px);
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 24vw);
+  gap: 18px;
+  height: calc(100vh - 64px - 84px);
+}
+
+.workbench {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.wb-scroll {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 20px;
+  min-height: 0;
+  padding: 6px 0 30px 4px;
+  overflow-y: auto;
+  background: transparent;
+}
+
+.wb-card {
+  padding: 20px;
+}
+
+.wb-items {
+  gap: 14px;
+}
+
+.app-footer {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0 clamp(16px, 2.2vw, 32px) 16px;
+}
+
+@media (max-width: 1279px) {
+  .workspace {
+    width: 100%;
+    padding: 0 14px;
+    height: calc(100vh - 64px - 84px);
+  }
+
+  .wb-scroll {
+    padding-right: 4px;
+  }
+}
+
+@media (max-width: 760px) {
+  .topbar {
+    height: 58px;
+    padding: 0 12px;
+  }
+
+  .workspace {
+    margin-top: 10px;
+    padding: 0 10px;
+    height: calc(100vh - 58px - 74px);
+  }
+
+  .wb-scroll {
+    gap: 14px;
+    padding: 4px 0 18px;
+  }
+
+  .app-footer {
+    padding: 0 12px 12px;
+  }
+}
