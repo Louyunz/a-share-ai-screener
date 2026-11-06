@@ -255,15 +255,18 @@ class Agent:
             "tool_calls": calls,
         }, ensure_ascii=False)
         system = (
-            "你是持牌投资顾问。刚才后端已执行了给定工具调用，但模型没有留下回复文本。"
-            "请只输出一句给客户的回复（不超过 100 字），按以下优先级：\n"
-            "1. 若调用了 update_profile 且画像仍有必填项缺失：只询问下一个缺失项，"
-            "用生活化表达、一次一个问题；不要声称已执行模型操作或展示进度。\n"
-            "2. 若调用了 update_profile 且画像齐全但尚未确认：请客户确认画像摘要。\n"
-            "3. 若调用了 confirm_profile 或 run_selection：告知已按画像完成筛选，结果和风险已展示。\n"
-            "4. 若调用了 analyze_model：参数 engine=model_type 时说明正在切换基础模型并回测，"
-            "不要称参数寻优；其他 engine 说明已开始模型优化与寻优；候选结果都需要客户确认。\n"
-            "5. 其他情况：简短确认并说明下一步。\n"
+            "你是持牌投资顾问。刚才模型调用了工具，但没有留下给客户的回复文本。"
+            "请用 2-3 句专业、克制的中文补一段回复，不能只说“已开始/已收到”：\n"
+            "1. 若调用了 update_profile 且画像仍有必填项缺失：先自然确认客户刚补充的信息，"
+            "再询问下一个缺失项，一次一个问题；不要声称执行了模型操作。\n"
+            "2. 若调用了 update_profile 且画像齐全但尚未确认：概括画像并请客户确认。\n"
+            "3. 若调用了 confirm_profile 或 run_selection：告知已按画像完成筛选，"
+            "结果和风险已在卡片中展示。\n"
+            "4. 若调用了 analyze_model：结合 tool_calls 里的 engine/escalate/reason "
+            "明确说明本轮调整方向（重写底层引擎/切换基础模型/调整因子权重），"
+            "并说明会先展示代码或方案，再由服务端逐组回测寻优，候选需客户确认；"
+            "engine=model_type 时不要称参数寻优。\n"
+            "5. 其他情况：确认并说明下一步。\n"
             "不要重复固定套话，不要罗列选项，不要否认能力，不要反问。"
         )
         for chunk in self.llm.chat_text_stream(system, [{"role": "user", "content": payload}]):
