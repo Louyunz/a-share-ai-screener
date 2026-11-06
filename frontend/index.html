@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -7,7 +7,7 @@
   <meta name="description" content="智投罗盘 · AI 投资助手：投资者画像、智能顾问、策略分析、组合与模型管理。">
   <title>智投罗盘 · AI 投资助手</title>
   <link rel="stylesheet" href="style.css?v=18">
-  <link rel="stylesheet" href="user-admin.css?v=19">
+  <link rel="stylesheet" href="user-admin.css?v=20">
 </head>
 <body>
   <svg class="icon-sprite" aria-hidden="true" focusable="false">
@@ -281,11 +281,21 @@
           </div>
         </form>
         <div class="user-list" id="users-list"></div>
+        <section class="sync-block">
+          <div class="sync-head">
+            <div>
+              <h3>行情数据同步</h3>
+              <p class="user-hint">每个工作日收盘后自动通过 Tushare 同步，失败时保留旧缓存。</p>
+            </div>
+            <button class="btn btn-ghost" id="sync-now" type="button">立即同步</button>
+          </div>
+          <p class="user-hint" id="sync-status">正在读取同步状态…</p>
+        </section>
       </div>
     </div>
   </div>
 
-  <script src="charts.js?v=19"></script>
-  <script src="app.js?v=19"></script>
+  <script src="charts.js?v=20"></script>
+  <script src="app.js?v=20"></script>
 </body>
 </html>

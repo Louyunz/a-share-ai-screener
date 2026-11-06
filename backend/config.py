@@ -48,6 +48,13 @@ REBALANCE_DAYS = int(os.environ.get("REBALANCE_DAYS", "20"))
 COST_BUY = float(os.environ.get("COST_BUY", "0.0003"))
 COST_SELL = float(os.environ.get("COST_SELL", "0.0013"))
 
+# 每日行情同步（收盘后自动拉取）
+DATA_SYNC_ENABLED = os.environ.get("DATA_SYNC_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+DATA_SYNC_HOUR = int(os.environ.get("DATA_SYNC_HOUR", "18"))
+DATA_SYNC_MINUTE = int(os.environ.get("DATA_SYNC_MINUTE", "5"))
+DATA_SYNC_SOURCE = os.environ.get("DATA_SYNC_SOURCE", SOURCE)
+DATA_SYNC_TIMEZONE = os.environ.get("DATA_SYNC_TIMEZONE", "Asia/Shanghai")
+
 # 管理员登录（单用户）
 AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "").strip()
 AUTH_PASSWORD_HASH = os.environ.get("AUTH_PASSWORD_HASH", "").strip()

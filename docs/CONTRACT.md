@@ -42,6 +42,8 @@
 | POST | `/api/admin/users` | 管理员：创建用户 `{username,password,role:admin|user}` |
 | PATCH | `/api/admin/users/{id}` | 管理员：启用/停用、重置密码、调整角色 |
 | DELETE | `/api/admin/users/{id}` | 管理员：删除无数据用户；有会话数据时返回 409 |
+| GET | `/api/admin/data/sync` | 管理员：行情同步状态（上次成功、as_of、下次运行） |
+| POST | `/api/admin/data/sync` | 管理员：手动触发一次行情同步 |
 | GET | `/api/health` | `{ok, source, as_of, universe, llm}`（需登录） |
 | GET | `/api/sessions` | 历史对话归档 `{sessions:[{id,title,created_at,updated_at,message_count,profile_summary,profile_confirmed}]}` |
 | POST | `/api/sessions` | `{session_id}` |
@@ -295,6 +297,8 @@ def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 
 - 文件：`frontend/index.html`、`app.js`、`style.css`、`charts.js`（纯原生 JS + SVG，无构建链/无 CDN）；登录页为 `login.html`、`login.css`、`login.js`。
 - 登录：所有业务 API 需要管理员会话 Cookie；未登录访问 `/` 跳转 `/login`；首次使用在本机创建管理员账号；登出入口在顶部工具栏。
+- 用户管理：管理员侧栏可创建、停用/启用、重置密码、删除用户；普通用户只能看到自己的会话，管理员也不能查看其他用户的对话内容。
+- 行情同步：服务启动后每日工作日 18:05（Asia/Shanghai）自动通过 Tushare 刷新缓存并热加载；管理端「用户管理」页可查看状态并手动触发。缓存先写临时目录再原子替换，失败保留旧缓存。
 - 布局：**顶部工具栏 56px + 左侧导航 224px + 中间 AI 对话工作区（最小 560px）+ 右侧投资上下文 320px**；页面边距 24px、栏间距 16px。小于 1024px 时导航收为图标，移动端为抽屉；小于 1200px 时右侧上下文改为可开合抽屉。
 - 导航：左侧为 AI 投资顾问 / 投资组合 / 策略分析 / 历史记录 / 模型管理 / 系统设置；投资组合、策略分析、模型管理、设置使用当前会话状态渲染只读弹窗，不改后端接口。对话区头部提供历史、清空、新对话；输入区支持快捷操作、停止生成、重新生成、清空输入与文本附件。
 - 交互：对话是唯一的写操作入口；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。

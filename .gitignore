@@ -16,6 +16,8 @@ data/*.db-wal
 data/*.db-shm
 data/chat/
 data/versions/
+data/sync_status.json
+data/sync_status.json.tmp
 
 # 前端无构建产物；保留静态文件
 node_modules/

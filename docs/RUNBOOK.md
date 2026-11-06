@@ -22,6 +22,8 @@ $env:LLM_MODEL = "deepseek-chat"
 
 打开 `http://127.0.0.1:8000` 会进入登录页：首次使用在本机创建管理员账号；也可以在 `.env` 配置 `AUTH_USERNAME` / `AUTH_PASSWORD_HASH`（用 `scripts/set_password.py` 生成）。所有业务 API 都需要登录；详细安全边界见 `docs/SECURITY.md`。
 
+管理员可在「用户管理」创建普通用户，并查看/手动触发行情同步。每日同步默认工作日 18:05（Asia/Shanghai）自动执行；可用 `DATA_SYNC_ENABLED`、`DATA_SYNC_HOUR`、`DATA_SYNC_MINUTE`、`DATA_SYNC_SOURCE`、`DATA_SYNC_TIMEZONE` 调整。同步先写临时目录再原子替换，失败保留旧缓存并记录在 `data/sync_status.json`。
+
 ## 2. 演示脚本（3 分钟）
 
 1. 输入“我想为养老攒点钱”，AI 会先问一个缺失的信息；

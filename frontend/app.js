@@ -276,6 +276,8 @@
     dom.userResetSubmit = $('#user-reset-submit');
     dom.userResetMsg = $('#user-reset-msg');
     dom.userResetCancel = $('#user-reset-cancel');
+    dom.syncNow = $('#sync-now');
+    dom.syncStatus = $('#sync-status');
   }
 
   /* ============================== 网络请求 ============================== */
@@ -2209,15 +2211,72 @@
     } catch (error) {
       dom.usersList.innerHTML = '<p class="user-empty">用户列表读取失败：' + esc(error.message || '请稍后重试') + '</p>';
     }
+    await loadSyncStatus();
   }
 
   function closeUsers() {
     if (!dom.usersOverlay) return;
     dom.usersOverlay.hidden = true;
+    if (syncPollTimer) {
+      clearTimeout(syncPollTimer);
+      syncPollTimer = null;
+    }
     document.body.classList.remove('history-open');
     if (dom.historyOverlay && dom.historyOverlay.hidden
         && (!dom.infoOverlay || dom.infoOverlay.hidden)) {
       setActiveNav('assistant');
+    }
+  }
+
+  var syncPollTimer = null;
+
+  function renderSyncStatus(data) {
+    if (!dom.syncStatus) return;
+    var parts = [];
+    if (data.running || data.status === 'running') parts.push('正在同步行情数据…');
+    if (data.status === 'disabled') parts.push(data.message || '自动同步已关闭');
+    if (data.status === 'success') parts.push('上次同步成功');
+    if (data.status === 'error') parts.push('上次同步失败：' + (data.error || '未知错误'));
+    if (data.last_success) parts.push('同步时间：' + data.last_success.replace('T', ' ').slice(0, 19));
+    if (data.as_of) parts.push('数据截至：' + data.as_of);
+    if (data.universe) parts.push('股票数：' + data.universe);
+    if (data.next_run && data.status !== 'running') parts.push('下次自动同步：' + data.next_run.replace('T', ' '));
+    dom.syncStatus.textContent = parts.join(' · ') || '暂无同步记录。';
+    dom.syncStatus.classList.toggle('is-error', data.status === 'error');
+    dom.syncStatus.classList.toggle('is-ok', data.status === 'success');
+  }
+
+  async function loadSyncStatus() {
+    if (!dom.syncStatus) return null;
+    try {
+      var data = await api('/api/admin/data/sync');
+      renderSyncStatus(data);
+      if (data.running || data.status === 'running') {
+        if (syncPollTimer) clearTimeout(syncPollTimer);
+        syncPollTimer = setTimeout(function () {
+          syncPollTimer = null;
+          loadSyncStatus();
+        }, 2500);
+      }
+      return data;
+    } catch (error) {
+      dom.syncStatus.textContent = '同步状态读取失败：' + (error.message || '请稍后重试');
+      dom.syncStatus.classList.add('is-error');
+      return null;
+    }
+  }
+
+  async function triggerSync() {
+    if (!dom.syncNow) return;
+    dom.syncNow.disabled = true;
+    try {
+      await api('/api/admin/data/sync', { method: 'POST' });
+      await loadSyncStatus();
+    } catch (error) {
+      dom.syncStatus.textContent = '同步启动失败：' + (error.message || '请稍后重试');
+      dom.syncStatus.classList.add('is-error');
+    } finally {
+      dom.syncNow.disabled = false;
     }
   }
 
@@ -2675,6 +2734,7 @@
       dom.userResetForm.hidden = true;
       state.resetUserId = null;
     });
+    if (dom.syncNow) dom.syncNow.addEventListener('click', triggerSync);
     if (dom.historyList) {
       dom.historyList.addEventListener('click', function (event) {
         var item = event.target.closest ? event.target.closest('[data-session-id]') : null;

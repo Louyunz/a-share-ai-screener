@@ -125,6 +125,12 @@ class AppService:
             "llm": type(self.llm).__name__,
         }
 
+    def reload_data(self) -> DataBundle:
+        """同步成功后热加载缓存；新请求立即使用新数据，失败时保留旧数据。"""
+        bundle = load_bundle(self.data_dir)
+        self.data = bundle
+        return bundle
+
     def create_session(self, owner_id: int | None = None) -> dict[str, Any]:
         session_id = self.store.create_session(owner_id)
         return {"session_id": session_id}

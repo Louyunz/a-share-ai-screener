@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from .auth import AuthError, AuthManager
 from .config import DB_PATH, FRONTEND_DIR
 from .data import DataError
+from .data.sync import SyncManager
 from .events import sse_format
 from .llm import LLMError
 from .schemas import ValidationError
@@ -22,6 +23,7 @@ from .store import Store
 
 _service: AppService | None = None
 _auth: AuthManager | None = None
+_sync: SyncManager | None = None
 
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 SECURITY_HEADERS = {
@@ -96,9 +98,10 @@ async def _json_body(request: Request) -> dict[str, Any]:
 
 
 def create_app(service: AppService | None = None) -> FastAPI:
-    global _service, _auth
+    global _service, _auth, _sync
     _service = service
     _auth = AuthManager(service.store) if service is not None else None
+    _sync = None
     app = FastAPI(title="智投罗盘 · AI 选股助手", version="2.1.0")
 
     @app.middleware("http")
@@ -178,7 +181,10 @@ def create_app(service: AppService | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> Any:
         try:
-            return get_service().health()
+            payload = get_service().health()
+            if _sync is not None:
+                payload["sync"] = _sync.status()
+            return payload
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
@@ -305,6 +311,31 @@ def create_app(service: AppService | None = None) -> FastAPI:
             return _error(exc)
 
     # ------------------------------------------------------------------
+    # 管理员：行情同步
+    # ------------------------------------------------------------------
+    @app.get("/api/admin/data/sync")
+    def admin_sync_status(request: Request) -> Any:
+        try:
+            _admin(request)
+            if _sync is None:
+                return {"status": "disabled", "message": "同步任务尚未启动"}
+            return _sync.status()
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @app.post("/api/admin/data/sync")
+    def admin_sync_now(request: Request) -> Any:
+        try:
+            actor = _admin(request)
+            if _sync is None:
+                raise AuthError("同步任务尚未启动", 503)
+            get_auth().store.audit(
+                "data_sync", reason="admin_manual", payload={"actor": actor.get("username")})
+            return _sync.trigger()
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    # ------------------------------------------------------------------
     # 页面
     # ------------------------------------------------------------------
     @app.get("/")
@@ -320,9 +351,19 @@ def create_app(service: AppService | None = None) -> FastAPI:
     if FRONTEND_DIR.exists() and (FRONTEND_DIR / "index.html").exists():
         app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
+    @app.on_event("startup")
+    def _start_daily_sync() -> None:
+        global _sync
+        if _sync is None:
+            _sync = SyncManager(get_service())
+            _sync.start()
+
     @app.on_event("shutdown")
-    def _close_auth_store() -> None:
-        global _auth
+    def _shutdown() -> None:
+        global _auth, _sync
+        if _sync is not None:
+            _sync.stop()
+            _sync = None
         if _auth is not None:
             _auth.store.close()
             _auth = None
