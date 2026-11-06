@@ -795,17 +795,39 @@ class AppService:
 
         if approach == "model_type":
             info = registry.get_model(str(proposal.get("model_type")))
-            file_name = "models/strategy.py · 模型类型"
+            file_name = "models/strategy.py · 模型类型与权重"
+            current = (current_model or {})
+            current_weights = current.get("weights") or {}
+            candidate_weights = proposal.get("weights") or info.get("weights") or {}
             diff_lines = [
                 "--- " + file_name + "（当前）",
                 "+++ " + file_name + "（候选）",
-                "- model_type: " + str((current_model or {}).get("model_id") or "multi_factor"),
+                "- model_type: " + str(current.get("model_id") or "multi_factor"),
                 "+ model_type: " + str(info.get("id")),
-                "- name: " + str((current_model or {}).get("name") or "均衡多因子"),
+                "- name: " + str(current.get("name") or "均衡多因子"),
                 "+ name: " + str(info.get("name")),
+                "@@ 因子权重 @@",
             ]
+            added = removed = 2
+            for name in FACTOR_NAMES:
+                old_value = round(float(current_weights.get(name, 0.0)), 4)
+                new_value = round(float(candidate_weights.get(name, 0.0)), 4)
+                if abs(old_value - new_value) < 0.0005:
+                    diff_lines.append(f"  {name}: {old_value:.4f}")
+                    continue
+                diff_lines.append(f"- {name}: {old_value:.4f}")
+                diff_lines.append(f"+ {name}: {new_value:.4f}")
+                added += 1
+                removed += 1
+            current_desc = str(current.get("description") or "").strip()
+            new_desc = str(info.get("description") or "").strip()
+            if current_desc != new_desc:
+                diff_lines.append("- description: " + current_desc)
+                diff_lines.append("+ description: " + new_desc)
+                added += 1
+                removed += 1
             return {"file": file_name, "language": "text", "kind": "model_type",
-                    "diff": "\n".join(diff_lines), "added": 2, "removed": 2}
+                    "diff": "\n".join(diff_lines), "added": added, "removed": removed}
 
         current = (current_model or {}).get("weights") or {}
         candidate = proposal.get("weights") or {}

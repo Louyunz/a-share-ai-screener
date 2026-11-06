@@ -137,6 +137,21 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("没有等待您确认", text)
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
 
+    def test_model_type_preview_includes_factor_weights(self) -> None:
+        from backend.models import registry
+        current = {"model_id": "ai_tuned_weights", "name": "AI 调整权重",
+                   "weights": registry.get_model("multi_factor")["weights"]}
+        target = registry.get_model("low_vol_quality")
+        preview = AppService._change_preview(current, {
+            "approach": "model_type", "model_type": "low_vol_quality",
+            "weights": target["weights"],
+        })
+        self.assertEqual(preview["kind"], "model_type")
+        self.assertIn("@@ 因子权重 @@", preview["diff"])
+        self.assertIn("ep:", preview["diff"])
+        self.assertIn("low_vol_quality", preview["diff"])
+        self.assertGreater(preview["added"], 2, "更换基础模型必须展示权重变化，不能只改两行元数据")
+
     def test_state_endpoint_payload(self) -> None:
         state = self.service.get_state(self.sid)
         self.assertIn("profile", state)
