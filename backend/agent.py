@@ -186,36 +186,6 @@ def infer_pending_slot(state: dict[str, Any], history: list[dict[str, str]] | No
     return ""
 
 
-def infer_short_answer(state: dict[str, Any], history: list[dict[str, str]] | None,
-                       message: str) -> dict[str, str]:
-    """对上一轮问题的短回答做轻量语义映射；LLM 仍负责主要理解。"""
-    text = str(message or "").strip()
-    if not text or len(text) > 50:
-        return {}
-    slot = infer_pending_slot(state, history)
-    if slot == "loss_reaction":
-        if any(word in text for word in ("继续持有", "继续拿", "拿着", "不卖", "持有", "等待回升",
-                                         "等待修复", "扛", "忍着", "不动")):
-            return {"loss_reaction": "继续持有等待修复"}
-        if any(word in text for word in ("补仓", "加仓", "摊低", "摊薄")):
-            return {"loss_reaction": "分批补仓摊低成本"}
-        if any(word in text for word in ("止损", "卖出", "减仓", "割肉", "离场")):
-            return {"loss_reaction": "止损或减仓离场"}
-        if any(word in text for word in ("看情况", "不确定", "没想好", "不知道")):
-            return {"loss_reaction": "视回撤情况决定"}
-    if slot == "drawdown_tolerance":
-        match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
-        if match:
-            return {"drawdown_tolerance": match.group(1) + "%"}
-    if slot == "horizon":
-        match = re.search(r"(\d+)\s*年", text)
-        if match:
-            return {"horizon": match.group(1) + "年"}
-        if any(word in text for word in ("长期", "五年以上", "3年以上", "三年以上")):
-            return {"horizon": "3年以上"}
-    return {}
-
-
 def is_explanation_question(message: str) -> bool:
     text = str(message or "").strip()
     return any(term in text for term in (
@@ -358,10 +328,6 @@ class Agent:
         delta = raw.get("profile_delta")
         if not isinstance(delta, dict):
             delta = {}
-        # 轻量兜底：短回答对应上一轮槽位时补进 profile_delta，避免“继续持有”被当成持仓查询
-        inferred = infer_short_answer(state, history, message)
-        for key, value in inferred.items():
-            delta.setdefault(key, value)
 
         plan = Plan(reply=reply, actions=actions, profile_delta=delta)
         # 澄清与执行分离：提问时本轮不执行动作；记录待执行意图，客户回答后再执行

@@ -133,7 +133,7 @@ backend/
   models/            内置模型类型、AI 代码安全校验与编译、提案流水线
 frontend/
   index.html / app.js / style.css / charts.js
-tests/               103+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
+tests/               102+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
 scripts/             构建缓存、启动、重置、全量测试、E2E 冒烟
 docs/                接口契约、运行手册、设计摘要、界面截图
 ```

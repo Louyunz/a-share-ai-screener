@@ -79,25 +79,28 @@ class ExplanationStyleTest(unittest.TestCase):
         self.assertTrue(is_explanation_question("这些都是什么意思"))
         self.assertFalse(is_explanation_question("帮我选股"))
 
-class SemanticSlotTest(unittest.TestCase):
-    def _agent(self):
-        return Agent(_RewriteLLM("收到，我记下了。"))
+class _ContextLLM:
+    def __init__(self) -> None:
+        self.payload = None
 
-    def test_continue_holding_maps_to_loss_reaction(self) -> None:
+    def chat_json(self, system, messages):
+        import json
+        self.payload = json.loads(messages[-1]["content"])
+        return {"reply": "已记录，出现浮亏时您倾向于继续持有、等待修复。",
+                "actions": [], "profile_delta": {"loss_reaction": "继续持有等待修复"}}
+
+
+class SemanticContextTest(unittest.TestCase):
+    def test_plan_passes_question_and_awaiting_slot_to_llm(self) -> None:
+        llm = _ContextLLM()
         state = {"profile": {"complete": False, "confirmed": False,
                              "missing": ["亏钱时的反应"], "summary": ""},
                  "pending": None, "versions": [], "last_selection": None}
-        history = [{"role": "assistant", "content": "若持有期间真的出现这样的浮亏，您通常会怎么做，比如继续持有等待回升、分批补仓摊低成本，还是先减仓止损？大致说说您的习惯即可。"}]
-        plan = self._agent().plan(state, history, "继续持有")
+        history = [{"role": "assistant", "content": "若持有期间真的出现浮亏，您通常会怎么做，比如继续持有等待回升、分批补仓摊低成本，还是先减仓止损？"}]
+        plan = Agent(llm).plan(state, history, "继续持有")
+        self.assertEqual(llm.payload.get("awaiting_slot"), "loss_reaction")
+        self.assertIn("浮亏", llm.payload.get("last_assistant_question", ""))
         self.assertEqual(plan.profile_delta.get("loss_reaction"), "继续持有等待修复")
-
-    def test_short_percentage_maps_to_drawdown(self) -> None:
-        state = {"profile": {"complete": False, "confirmed": False,
-                             "missing": ["能接受的最大亏损"], "summary": ""},
-                 "pending": None, "versions": [], "last_selection": None}
-        history = [{"role": "assistant", "content": "您最多能接受账户出现多大比例的回撤？"}]
-        plan = self._agent().plan(state, history, "10%")
-        self.assertEqual(plan.profile_delta.get("drawdown_tolerance"), "10%")
 
 class ConfirmationDedupTest(unittest.TestCase):
     def test_duplicate_confirmation_is_removed(self) -> None:
