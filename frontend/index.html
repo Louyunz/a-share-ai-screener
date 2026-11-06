@@ -50,7 +50,6 @@
         </span>
         <span class="brand-copy">
           <strong>智投罗盘</strong>
-          <span>AI Investment Assistant</span>
         </span>
       </a>
     </div>
@@ -72,7 +71,7 @@
     <aside class="sidebar" id="sidebar" aria-label="主导航">
       <nav class="side-nav">
         <div class="nav-section">
-          <span class="nav-label">WORKSPACE</span>
+          <span class="nav-label">工作区</span>
           <button class="nav-item is-active" type="button" data-nav="assistant">
             <svg class="icon"><use href="#i-spark"></use></svg><span>AI 投资顾问</span>
           </button>
@@ -87,13 +86,7 @@
           </button>
         </div>
         <div class="nav-section">
-          <span class="nav-label">MANAGEMENT</span>
-          <button class="nav-item" type="button" data-nav="model">
-            <svg class="icon"><use href="#i-layers"></use></svg><span>模型管理</span>
-          </button>
-          <button class="nav-item" type="button" data-nav="settings">
-            <svg class="icon"><use href="#i-settings"></use></svg><span>系统设置</span>
-          </button>
+
         </div>
       </nav>
       <div class="sidebar-footer">
@@ -110,7 +103,7 @@
             <span class="chat-agent-mark"><svg class="icon"><use href="#i-spark"></use></svg></span>
             <div class="chat-header-copy">
               <h1>AI 投资顾问</h1>
-              <p><span id="chat-session-name">新会话</span><span class="dot-sep">·</span><span id="chat-run-status">对话中</span><span class="dot-sep">·</span><span class="session-chip" id="session-chip" title="当前会话 ID">会话 —</span></p>
+              <p><span class="session-chip" id="session-chip" title="当前会话 ID"></span></p>
             </div>
           </div>
           <div class="chat-header-actions">
@@ -171,7 +164,6 @@
           </div>
           <div class="composer-foot">
             <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
-            <span class="composer-tip">AI 建议基于历史回测数据，不构成投资建议</span>
           </div>
         </form>
       </section>
@@ -179,7 +171,6 @@
       <aside class="context-panel" id="workbench" aria-label="投资上下文">
         <header class="context-head">
           <div>
-            <span class="context-kicker">CONTEXT</span>
             <h2>投资上下文</h2>
           </div>
           <button class="icon-btn" id="wb-toggle" type="button" aria-controls="workbench" aria-expanded="true" title="收起右侧面板">
@@ -209,9 +200,7 @@
     <div class="history-panel" role="dialog" aria-modal="true" aria-labelledby="history-title">
       <header class="history-head">
         <div>
-          <span class="context-kicker">ARCHIVE</span>
           <h2 id="history-title">历史记录</h2>
-          <p class="history-note">所有会话自动归档保存在本地服务端，可随时切回继续。</p>
         </div>
         <button class="icon-btn" id="history-close" type="button" aria-label="关闭历史记录">
           <svg class="icon"><use href="#i-close"></use></svg>

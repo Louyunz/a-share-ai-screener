@@ -93,8 +93,8 @@
   };
 
   var STARTERS = [
+    { label: '如何开始投资？', message: '如何开始投资？' },
     { label: '稳健一点，能接受 10% 左右回撤', message: '我想稳健一点，能接受 10% 左右回撤，计划投资 3 年以上。' },
-    { label: '帮我看看现在适合什么模型', message: '帮我看看现在适合什么模型' },
     { label: '我比较积极，想抓成长机会', message: '我比较积极，能接受 20% 左右的回撤，希望抓住成长股的长期机会。' },
     { label: '不想碰的行业怎么排除？', message: '我不想碰白酒和房地产行业，选股时帮我排除掉。' }
   ];
@@ -721,7 +721,7 @@
 
   function genericCardHtml(block) {
     return '<article class="card"><header class="card-head"><span class="card-icon tone-slate">' + icon('layers') + '</span>'
-      + '<div class="card-title"><span class="card-kicker">AI BLOCK</span><h3>' + esc(block.title || block.type || 'AI 内容') + '</h3></div></header>'
+      + '<div class="card-title"><h3>' + esc(block.title || block.type || 'AI 内容') + '</h3></div></header>'
       + '<div class="card-body"><p class="wb-empty">收到一条暂不支持展示的内容。</p></div></article>';
   }
 
@@ -741,8 +741,8 @@
     var progressHtml = pct === null ? '' : '<div class="completeness"><div class="completeness-head"><span>资料完整度</span><b>' + pct + '%</b></div>'
       + '<div class="progress-line"><i style="width:' + pct + '%"></i></div>' + missingHtml + '</div>';
     return '<article class="card card-profile">'
-      + '<header class="card-head"><span class="card-icon tone-blue">' + icon('user') + '</span>'
-      + '<div class="card-title"><span class="card-kicker">INVESTOR PROFILE</span><h3>你的投资画像</h3></div>'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>你的投资画像</h3></div>'
       + '<span class="status-pill ' + (profile.confirmed ? 'is-ok' : 'is-warn') + '">' + (profile.confirmed ? '已确认' : '待确认') + '</span></header>'
       + '<div class="card-body">'
       + (summary ? '<p class="card-summary">' + esc(summary) + '</p>' : '')
@@ -759,11 +759,9 @@
     if (!keys.length) return '';
     return '<div class="metric-grid">' + keys.map(function (key) {
       var meta = metricMeta(key);
-      var note = selection.metric_notes && selection.metric_notes[key] ? String(selection.metric_notes[key]) : meta.note;
       return '<div class="metric-card tone-' + meta.tone + '">'
         + '<span class="metric-label">' + esc(meta.label) + '</span>'
         + '<span class="metric-value">' + esc(formatMetric(key, selection.metrics[key])) + '</span>'
-        + (note ? '<span class="metric-note">' + esc(note) + '</span>' : '')
         + '</div>';
     }).join('') + '</div>'
       + '<p class="metric-disclaimer">以上为历史回测数据' + (selection.as_of ? '（截至 ' + esc(selection.as_of) + '）' : '') + '，不代表未来实际表现，不构成投资建议。</p>';
@@ -914,14 +912,12 @@
     var factorsHtml = factors.length
       ? '<div class="sub-block"><div class="sub-title"><h4>因子贡献</h4><span class="sub-meta">组合平均暴露</span></div>'
         + '<div class="chart-box" data-chart="factors"></div>'
-        + '<p class="chart-note">条越长表示组合在这个因子上越占优（已完成行业中性化）。</p></div>'
       : '';
     var weightsHtml = portfolioHtml(selection);
     var navData = buildNavData(selection);
     var navHtml = navData
       ? '<div class="sub-block"><div class="sub-title"><h4>策略净值 vs 基准</h4><span class="sub-meta">起点归一为 1.00</span></div>'
         + '<div class="chart-box" data-chart="nav"></div>'
-        + '<p class="chart-note">蓝色为策略净值，灰色虚线为基准；回测已计入交易成本与涨跌停约束。</p></div>'
       : '';
     var explanationHtml = selection.explanation
       ? '<div class="ai-note"><span class="ai-note-label">' + icon('spark') + 'AI 解读</span><p>' + esc(selection.explanation) + '</p></div>'
@@ -930,8 +926,8 @@
       ? '<div class="selection-split">' + factorsHtml + weightsHtml + '</div>'
       : '';
     return '<article class="card card-selection">'
-      + '<header class="card-head"><span class="card-icon tone-blue">' + icon('target') + '</span>'
-      + '<div class="card-title"><span class="card-kicker">AI SELECTION</span><h3>本次选股结果</h3></div>'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>本次选股结果</h3></div>'
       + '<span class="status-pill is-run">已完成</span></header>'
       + '<div class="card-body">'
       + '<div class="selection-meta-line">' + meta.join('') + '</div>'
@@ -984,7 +980,6 @@
     if (!items.length) return '';
     return '<div class="sub-block"><div class="sub-title"><h4>效果对比</h4><span class="sub-meta">当前 → 候选</span></div>'
       + '<div class="chart-box" data-chart="compare"></div>'
-      + '<p class="chart-note">灰色为当前模型，青色为候选模型；回撤越接近 0 越好，其余指标越大越好。</p></div>';
   }
 
   var CODE_TOKEN_RE = /(#[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|class|return|import|from|as|if|elif|else|for|while|in|not|and|or|is|None|True|False|lambda|with|try|except|finally|raise|yield|pass|break|continue|global|nonlocal|assert|del|async|await)\b|\b(\d+(?:\.\d+)?)\b|([A-Za-z_][A-Za-z0-9_]*)(?=\s*\()/g;
@@ -1031,7 +1026,6 @@
       + '<span class="code-file">' + esc(change.file || 'models/strategy.py') + '</span></span>'
       + '<span class="code-stats">+' + added + ' / -' + removed + '</span></div>'
       + '<pre class="code-box" aria-label="AI 正在修改的模型内容">' + rows + '</pre>'
-      + '<p class="code-note"><strong>风险提示</strong> AI 生成或修改的模型仅用于历史回测演示，可能存在逻辑偏差或过拟合；历史业绩不代表未来实际表现，启用前请审阅代码并确认。</p>'
       + '</div>';
   }
 
@@ -1045,14 +1039,9 @@
     var diff = (showCodeDiff !== false && proposal.diff)
       ? '<details class="diff"><summary>展开查看代码改动</summary><pre>' + esc(proposal.diff) + '</pre></details>'
       : '';
-    var risks = Array.isArray(proposal.risks) && proposal.risks.length
-      ? '<div class="risk-list"><h5>风险提示</h5><ul>' + proposal.risks.map(function (risk) {
-        return '<li>' + esc(risk) + '</li>';
-      }).join('') + '</ul></div>'
-      : '';
     return '<div class="proposal">' + summary
       + (tags.length ? '<div class="proposal-meta">' + tags.join('') + '</div>' : '')
-      + diff + risks + '</div>';
+      + diff  + '</div>';
   }
 
   function workCardHtml(block) {
@@ -1071,8 +1060,8 @@
       : '';
     var stepsHtml = '<ol class="steps">' + steps.map(stepHtml).join('') + '</ol>';
     return '<article class="card card-work is-' + status + '">'
-      + '<header class="card-head"><span class="card-icon tone-amber">' + icon('spark') + '</span>'
-      + '<div class="card-title"><span class="card-kicker">AI WORK LOG</span><h3>' + esc(block.title || 'AI 正在工作') + '</h3></div>'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>' + esc(block.title || 'AI 正在工作') + '</h3></div>'
       + statusPill + '</header>'
       + '<div class="card-body">' + progressHtml + stepsHtml
       + codeBoxHtml(block.code_change)
@@ -1089,11 +1078,11 @@
         + esc(action.label || action.message) + '</button>';
     }).join('');
     var riskHtml = block.risk
-      ? '<div class="approval-risk">' + icon('shield') + '<span>' + esc(block.risk) + '</span></div>'
+      ? '<div class="approval-risk">'  + '<span>' + esc(block.risk) + '</span></div>'
       : '';
     return '<article class="card card-approval">'
-      + '<header class="card-head"><span class="card-icon tone-amber">' + icon('shield') + '</span>'
-      + '<div class="card-title"><span class="card-kicker">NEEDS YOUR APPROVAL</span><h3>' + esc(block.title || '需要你确认') + '</h3></div>'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>' + esc(block.title || '需要用户确认') + '</h3></div>'
       + '<span class="status-pill is-warn">等待确认</span></header>'
       + '<div class="card-body">'
       + (block.summary ? '<p class="card-summary">' + esc(block.summary) + '</p>' : '')
@@ -1156,8 +1145,8 @@
       }).join('') + '</ul>'
       : '';
     return '<article class="card card-version">'
-      + '<header class="card-head"><span class="card-icon tone-blue">' + icon('layers') + '</span>'
-      + '<div class="card-title"><span class="card-kicker">MODEL VERSION</span><h3>模型版本已更新</h3></div>'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>模型版本已更新</h3></div>'
       + '<span class="status-pill is-ok">已生效</span></header>'
       + '<div class="card-body">' + activeHtml + listHtml + '</div></article>';
   }
@@ -1252,7 +1241,7 @@
         syncWorkActivity(block);
         break;
       case 'approval':
-        pushActivity('approval-' + block.id, '等待你确认：' + (block.title || '待审批方案'), 'waiting', 'wait');
+        pushActivity('approval-' + block.id, '等待用户确认：' + (block.title || '待审批方案'), 'waiting', 'wait');
         break;
       case 'version': {
         if (block.active && typeof block.active === 'object') state.activeModel = normalizeModel(block.active);
@@ -1309,7 +1298,7 @@
 
   function renderProfileSection() {
     var profile = state.profile;
-    var head = '<header class="wb-head"><span class="wb-kicker">PROFILE</span><h2>当前画像</h2>'
+    var head = '<header class="wb-head"><h2>用户画像</h2>'
       + '<span class="status-pill ' + (profile && profile.confirmed ? 'is-ok' : 'is-warn') + '">'
       + (profile ? (profile.confirmed ? '已确认' : '完善中') : '未开始') + '</span></header>';
     if (!profile || (!profile.items.length && !profile.summary)) {
@@ -1324,7 +1313,7 @@
     dom.profile.innerHTML = head
       + '<div class="wb-profile-top"><div class="wb-ring" data-chart="ring"></div>'
       + '<div class="wb-profile-copy"><span class="wb-confirmed' + (profile.confirmed ? '' : ' is-pending') + '">'
-      + (profile.confirmed ? '已确认，可用于选股' : '等待你确认') + '</span>'
+      + (profile.confirmed ? '已确认，可用于选股' : '等待用户确认') + '</span>'
       + '<p class="wb-summary">' + esc(summary) + '</p></div></div>'
       + (items ? '<ul class="wb-items">' + items + '</ul>' : '');
     var ring = dom.profile.querySelector('[data-chart="ring"]');
@@ -1342,7 +1331,7 @@
   }
 
   function renderActivitySection() {
-    var head = '<header class="wb-head"><span class="wb-kicker">ACTIVITY</span><h2>AI 活动时间线</h2></header>';
+    var head = '<header class="wb-head"><h2>AI 活动时间线</h2></header>';
     if (!state.activity.length) {
       dom.activity.innerHTML = head + '<p class="wb-empty">AI 的每一步动作都会实时显示在这里。</p>';
       return;
@@ -1381,7 +1370,7 @@
   }
 
   function renderModelSection() {
-    var head = '<header class="wb-head"><span class="wb-kicker">MODEL</span><h2>当前模型与版本</h2></header>';
+    var head = '<header class="wb-head"><h2>当前模型与版本</h2></header>';
     var html = head;
     var model = state.activeModel;
     if (model) {
@@ -1391,7 +1380,7 @@
         + (chips ? '<div class="wb-chips">' + chips + '</div>' : '')
         + '<p class="wb-note">年化收益、夏普比率、最大回撤等均为历史回测数据，不代表未来实际表现，不构成投资建议。</p>';
     } else {
-      html += '<p class="wb-empty">还没有启用的自定义模型。跟 AI 说「帮我优化模型」，它会先给你方案，再等你确认。</p>';
+      html += '<p class="wb-empty">还没有启用的自定义模型。跟 AI 说帮我优化模型，它会先给你方案，再等你确认。</p>';
     }
     var versions = state.versions.slice(0, 6);
     if (versions.length) {
@@ -1412,7 +1401,7 @@
   }
 
   function renderResultSection() {
-    var head = '<header class="wb-head"><span class="wb-kicker">LAST SELECTION</span><h2>最近选股结果</h2></header>';
+    var head = '<header class="wb-head"><h2>最近选股结果</h2></header>';
     var selection = state.lastSelection;
     if (!selection || (!selection.top.length && !selection.hasMetrics)) {
       dom.result.innerHTML = head + '<p class="wb-empty">完成一次选股后，这里会显示最近的结果摘要和净值曲线。</p>';
@@ -1496,7 +1485,7 @@
     if (dom.clearInput) dom.clearInput.disabled = busy;
     dom.input.placeholder = busy
       ? 'AI 正在回复，可点击停止生成…'
-      : '输入投资问题或分析需求，例如：帮我看看现在适合什么模型……';
+      : '输入投资问题或分析需求，例如：我应该如何开始投资';
   }
 
   async function sendMessage(rawContent) {
@@ -1553,7 +1542,7 @@
       if (error && error.name === 'AbortError') {
         failed = false;
         stopped = true;
-        appendTextMessage('ai', '已停止生成。你可以修改问题后重新发送，或点击输入区的「重新生成」。', null);
+        appendTextMessage('ai', '已停止生成。你可以修改问题后重新发送，或点击输入区的重新生成。', null);
         pushActivity('turn', '已停止生成', 'error', 'alert');
       } else {
         showTurnError(turn, '网络异常', error && error.message ? error.message : '请检查后端服务后重试。', true);
@@ -1869,7 +1858,7 @@
       strategy: { kicker: 'STRATEGY', title: '策略分析', subtitle: '历史回测指标与因子暴露，说明当前策略风格。' },
       model: { kicker: 'MODEL', title: '模型管理', subtitle: '当前启用模型的版本、状态与历史回测指标。' },
       settings: { kicker: 'SETTINGS', title: '系统设置', subtitle: '演示版运行环境与数据说明。' },
-      help: { kicker: 'HELP', title: '帮助中心', subtitle: '如何用自然语言完成投资画像、选股与模型优化。' }
+      help: {  title: '帮助中心', subtitle: '如何用自然语言完成投资画像、选股与模型优化。' }
     }[kind] || { kicker: 'DETAILS', title: '详情', subtitle: '' };
     dom.infoKicker.textContent = meta.kicker;
     dom.infoTitle.textContent = meta.title;
@@ -1896,7 +1885,7 @@
     var selection = state.lastSelection;
     if (kind === 'portfolio') {
       if (!selection || (!selection.top.length && !selection.hasMetrics)) {
-        return '<p>还没有生成投资组合。回到「AI 投资顾问」对话，先确认投资画像，再让 AI 帮你选股。</p>';
+        return '<p>还没有生成投资组合。回到AI 投资顾问对话，先确认投资画像，再让 AI 帮你选股。</p>';
       }
       var top = selection.top.slice(0, 8);
       var table = top.length
@@ -1953,9 +1942,8 @@
     return '<h3>如何开始</h3><ul>'
       + '<li>在输入框用自然语言描述投资目标、期限和可接受回撤，AI 会逐步建立投资者画像。</li>'
       + '<li>画像确认后，可以让 AI 选股、解读结果或优化模型；重要操作会先请您审批。</li>'
-      + '<li>右侧「投资上下文」会同步显示画像、AI 活动、当前模型和最近结果。</li>'
+      + '<li>右侧投资上下文会同步显示画像、AI 活动、当前模型和最近结果。</li>'
       + '<li>顶栏可以打开历史记录，切换回之前的会话继续分析。</li>'
-      + '</ul>' + infoNote('AI 不会重复询问已确认的画像字段；所有收益与回撤指标均标注为历史回测数据。');
   }
 
   /* ============================== 事件绑定 ============================== */
