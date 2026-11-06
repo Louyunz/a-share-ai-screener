@@ -486,6 +486,7 @@ class AppService:
         steps: list[dict[str, Any]] = []
         tuning_state: dict[str, Any] = {"start": None, "history": [], "best": None,
                                         "started": time.time()}
+        work_extra: dict[str, Any] = {}
 
         def publish(status: str = "running", comparison: dict | None = None,
                     proposal: dict | None = None, extra: dict | None = None) -> dict[str, Any]:
@@ -496,6 +497,7 @@ class AppService:
                 "comparison": comparison or {},
                 "proposal": proposal or {},
             }
+            block.update(work_extra)
             if extra:
                 block.update(extra)
             return {"block": block}
@@ -658,6 +660,7 @@ class AppService:
                 steps[-1], status="done",
                 detail=(f"AI 重写的模型代码已写入：新增 {pre_code_change['added']} 行、"
                         f"删除 {pre_code_change['removed']} 行；接下来在代码框架内做参数寻优。"))
+            work_extra["code_change"] = pre_code_change
             yield "ui", publish(proposal=self._proposal_public(plan),
                                 extra={"code_change": pre_code_change})
 
@@ -937,7 +940,6 @@ class AppService:
             "title": "效果对比",
             "status": "done",
             "comparison": comparison,
-            "note": "历史回测数据，不代表未来实际表现；候选方案需您确认后才会启用。",
         }
         yield "ui", {"block": comparison_block}
 

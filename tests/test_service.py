@@ -184,6 +184,12 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue(works and approvals)
         self.assertTrue((works[-1].get("code_change") or {}).get("diff"),
                         "点名自定义模型时应生成代码改动")
+        first_code_index = next(
+            index for index, block in enumerate(works)
+            if (block.get("code_change") or {}).get("diff"))
+        for block in works[first_code_index:]:
+            self.assertTrue((block.get("code_change") or {}).get("diff"),
+                            "后续 work 更新不应丢失代码改动（否则前端会折叠代码窗口）")
         first_code = next(
             index for index, (event, data) in enumerate(events)
             if event == "ui"
