@@ -240,7 +240,7 @@ class OpenAICompatClient:
             "messages": [{"role": "system", "content": system}, *messages],
             "tools": tools,
             "tool_choice": tool_choice,
-            "temperature": 0.2,
+            "temperature": 0.4,
             "stream": True,
         }
         request = urllib.request.Request(
