@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 from backend.config import A_SHARE_DIR  # noqa: E402
 from backend.dev_server import ApiHandler  # noqa: E402
-from backend.llm import FakeLLM  # noqa: E402
+from tests.support.scripted_llm import ScriptedLLM  # noqa: E402
 from backend.service import AppService  # noqa: E402
 
 
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     work = ROOT / "tests" / "_tmp"
     work.mkdir(parents=True, exist_ok=True)
     db_path = work / f"e2e_chat_{int(time.time())}.db"
-    service = AppService(data_dir=Path(args.data_dir), db_path=db_path, llm=FakeLLM())
+    service = AppService(data_dir=Path(args.data_dir), db_path=db_path, llm=ScriptedLLM())
     ApiHandler.service = service
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
     port = httpd.server_address[1]

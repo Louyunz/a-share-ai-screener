@@ -19,7 +19,7 @@
 - 无构建链、无 CDN、纯 SVG 图表，保证比赛现场一键启动、弱网可演示。
 - SQLite 存会话/画像/模型版本/审计；`version` 表带 `session_id`，`session` 表带 `active_version_id`（SCHEMA_VERSION=5）。
 - 真实模型路径走 OpenAI 兼容接口；LLM 客户端自实现 `chat_tools`（复用现有 urllib 传输，未引入额外 SDK），支持一次工具参数修复与“无工具调用时的语义复核”。
-- FakeLLM 只作为结构测试替身；真实语义由 `scripts/semantic_eval.py` 语义矩阵验收（10 个意图用例，10/10 才发版）。
+- 生产包不含任何假模型；结构测试使用 `tests/support/scripted_llm.py`（仅测试目录）。真实语义由 `scripts/semantic_eval.py` 语义矩阵验收（10 个意图用例，10/10 才发版）。
 
 ## 合规与边界
 - AI 不承诺收益、不荐股、不说“稳赚”；回复有违禁词拦截，解读基于真实回测事实。

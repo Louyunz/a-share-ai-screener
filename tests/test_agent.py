@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Agent 规划与合规测试（FakeLLM / 脚本化 LLM，不联网）。"""
+"""Agent 规划与合规测试（ScriptedLLM / 脚本化 LLM，不联网）。"""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,8 @@ import unittest
 from backend.agent import (Agent, AgentError, ComplianceError, ensure_compliance,
                           has_mechanical_style, is_explanation_question,
                           strip_confirmation_tail, trim_duplicate_confirmation)
-from backend.llm import FakeLLM, ToolCall, ToolChatResult
+from backend.llm import ToolCall, ToolChatResult
+from tests.support.scripted_llm import ScriptedLLM
 from backend.schemas import profile_payload
 
 
@@ -145,7 +146,7 @@ class ConfirmationDedupTest(unittest.TestCase):
 
 class AgentPlanTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.agent = Agent(FakeLLM())
+        self.agent = Agent(ScriptedLLM())
 
     def test_ask_for_missing_slot(self) -> None:
         plan = self.agent.plan(_state({"goal": "养老"}), [], "我想为养老攒点钱")

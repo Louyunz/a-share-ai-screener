@@ -10,7 +10,7 @@ import unittest
 
 from backend.data.base import save_bundle
 from backend.data.sample import generate_bundle
-from backend.llm import FakeLLM
+from tests.support.scripted_llm import ScriptedLLM
 from backend.models import registry
 from backend.schemas import Plan, profile_summary
 from backend.service import AppService
@@ -38,7 +38,7 @@ class ChatFlowTest(unittest.TestCase):
         cls.dir = workdir("chatflow")
         save_bundle(generate_bundle(n_stocks=30, n_days=360, seed=7), cls.dir / "a_share")
         cls.service = AppService(data_dir=cls.dir / "a_share", db_path=cls.dir / "app.db",
-                                 llm=FakeLLM())
+                                 llm=ScriptedLLM())
         cls.sid = cls.service.create_session()["session_id"]
 
     @classmethod
@@ -234,7 +234,7 @@ class ChatFlowTest(unittest.TestCase):
         try:
             save_bundle(generate_bundle(n_stocks=10, n_days=220, seed=3), local / "a_share")
             service = AppService(data_dir=local / "a_share", db_path=local / "app.db",
-                                 llm=FakeLLM())
+                                 llm=ScriptedLLM())
             sid = service.create_session()["session_id"]
             list(service.chat_stream(sid, "可以，就按这个来"))
             profile = service.store.get_profile(sid)
@@ -251,7 +251,7 @@ class SessionModelScopeTest(unittest.TestCase):
         self.dir = workdir("session_scope")
         save_bundle(generate_bundle(n_stocks=20, n_days=300, seed=5), self.dir / "a_share")
         self.service = AppService(data_dir=self.dir / "a_share", db_path=self.dir / "app.db",
-                                  llm=FakeLLM())
+                                  llm=ScriptedLLM())
         self.first = self.service.create_session()["session_id"]
         self.second = self.service.create_session()["session_id"]
 
@@ -317,7 +317,7 @@ class WeightTuningTest(unittest.TestCase):
         self.dir = workdir("weight_tuning")
         save_bundle(generate_bundle(n_stocks=25, n_days=320, seed=11), self.dir / "a_share")
         self.service = AppService(data_dir=self.dir / "a_share", db_path=self.dir / "app.db",
-                                  llm=FakeLLM())
+                                  llm=ScriptedLLM())
         self.sid = self.service.create_session()["session_id"]
         self.service.store.save_profile(self.sid, PROFILE_SLOTS,
                                         profile_summary(PROFILE_SLOTS), True)

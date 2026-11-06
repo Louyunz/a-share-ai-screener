@@ -11,7 +11,7 @@ from http.server import ThreadingHTTPServer
 from backend.data.base import save_bundle
 from backend.data.sample import generate_bundle
 from backend.dev_server import ApiHandler
-from backend.llm import FakeLLM
+from tests.support.scripted_llm import ScriptedLLM
 from backend.service import AppService
 from tests import cleanup, workdir
 
@@ -39,7 +39,7 @@ class DevServerTest(unittest.TestCase):
         cls.dir = workdir("devserver")
         save_bundle(generate_bundle(n_stocks=12, n_days=240, seed=11), cls.dir / "a_share")
         cls.service = AppService(data_dir=cls.dir / "a_share", db_path=cls.dir / "app.db",
-                                 llm=FakeLLM())
+                                 llm=ScriptedLLM())
         ApiHandler.service = cls.service
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
         cls.port = cls.httpd.server_address[1]

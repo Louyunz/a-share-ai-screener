@@ -126,7 +126,7 @@ node --check frontend/app.js
 node --check frontend/charts.js
 ```
 
-结构 E2E（FakeLLM，无需 Key）：
+结构 E2E（tests/support 的 ScriptedLLM，无需 Key；生产包不含任何假模型）：
 
 ```powershell
 python scripts\e2e_smoke.py

@@ -13,7 +13,7 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
-from backend.llm import FakeLLM
+from tests.support.scripted_llm import ScriptedLLM
 from backend.models import (
     DEFAULT_MODEL_ID,
     MODEL_TYPES,
@@ -775,7 +775,7 @@ class TuningPlanTests(unittest.TestCase):
     # build_tuning_plan
     # ------------------------------------------------------------------
     def test_fake_llm_tuning_plan_matches_contract(self) -> None:
-        raw = FakeLLM().chat_json(
+        raw = ScriptedLLM().chat_json(
             TUNING_SYSTEM,
             [{"role": "user", "content": json.dumps({"tuning_request": True})}],
         )
@@ -792,7 +792,7 @@ class TuningPlanTests(unittest.TestCase):
         self.assertIn("tilt", plan["param_space"])
 
     def test_build_tuning_plan_with_fake_llm(self) -> None:
-        plan = build_tuning_plan(FakeLLM(), self._state())
+        plan = build_tuning_plan(ScriptedLLM(), self._state())
         self.assertEqual(plan["approach"], "code")
         self.assertEqual(plan["max_trials"], 12)
         self.assertEqual(plan["objective"], "sharpe")
@@ -837,7 +837,7 @@ class TuningPlanTests(unittest.TestCase):
 
     def test_build_tuning_plan_rejects_non_mapping_state(self) -> None:
         with self.assertRaises(ModelValidationError):
-            build_tuning_plan(FakeLLM(), ["not", "a", "dict"])  # type: ignore[arg-type]
+            build_tuning_plan(ScriptedLLM(), ["not", "a", "dict"])  # type: ignore[arg-type]
 
     def test_build_tuning_plan_invalid_state_weights(self) -> None:
         state = self._state()
@@ -848,7 +848,7 @@ class TuningPlanTests(unittest.TestCase):
         self.assertEqual(llm.calls, [])
 
     def test_fake_llm_planner_behavior_unchanged(self) -> None:
-        plan = FakeLLM().chat_json(
+        plan = ScriptedLLM().chat_json(
             "planner",
             [
                 {
