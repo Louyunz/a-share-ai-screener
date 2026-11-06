@@ -1,12 +1,18 @@
-# 重置演示状态：清空 SQLite（会话/画像/版本/审计）但保留 A 股数据缓存
-# 用法： .\scripts\demo_reset.ps1
+# Reset demo state: clear SQLite (sessions/profiles/versions/audit) but keep A-share cache.
+# Usage: .\scripts\demo_reset.ps1
+# Stop the server before running this script.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$db = Join-Path $root "data\app.db"
-$wal = Join-Path $root "data\app.db-wal"
-$shm = Join-Path $root "data\app.db-shm"
-foreach ($f in @($db, $wal, $shm)) {
-    if (Test-Path $f) { Remove-Item $f -Force; Write-Host "[demo_reset] 已删除 $f" }
+$files = @(
+    (Join-Path $root "data\app.db"),
+    (Join-Path $root "data\app.db-wal"),
+    (Join-Path $root "data\app.db-shm")
+)
+foreach ($file in $files) {
+    if (Test-Path $file) {
+        Remove-Item $file -Force
+        Write-Host "[demo_reset] removed $file"
+    }
 }
-Write-Host "[demo_reset] 完成：下次启动服务将创建干净的 SQLite。"
-Write-Host "[demo_reset] 如需重建数据缓存： .\scripts\build_cache.ps1 -Source sample"
+Write-Host "[demo_reset] done: next server start creates a clean SQLite database."
+Write-Host "[demo_reset] rebuild cache if needed: .\scripts\build_cache.ps1 -Source sample"
