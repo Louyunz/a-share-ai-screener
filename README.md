@@ -1,4 +1,4 @@
-﻿# 智投罗盘 · AI 选股助手（MVP）
+# 智投罗盘 · AI 选股助手（MVP）
 
 一个「只用一个聊天框」完成全部操作的 A 股 AI 选股应用：AI 先像朋友一样了解你，再自动完成选股、解读，并能自己分析模型、生成/修改选股代码、回测对比，最后等你点头后才启用。
 
@@ -81,8 +81,9 @@ AI 工作时，背景流体自动加速、提高饱和度：
 ## 视觉与交互设计
 
 - **浅色 Apple 风格**：Apple 系统字体栈、浅灰白背景、大圆角、留白与克制的蓝色主色；页面内不使用深色背景。
-- **动态流体背景**：Canvas 2D 柔和色团持续流动；AI 处理请求时（`body.ai-working`）速度倍率从 1 平滑升到约 3，回复结束后回落。
-- **毛玻璃卡片**：卡片、顶栏、聊天气泡、输入区使用 `backdrop-filter: blur(...) saturate(...)` 与半透明白色渐变，和背后的流体、其他元素产生透光/模糊的光学关系；指针经过卡片会移动高光位置。
+- **动态流体背景**：Canvas 2D 柔和色团持续流动；AI 处理请求时（`body.ai-working`）速度倍率从 1 平滑升到约 3.6，模糊度降低、饱和度升高，顶栏同时出现「AI 正在工作 · 流体加速」提示，回复结束后回落。
+- **沉浸光感卡片**：对话卡片使用真实 `backdrop-filter` 磨砂（blur + saturation + brightness）、层次渐变描边、环境光晕与内层高光；指针经过时，镜面边缘光（Fresnel rim）与内部高光跟随指针移动（由 `--glass-x/--glass-y` 驱动），并根据卡片类型（选股/优化/审批/画像）呈现蓝、紫、暖橙等不同氛围光。
+- **光学与无障碍细节**：内容自适应透明度（浅色背景更通透）、柔和彩色投影；支持 `prefers-reduced-motion`（关闭动画）与 `prefers-reduced-transparency`（退化为实色磨砂面板）。
 - **绿色使用纪律**：绿色仅用于负向数据（股票/组合下跌、最大回撤等），上涨与正收益使用红系；成功、进行中、普通状态全部使用蓝色或中性灰，避免把绿色当装饰色。
 - **新对话与历史归档**：顶栏「新对话」创建会话；「历史对话」打开归档，可切换回任意历史会话并恢复聊天卡片与代码框。
 
@@ -116,7 +117,7 @@ backend/
   engine/            A 股 10 因子、筛选/组合、T+1/涨跌停/停牌/成本回测
   models/            内置模型类型、AI 代码安全校验与编译、提案流水线
 frontend/
-  index.html / app.js / style.css / charts.js
+  index.html / app.js / style.css / charts.js / fluid.js
 tests/               95+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
 scripts/             构建缓存、启动、重置、全量测试、E2E 冒烟
 docs/                接口契约、运行手册、设计摘要、界面截图
@@ -141,3 +142,9 @@ $node --check frontend/app.js; $node --check frontend/charts.js
 - 高净值客户 KYC 与沟通技巧：[《高净值客户深度 KYC 及沟通技巧》](https://m.jiangshi99.com/course/content/185767.html)
 - 证券投资顾问业务与适当性管理要求：[证券投资顾问业务暂行规定](https://www.10jqka.com.cn)
 - 财富管理路演支持话术参考：[FinClaw bank wealth-management skill](https://github.com/aifinlab/finclaw/blob/main/skills/bank-t191-wealth-management-roadshow-support-assistant/SKILL.md)
+
+## 视觉设计参考
+
+- 沉浸光感材质（华为开发者问答）：[沉浸光感材质在卡片中如何使用](https://developer.huawei.com/consumer/cn/forum/topic/0207211216415627050?fid=0109140870620153026)、[接入沉浸光感后如何增强效果](https://developer.huawei.com/consumer/cn/forum/topic/0202219337594255098?fid=0101587865002800104)
+- Apple Liquid Glass 设计语言：[Apple 新软件设计新闻稿](https://www.apple.com.cn/newsroom/2025/06/apple-introduces-a-delightful-and-elegant-new-software-design/)、[WWDC25 Liquid Glass 介绍](https://developer.apple.com/la/videos/play/wwdc2025/219/)
+- 玻璃材质的光学实现参考（磨砂、镜面高光锐度、内容自适应强度、无障碍回退）：[liquid_glass_widgets 文档](https://pub.dev/packages/liquid_glass_widgets/versions/0.17.1)

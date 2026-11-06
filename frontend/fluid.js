@@ -36,8 +36,8 @@
         x: Math.random(),
         y: Math.random(),
         radius: 0.28 + Math.random() * 0.24,
-        vx: (Math.random() - 0.5) * 0.00045,
-        vy: (Math.random() - 0.5) * 0.00045,
+        vx: (Math.random() - 0.5) * 0.0018,
+        vy: (Math.random() - 0.5) * 0.0018,
         phase: Math.random() * Math.PI * 2,
         palette: palette
       });
@@ -85,7 +85,7 @@
       }
       var cx = px * width;
       var cy = py * height;
-      var radius = blob.radius * minSide * (1 + Math.sin(blob.phase * 0.7) * 0.06);
+      var radius = blob.radius * minSide * (1 + Math.sin(blob.phase * 0.7) * 0.10);
       var gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
       var rgb = blob.palette.color;
       gradient.addColorStop(0, 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + blob.palette.alpha * (0.82 + energy * 0.08) + ')');
@@ -109,7 +109,7 @@
   }
 
   function readWorkingState() {
-    targetEnergy = document.body.classList.contains('ai-working') ? 3.1 : 1;
+    targetEnergy = document.body.classList.contains('ai-working') ? 3.6 : 1;
   }
 
   function start() {

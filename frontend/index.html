@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B1220">
   <meta name="description" content="智投罗盘 · AI 选股助手：在一个对话框里完成投资画像、因子选股、结果解读与模型优化。">
   <title>智投罗盘 · AI 选股助手</title>
-  <link rel="stylesheet" href="style.css?v=5">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
 <body>
   <!-- 内联图标库：无字体、无 CDN、无第三方资源 -->
@@ -55,6 +55,7 @@
       <button class="topbar-btn" id="history-btn" type="button" title="历史对话归档">
         <svg class="icon"><use href="#i-history"></use></svg><span>历史对话</span>
       </button>
+      <span class="ai-state-chip" id="ai-state-chip"><i></i><span>AI 正在工作 · 流体加速</span></span>
       <div class="health-pill" id="health-pill" title="后端与数据服务状态">
         <span class="health-dot is-loading" id="health-dot"></span>
         <span id="health-text">连接中</span>
@@ -69,18 +70,6 @@
 
   <main class="workspace" id="workspace">
     <section class="chat-panel" aria-label="AI 对话">
-      <header class="chat-head">
-        <span class="agent-avatar" aria-hidden="true">
-          <svg class="icon"><use href="#i-spark"></use></svg>
-          <i class="avatar-ping"></i>
-        </span>
-        <div class="agent-copy">
-          <h1>AI 选股助手</h1>
-          <p><i class="live-dot"></i>画像、选股、解读、模型优化，都在这个对话框里完成</p>
-        </div>
-        <span class="model-chip" id="chat-model-chip">AI · —</span>
-      </header>
-
       <div class="chat-scroll" id="chat-scroll">
         <div class="chat-stream" id="chat-stream" aria-live="polite" aria-relevant="additions">
           <div class="chat-loading"><span class="spinner"></span>正在连接 AI 助手…</div>
@@ -157,8 +146,8 @@
     <span class="footer-meta" id="footer-meta">数据加载中…</span>
   </footer>
 
-  <script src="fluid.js?v=5"></script>
-  <script src="charts.js?v=5"></script>
-  <script src="app.js?v=5"></script>
+  <script src="fluid.js?v=6"></script>
+  <script src="charts.js?v=6"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>
