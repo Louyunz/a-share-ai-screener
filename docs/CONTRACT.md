@@ -5,7 +5,7 @@
 ## 0. 环境
 
 - 项目根：`C:\Users\77578\Documents\deepseek-harness\default-workspace\a-share-ai-screener`
-- Python：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（已装 fastapi/uvicorn；无 akshare/tushare）
+- Python：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（已装 fastapi/uvicorn/akshare/tushare；sklearn 用于 AI 自定义模型；token 通过项目根目录 .env 注入，不入库）
 - Node：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe`
 - git 由 Lead 统一提交；子任务不要执行 git，不要改自己写作用域之外的文件。
 
@@ -16,6 +16,13 @@
 3. **普通用户语言**：AI 不用专业术语提问；必须把“回撤、夏普、因子”等翻译成生活化解释；一次只问一个问题；先共情再提问。
 4. **AI 真正参与建模**：AI 可以切换内置模型类型、调整参数、生成/修改选股模型源码（受静态检查与冒烟测试约束），并用回测结果向用户解释为什么更好。
 5. **AI 工作过程可见**：优化过程中，前端实时展示 AI 的步骤（分析→提出方案→改代码→检查→回测→对比→等待确认），步骤由后端真实动作产生，不伪造。
+
+## 1.1 数据源（真实数据）
+
+- Tushare token 通过 `.env` 的 `TUSHARE_TOKEN` 注入；`.env` 已 gitignore，不提交。
+- `python -m backend.data.build_cache --source tushare --limit 30 --start 2022-01-01` 生成 `data/a_share/` 缓存；服务运行期只读缓存。
+- 低积分 token 的 `index_weight` / `fina_indicator` / `daily_basic` / `index_daily` 可能无权限或限频；适配器首次失败后不再重复请求，并降级为：核心 A 股标的池、真实日线行情、等权基准，缺失财务因子在打分时按 0 处理。额度恢复后重新 build 即自动补齐。
+- 当前缓存：29 只核心 A 股，2022-01-04 ~ 2026-11-05，`meta.source=tushare`。
 
 ## 2. 后端 API（精简）
 

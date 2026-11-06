@@ -4,7 +4,7 @@
 
 - 前端：原生 JS + 纯 SVG 图表，无构建链、无 CDN；**Professional Financial SaaS** 三栏布局（左侧导航 / 中间 AI 对话工作区 / 右侧投资上下文）
 - 后端：FastAPI（单进程同时托管页面与 API）+ SQLite + pandas
-- 数据：AkShare 为主、Tushare 为辅；离线缓存自动选择 parquet/CSV；无网络时可用内置示例数据
+- 数据：支持 AkShare / Tushare 真实行情；已接入 Tushare 缓存（当前 29 只核心 A 股，真实日线覆盖 2022-01-04 至 2026-11-05），离线缓存自动选择 parquet/CSV
 - 模型：10 因子选股引擎 + 5 种内置模型类型 + AI 按需生成 sklearn 自定义模型 + AI 生成自定义打分代码（AST 白名单 + 子进程冒烟 + 回测验证）
 
 ## 它怎么工作
@@ -45,13 +45,19 @@ $env:LLM_MODEL = "deepseek-chat"
 & $py -m uvicorn backend.main:app --port 8000
 ```
 
-真实 A 股数据：
+真实 A 股数据（推荐把 Token 放在项目根目录 `.env`，该文件已被 gitignore，不会入库）：
 
 ```powershell
-& $py -m backend.data.build_cache --source akshare --limit 300
-# 或 Tushare（需要 TUSHARE_TOKEN）
-& $py -m backend.data.build_cache --source tushare --limit 300
+# .env
+# TUSHARE_TOKEN=你的 token
+# SOURCE=tushare
+# UNIVERSE=csi800
+
+# 拉取真实行情并写入 data/a_share 缓存；重启服务后生效
+& $py -m backend.data.build_cache --source tushare --limit 30 --start 2022-01-01
 ```
+
+说明：低积分 Tushare token 可能没有 `index_weight`、`fina_indicator`、`daily_basic` 或 `index_daily` 权限/额度。适配器会自动降级：用核心 A 股标的池、真实日线行情和等权基准，缺失的财务因子按 0 处理；额度恢复后重新 build 即可自动补齐。服务运行期只读缓存，不联网。
 
 ## 界面
 

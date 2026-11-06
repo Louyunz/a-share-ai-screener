@@ -29,6 +29,8 @@ Thumbs.db
 # 测试临时目录
 tests/_tmp/
 
-# 临时
+# 本地密钥与临时文件
+.env
+.env.*
 *.log
 _tmp/

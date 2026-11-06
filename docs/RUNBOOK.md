@@ -32,13 +32,21 @@ $env:LLM_MODEL = "deepseek-chat"
 
 ## 3. 使用真实 A 股数据
 
+推荐把 token 写入项目根目录 `.env`（已 gitignore）：
+
 ```powershell
-& $py -m backend.data.build_cache --source akshare --limit 300
-# 或（需要 TUSHARE_TOKEN）
-& $py -m backend.data.build_cache --source tushare --limit 300
+# .env
+# TUSHARE_TOKEN=...
+# SOURCE=tushare
+# UNIVERSE=csi800
 ```
 
-服务运行期只读 `data/a_share/` 缓存，不访问网络。历史数据仅用于回测演示，不构成投资建议。
+```powershell
+& $py -m backend.data.build_cache --source tushare --limit 30 --start 2022-01-01
+# 重启服务以加载新缓存
+```
+
+当前真实缓存：29 只核心 A 股 × 1171 个交易日（2022-01-04 至 2026-11-05）。若 token 额度较低，`index_weight/fina_indicator/daily_basic/index_daily` 会降级：使用核心标的池、真实日线、等权基准，财务质量因子缺失；额度恢复后重新 build 即自动补齐。服务运行期只读 `data/a_share/` 缓存，不访问网络。历史数据仅用于回测演示，不构成投资建议。
 
 ## 4. 常见问题
 

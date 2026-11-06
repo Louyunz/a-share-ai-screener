@@ -10,6 +10,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = ROOT / "frontend"
+
+
+def load_dotenv(path: Path | None = None) -> None:
+    """极简 .env 读取：仅支持 KEY=VALUE 与 # 注释，不覆盖已有环境变量。"""
+    env_path = path or (ROOT / ".env")
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv()
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
 A_SHARE_DIR = DATA_DIR / "a_share"
 DB_PATH = DATA_DIR / "app.db"
@@ -32,24 +51,6 @@ COST_SELL = float(os.environ.get("COST_SELL", "0.0013"))
 
 # 演示账户（单用户）
 DEMO_USER = "demo"
-
-
-def load_dotenv(path: Path | None = None) -> None:
-    """极简 .env 读取：仅支持 KEY=VALUE 与 # 注释，不覆盖已有环境变量。"""
-    env_path = path or (ROOT / ".env")
-    if not env_path.exists():
-        return
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key, value = key.strip(), value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-load_dotenv()
 
 
 def llm_api_key() -> str:
