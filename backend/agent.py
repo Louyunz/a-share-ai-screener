@@ -43,10 +43,6 @@ CONFIRM_PROFILE_HINT = (
     "需要您确认：以上画像信息是否准确？如无补充，请回复「确认」，"
     "我将按该画像为您筛选标的；如需调整，请直接告知。"
 )
-CONFIRM_PENDING_HINT = (
-    "需要您确认：是否启用该模型改进方案？请回复「同意启用」应用该方案，"
-    "或回复「先不启用」保留现有模型。"
-)
 CONFIRMATION_MARKERS = (
     "需要您确认",
     "请您确认",
@@ -100,8 +96,9 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 ## 确认协议
 凡需要客户决定，必须使用明确、可回复的句式，禁止用“要不要”“可以吗”这类模糊问法：
 - 画像待确认：“需要您确认：以上画像信息是否准确？如无补充，请回复「确认」，我将按该画像为您筛选标的；如需调整，请直接告知。”
-- 模型方案待审批：“需要您确认：是否启用该模型改进方案？请回复「同意启用」应用该方案，或回复「先不启用」保留现有模型。”
+- 模型方案待审批：结合本次回测结果自然说明，请客户决定是否启用；不要使用固定模板，也不要与其他提问叠加。
 - 动作未执行前不得声称已完成。
+- 同一轮只能提出一个需要客户回答的问题：如果本轮在询问优化方向/其他信息，不得再附加“是否启用上一版方案”的确认；如果认为候选不宜启用，不要把“继续优化”的提问和“是否启用”的确认放在同一段。
 
 ## 可执行动作（actions 数组；不需要动作时输出空数组）
 - confirm_profile：客户本轮明确同意画像时使用（“可以/确认/没问题/就按这个来”），且必填齐全。
@@ -258,15 +255,19 @@ def trim_duplicate_confirmation(text: str) -> str:
 
 
 def confirmation_hint(state: dict[str, Any], plan: Plan) -> str:
-    """需要客户确认但计划里没有动作时，返回服务端标准确认话术。"""
-    if plan.actions:
+    """需要客户确认但计划里没有动作时，返回服务端标准确认话术。
+
+    同一轮只允许一个问题：如果本轮已经提出澄清问题或记录待执行意图，
+    不得再追加上一版候选方案的启用确认，避免双重提问。
+    """
+    if plan.actions or plan.deferred_intent:
+        return ""
+    if asks_clarifying_question(plan.reply):
         return ""
     profile = state.get("profile") or {}
     if profile.get("complete") and not profile.get("confirmed"):
         return CONFIRM_PROFILE_HINT
-    if state.get("pending"):
-        return CONFIRM_PENDING_HINT
-    return ""
+        return ""
 
 
 def attach_confirmation(reply: str, hint: str) -> str:

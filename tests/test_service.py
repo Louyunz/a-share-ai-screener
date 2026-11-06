@@ -81,8 +81,8 @@ class ChatFlowTest(unittest.TestCase):
         self.assertGreater(diff_lengths[-1], diff_lengths[0])
         self.assertGreaterEqual(len(set(diff_lengths)), 3, "代码 diff 应逐行增长而不是一次性出现")
         self.assertTrue(approvals)
-        self.assertTrue("需要您确认" in text or "继续优化" in text)
-        self.assertLessEqual(text.count("需要您确认"), 1, "确认话术不应重复出现")
+        self.assertNotIn("需要您确认：是否启用该模型改进方案", text,
+                         "服务端不应再追加上一版固定审批兜底话术")
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
         history = self.service.messages(self.sid)["messages"]
         persisted = [block for message in history for block in (message.get("blocks") or [])]

@@ -13,8 +13,8 @@ from typing import Any, Iterator
 
 import pandas as pd
 
-from .agent import (Agent, AgentError, CONFIRM_PENDING_HINT, CONFIRM_PROFILE_HINT,
-                     chunk_text, has_confirmation_request, safe_question,
+from .agent import (Agent, AgentError, CONFIRM_PROFILE_HINT,
+                     asks_clarifying_question, chunk_text, has_confirmation_request, safe_question,
                      strip_confirmation_tail, trim_duplicate_confirmation)
 from .config import (
     A_SHARE_DIR,
@@ -271,7 +271,6 @@ class AppService:
         # 2) 流式回复（去掉模型自行重复的确认段落）
         plan.reply = trim_duplicate_confirmation(plan.reply)
         notes: list[str] = []
-        pending_before = bool(public_state.get("pending"))
         try:
             for piece in chunk_text(plan.reply):
                 yield "token", {"text": piece}
@@ -282,7 +281,9 @@ class AppService:
                     if isinstance(block, dict) and block.get("id"):
                         saved_blocks[str(block["id"])] = block
                 if note:
-                    if has_confirmation_request(plan.reply) and has_confirmation_request(note):
+                    if has_confirmation_request(note) and (
+                            has_confirmation_request(plan.reply)
+                            or asks_clarifying_question(plan.reply)):
                         note = strip_confirmation_tail(note).strip()
                     if note:
                         notes.append(note)
@@ -291,19 +292,6 @@ class AppService:
                             yield "token", {"text": piece}
                 if should_stop:
                     break
-            # 有待审批方案但没有处理时，明确提醒用户做决定
-            if (pending_before and not plan.has_action("apply_pending_change")
-                    and not plan.has_action("analyze_model")
-                    and self.store.get_state(session_id).get("pending")):
-                hint = CONFIRM_PENDING_HINT
-                notes_have_confirmation = any(has_confirmation_request(item) for item in notes)
-                if (hint not in notes and hint not in plan.reply
-                        and not has_confirmation_request(plan.reply)
-                        and not notes_have_confirmation):
-                    yield "token", {"text": "\n\n"}
-                    for piece in chunk_text(hint):
-                        yield "token", {"text": piece}
-                    notes.append(hint)
         except (ServiceError, AgentError, ValidationError) as exc:
             self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
             yield "error", {"message": str(exc), "retryable": False}
@@ -619,7 +607,7 @@ class AppService:
             "actions": approval_actions,
         }
         yield "ui", {"block": approval}
-        note_text = "需要您确认：新的模型方案已完成回测。是否启用？"
+        note_text = ""
         if not expectation_met:
             note_text = ("候选方案未达到您的目标：" + expectation_reason
                          + " 您可以先不启用，或回复「继续优化」让我换一种模型方向再试。")

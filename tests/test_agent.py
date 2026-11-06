@@ -165,15 +165,15 @@ class AgentPlanTest(unittest.TestCase):
         plan = self.agent.plan(state, [], "回撤小一点更重要")
         self.assertIn("analyze_model", plan.action_names())
 
-    def test_pending_confirmation_hint_is_explicit(self) -> None:
+    def test_pending_proposal_does_not_get_standard_confirmation(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
                  "loss_reaction": "会有点慌，但先不卖"}
         plan = self.agent.plan(_state(slots, confirmed=True,
-                                      pending={"summary": "换低波模型"}),
+                                     pending={"summary": "换低波模型"}),
                                [], "今天市场怎么样")
         self.assertEqual(plan.actions, [])
-        self.assertIn("需要您确认", plan.reply)
-        self.assertIn("同意启用", plan.reply)
+        self.assertNotIn("需要您确认：是否启用该模型改进方案", plan.reply)
+        self.assertNotIn("请回复「同意启用」", plan.reply)
 
     def test_optimize_requires_confirmed_profile(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
