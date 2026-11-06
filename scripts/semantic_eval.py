@@ -64,6 +64,16 @@ CASES: list[dict[str, Any]] = [
         "check": lambda action, reply: action is not None and action["args"]["engine"] == "code",
     },
     {
+        "name": "换其他模型 → model_type 自动选择",
+        "message": "换成其他模型",
+        "check": lambda action, reply: (
+            action is not None
+            and action["args"]["engine"] == "model_type"
+            and action["args"]["model_type"] == ""
+            and not action["args"]["escalate"]
+        ),
+    },
+    {
         "name": "换成低波质量 → model_type",
         "message": "换成低波质量模型",
         "check": lambda action, reply: (

@@ -142,9 +142,11 @@ Planner 每轮输出：
 | `confirm_profile` | `{}` | 画像必填齐全且用户本轮明确确认 | 写入 confirmed，返回 profile 卡 |
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
-| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 按 engine 执行调参方案 → 服务端网格寻优（实时 tuning 卡）→ 改动 diff → 回测 → work/tuning/approval 卡，**不自动启用** |
+| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | `engine=model_type` 时切换内置模型并使用其预设权重（不寻优）；其他 engine 执行调参方案 → 服务端网格寻优（实时 tuning 卡）→ 改动 diff → 回测 → work/tuning/approval 卡，**不自动启用** |
 | `apply_pending_change` | `{}` | 存在待审批方案且用户本轮明确同意 | 当前会话启用新模型版本，返回 version 卡 |
 | `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
+
+**换模型与调参分离**：客户说“换其他模型/换个模型”但未点名时，AI 调用 `analyze_model(engine="model_type", model_type="", escalate=false)`；服务端选择与当前不同的内置模型，**直接使用预设权重回测**，不跑网格寻优。只有“继续优化/上一版未达预期”才 `escalate=true` 进入结构性升级或参数寻优。
 
 **`analyze_model` 参数语义**（由 AI 判断，服务端只做确定性策略）：
 - `engine`: `auto`（普通优化，由 pipeline 决定） / `weights`（只调因子权重） / `model_type`（点名内置模型） / `code`（构建或更换新的数学模型/打分引擎）

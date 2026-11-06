@@ -13,6 +13,8 @@
 - 生成的代码必须通过：长度/语法检查 → AST 白名单（math/numpy/pandas/sklearn/scipy，禁止文件/网络/系统调用/动态执行/下划线属性）→ 子进程冒烟（10s 超时）→ 全区间回测；调参方案校验失败自动修复最多 2 次。
 - 任何模型变更都生成候选，用户同意后才在当前会话激活；会话各自保留版本链，聊天一句话即可回滚。
 - **会话级模型**：模型只在被启用的会话内生效，新对话自动回到默认均衡多因子；`session.active_version_id` 是唯一模型状态源，`session_state` 不再保存 active_model/metrics/version_id。
+- **换模型与调参分离**：客户明确说“换其他模型”时，AI 调 `analyze_model(engine="model_type")`，服务端切换内置模型并直接使用预设权重回测，不跑网格寻优；只有“继续优化/上一版未达预期”才进入结构性升级或参数寻优。
+- **主动推进**：模型只调工具、content 为空时，服务端用第二轮上下文生成（携带本轮 tool_calls 与更新后的画像）产出回复：画像缺项就问下一个缺失项，齐全就问确认，执行动作就说明进展，避免固定“已收到执行”套话。
 
 ## 技术取舍
 - 轻量前后端分离：FastAPI 单进程同时托管静态页面与 API；聊天用 `fetch + ReadableStream` 解析 SSE（POST 不能使用 EventSource）。
@@ -20,7 +22,7 @@
 - 无构建链、无 CDN、纯 SVG 图表，保证比赛现场一键启动、弱网可演示。
 - SQLite 存会话/画像/模型版本/审计；`version` 表带 `session_id`，`session` 表带 `active_version_id`（SCHEMA_VERSION=5）。
 - 真实模型路径走 OpenAI 兼容接口；LLM 客户端自实现 `chat_tools` / `chat_tools_stream`（复用现有 urllib 传输，未引入额外 SDK），支持一次工具参数修复与“无工具调用时的语义复核”。
-- 生产包不含任何假模型；结构测试使用 `tests/support/scripted_llm.py`（仅测试目录）。真实语义由 `scripts/semantic_eval.py` 语义矩阵验收（10 个意图用例，10/10 才发版）。
+- 生产包不含任何假模型；结构测试使用 `tests/support/scripted_llm.py`（仅测试目录）。真实语义由 `scripts/semantic_eval.py` 语义矩阵验收（11 个意图用例，11/11 才发版）。
 
 ## 合规与边界
 - AI 不承诺收益、不荐股、不说“稳赚”；回复有违禁词拦截，解读基于真实回测事实。

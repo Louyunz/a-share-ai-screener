@@ -13,7 +13,7 @@ from typing import Any, Iterator
 
 from .chat.action_schema import TOOL_DEFINITIONS, ToolArgsError, validate_tool_call
 from .llm import LLMClient, LLMError, ToolChatResult
-from .schemas import Plan, SLOT_DEFS
+from .schemas import Plan, SLOT_DEFS, profile_payload
 
 BANNED_WORDS = ("稳赚", "必涨", "保证收益", "推荐买入", "满仓干", "包赚", "翻倍牛股")
 
@@ -76,6 +76,8 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - 客户本轮明确同意画像时调用 confirm_profile；开始选股调用 run_selection；追问结果调用 explain_results；明确同意启用方案调用 apply_pending_change；明确要求回滚调用 rollback_version。
 - analyze_model 必须明确 engine/model_type/objective/escalate：构建/更换新的数学模型、打分模型、引擎或公式 → engine="code"；点名内置模型 → engine="model_type" 并填 model_type；点名 SVM/随机森林等清单外模型 → engine="code"；继续优化/上一版未达预期 → escalate=true；普通优化 → engine="auto"。
 - 客户说“继续优化/上一版未达到预期/再试一版”时，必须直接调用 analyze_model(engine="auto", escalate=true)，不得反问“哪里不满意/先确认方向”。
+- 客户只泛称“换其他模型/换个模型/其他模型”而没有点名具体模型时，调用 analyze_model(engine="model_type", model_type="", escalate=false)，由服务端选择与当前不同的内置模型；不要用 engine="code"，也不要当成继续优化。
+- escalate=true 只用于“继续优化/上一版未达到预期/再试一版”；存在待审批方案本身不代表要升级。
 - 客户说“回滚到上一个版本/恢复上一版模型”时，必须直接调用 rollback_version，不得反问确认。
 - 客户确认画像且必填齐全时，必须同时调用 confirm_profile 与 run_selection。
 - 客户要求“更换/构建数学模型”时不要反问“想换成哪种模型”，不要声称没有权限写代码。
@@ -83,6 +85,7 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 ## 工具调用示例（参数只写关键字段）
 - “更换数学模型” → analyze_model(engine="code")
 - “换成低波质量” → analyze_model(engine="model_type", model_type="low_vol_quality")
+- “换其他模型/换个模型” → analyze_model(engine="model_type", model_type="", escalate=false)
 - “继续优化，上一版没达到预期” → analyze_model(engine="auto", escalate=true)
 - “帮我优化一下模型” → analyze_model(engine="auto")
 - “可以，就按这个来”（画像待确认）→ confirm_profile、run_selection
@@ -229,13 +232,38 @@ class Agent:
         return [{"role": "user", "content": user_content}, assistant,
                 *tool_messages, {"role": "user", "content": correction}]
 
-    def _ack_tokens(self, state: dict[str, Any], user_content: str) -> Iterator[str]:
-        payload = json.dumps({"state": state, "user_message": user_content}, ensure_ascii=False)
-        for chunk in self.llm.chat_text_stream(
-                "你是持牌投资顾问。客户刚提出一个需要执行的动作，而你已在系统中发起执行。"
-                "请用一句专业、克制的中文确认已收到并正在执行，说明过程与结果会逐步展示、"
-                "重要变更需客户确认；不要否认能力，不要罗列选项，不要反问。",
-                [{"role": "user", "content": payload}]):
+    @staticmethod
+    def _state_after_profile(state: dict[str, Any],
+                             profile_delta: dict[str, Any]) -> dict[str, Any]:
+        if not profile_delta:
+            return state
+        profile = state.get("profile") or {}
+        slots = dict(profile.get("slots") or {})
+        slots.update(profile_delta)
+        return {**state,
+                "profile": profile_payload(slots, bool(profile.get("confirmed")))}
+
+    def _ack_tokens(self, state: dict[str, Any], user_content: str,
+                    tool_calls: list[Any]) -> Iterator[str]:
+        calls = [{"name": call.name, "args": call.arguments} for call in tool_calls]
+        payload = json.dumps({
+            "state": state,
+            "user_message": user_content,
+            "tool_calls": calls,
+        }, ensure_ascii=False)
+        system = (
+            "你是持牌投资顾问。刚才后端已执行了给定工具调用，但模型没有留下回复文本。"
+            "请只输出一句给客户的回复（不超过 100 字），按以下优先级：\n"
+            "1. 若调用了 update_profile 且画像仍有必填项缺失：只询问下一个缺失项，"
+            "用生活化表达、一次一个问题；不要声称已执行模型操作或展示进度。\n"
+            "2. 若调用了 update_profile 且画像齐全但尚未确认：请客户确认画像摘要。\n"
+            "3. 若调用了 confirm_profile 或 run_selection：告知已按画像完成筛选，结果和风险已展示。\n"
+            "4. 若调用了 analyze_model：参数 engine=model_type 时说明正在切换基础模型并回测，"
+            "不要称参数寻优；其他 engine 说明已开始模型优化与寻优；候选结果都需要客户确认。\n"
+            "5. 其他情况：简短确认并说明下一步。\n"
+            "不要重复固定套话，不要罗列选项，不要否认能力，不要反问。"
+        )
+        for chunk in self.llm.chat_text_stream(system, [{"role": "user", "content": payload}]):
             yield chunk
 
     def stream_plan(self, state: dict[str, Any], history: list[dict[str, Any]],
@@ -271,6 +299,7 @@ class Agent:
             actions, profile_delta, errors = self._actions_from_result(repaired)
             if errors:
                 raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
+            result = repaired
 
         if not result.tool_calls:
             review_messages = [
@@ -290,11 +319,13 @@ class Agent:
                 actions, profile_delta, errors = self._actions_from_result(reviewed)
                 if errors:
                     raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
+                result = reviewed
 
         reply = "".join(reply_parts).strip()
         if not reply:
             reply_parts = []
-            for chunk in self._ack_tokens(state, user_content):
+            ack_state = self._state_after_profile(state, profile_delta)
+            for chunk in self._ack_tokens(ack_state, user_content, result.tool_calls):
                 reply_parts.append(chunk)
                 yield "token", chunk
             reply = "".join(reply_parts).strip()

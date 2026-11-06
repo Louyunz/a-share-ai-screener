@@ -133,7 +133,7 @@ node --check frontend/charts.js
 python scripts\e2e_smoke.py
 ```
 
-真实 LLM 语义矩阵（需要 `DEEPSEEK_API_KEY`，验证“更换数学模型/换内置模型/随机森林/继续优化/回滚”等意图是否通过 tool_calls 正确表达，10/10 通过才允许发版）：
+真实 LLM 语义矩阵（需要 `DEEPSEEK_API_KEY`，验证“更换数学模型/换内置模型/随机森林/继续优化/回滚”等意图是否通过 tool_calls 正确表达，11/11 通过才允许发版）：
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "sk-..."

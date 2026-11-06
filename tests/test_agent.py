@@ -195,6 +195,40 @@ class AgentPlanTest(unittest.TestCase):
         self.assertEqual(llm.calls, 2)
         self.assertEqual(plan.action("analyze_model")["args"]["engine"], "code")
 
+    def test_empty_content_uses_context_aware_ack(self) -> None:
+        slots = {"goal": "养老", "drawdown_tolerance": "10%", "loss_reaction": "先拿住"}
+
+        class _AckLLM:
+            def __init__(self):
+                self.ack_payload = None
+
+            def chat_tools_stream(self, system, messages, tools, tool_choice="auto"):
+                call = ToolCall(id="call_update", name="update_profile",
+                                arguments={"slots": {"horizon": "5 年"}})
+                yield "result", _tool_result("", calls=[call])
+
+            def chat_text_stream(self, system, messages):
+                self.ack_payload = json.loads(messages[-1]["content"])
+                yield "这笔钱大概多久不需要动用？"
+
+            def chat_tools(self, system, messages, tools, tool_choice="auto"):
+                return _tool_result("")
+
+        llm = _AckLLM()
+        tokens = []
+        plan = None
+        for kind, payload in Agent(llm).stream_plan(
+                _state(slots), [], "大概 5 年不用"):
+            if kind == "token":
+                tokens.append(payload)
+            else:
+                plan = payload
+        self.assertEqual(plan.profile_delta, {"horizon": "5 年"})
+        self.assertIn("多久", "".join(tokens))
+        self.assertEqual(llm.ack_payload["tool_calls"][0]["name"], "update_profile")
+        self.assertTrue(llm.ack_payload["state"]["profile"]["complete"])
+        self.assertEqual(llm.ack_payload["state"]["profile"]["slots"]["horizon"], "5 年")
+
     def test_pending_intent_executes_after_answer(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
                  "loss_reaction": "会有点慌，但先不卖"}

@@ -459,6 +459,7 @@ class AppService:
         force_approach = directive.engine if directive.engine in (
             "weights", "model_type", "code") else ""
         force_model_type = directive.model_type
+        switch_only = directive.engine == "model_type" and not directive.escalate
 
         work_id = "work-" + uuid.uuid4().hex[:8]
         tune_id = "tune-" + uuid.uuid4().hex[:8]
@@ -469,7 +470,8 @@ class AppService:
         def publish(status: str = "running", comparison: dict | None = None,
                     proposal: dict | None = None, extra: dict | None = None) -> dict[str, Any]:
             block = {
-                "id": work_id, "type": "work", "title": "AI 正在优化模型",
+                "id": work_id, "type": "work",
+                "title": "AI 正在切换模型" if switch_only else "AI 正在优化模型",
                 "status": status, "steps": list(steps),
                 "comparison": comparison or {},
                 "proposal": proposal or {},
@@ -542,17 +544,33 @@ class AppService:
         recent_metrics = self._recent_metrics(model)
         yield "ui", publish()
 
-        # 1) AI 只产出「引擎 + 搜索范围」，不直接给参数值
-        try:
-            plan = pipeline.build_tuning_plan(self.llm, self._tuning_state(
-                model, base_metrics, factor_stats, recent_metrics, request_text,
-                directive=directive, previous=previous_pending))
-        except Exception as exc:  # noqa: BLE001
-            raise AgentError(f"AI 没能给出调参方案：{exc}") from exc
-        if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
-            plan = plan["plan"]
-        if not isinstance(plan, dict) or not plan.get("approach"):
-            raise AgentError("AI 返回的调参方案格式不对")
+        # 1) AI 只产出「引擎 + 搜索范围」，不直接给参数值；
+        #    客户明确要求“换其他模型”时，直接切换内置模型预设权重，不做参数寻优。
+        target_model: dict[str, Any] = {}
+        if switch_only:
+            target_model = registry.get_model(force_model_type)
+            plan = {
+                "approach": "model_type",
+                "model_type": target_model["id"],
+                "weights": target_model["weights"],
+                "summary": f"按客户要求切换基础模型为「{target_model['name']}」，直接使用该模型的预设权重。",
+                "why": f"客户要求更换模型风格，选用内置「{target_model['name']}」。",
+                "expected_effect": "模型风格切换后，组合的因子偏好与波动特征会随之变化。",
+                "risks": ["切换后的历史回测不代表未来表现。"],
+                "switch_only": True,
+                "max_trials": 1,
+            }
+        else:
+            try:
+                plan = pipeline.build_tuning_plan(self.llm, self._tuning_state(
+                    model, base_metrics, factor_stats, recent_metrics, request_text,
+                    directive=directive, previous=previous_pending))
+            except Exception as exc:  # noqa: BLE001
+                raise AgentError(f"AI 没能给出调参方案：{exc}") from exc
+            if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
+                plan = plan["plan"]
+            if not isinstance(plan, dict) or not plan.get("approach"):
+                raise AgentError("AI 返回的调参方案格式不对")
         self.store.audit(
             "analyze_model", reason="llm_tool",
             payload={
@@ -575,170 +593,190 @@ class AppService:
                       if force_approach == "model_type" else
                       "上一版未达预期，本轮不再微调，改由 AI 重写数学打分引擎，再由服务端重新寻优。"),
                      "done", "plan")
-        repair_attempts = int(plan.get("repair_attempts") or 0)
-        if repair_attempts:
-            add_step("自动修复调参方案",
-                     f"AI 首次给出的引擎/范围未通过校验，已根据错误自动修复 {repair_attempts} 次。",
-                     "done", "check")
-        add_step("提出调参方案", self._plan_detail(plan), "done", "plan")
+        if switch_only:
+            add_step("切换基础模型",
+                     f"已选用内置「{target_model['name']}」，直接使用该模型的预设权重，"
+                     "不进行参数寻优；接下来回测并与当前模型对比。", "done", "plan")
+        else:
+            repair_attempts = int(plan.get("repair_attempts") or 0)
+            if repair_attempts:
+                add_step("自动修复调参方案",
+                         f"AI 首次给出的引擎/范围未通过校验，已根据错误自动修复 {repair_attempts} 次。",
+                         "done", "check")
+            add_step("提出调参方案", self._plan_detail(plan), "done", "plan")
         yield "ui", publish(proposal=self._proposal_public(plan))
 
-        # 2) 服务端在 AI 给定范围内执行逐轴网格寻优
-        engine_kind = "param" if plan["approach"] == "code" else "weight"
-        engine_weights = normalize_weights(plan.get("weights") or base_weights)
-        code = str(plan.get("code") or "")
-        if engine_kind == "weight":
-            search_space = dict(plan.get("search_space") or {})
-            labels = {name: FACTOR_PLAIN.get(name, name) for name in search_space}
+        if switch_only:
+            engine_kind = "weight"
+            candidate_weights = normalize_weights(plan.get("weights") or base_weights)
+            start_date, end_date = self._backtest_window()
+            backtest = selection.run_backtest(
+                self.data, candidate_weights, start=start_date, end=end_date,
+                top_n=DEFAULT_TOP_N, rebalance_days=REBALANCE_DAYS,
+                cost_buy=COST_BUY, cost_sell=COST_SELL,
+                risk_free_rate=RISK_FREE_RATE)
+            candidate_metrics = _json_safe(backtest["metrics"])
+            candidate_nav = backtest["nav"]
+            tuned_params = dict(candidate_weights)
+            evaluated = total_trials = 1
+            tune_public = {}
         else:
-            search_space = dict(plan.get("param_space") or {})
-            labels = {name: name for name in search_space}
-
-        start_date, end_date = self._backtest_window()
-        rebalance_days = REBALANCE_DAYS
-        cost_buy = COST_BUY
-        cost_sell = COST_SELL
-        risk_free_rate = RISK_FREE_RATE
-
-        def evaluator(params: dict[str, Any]) -> dict[str, Any]:
+            # 2) 服务端在 AI 给定范围内执行逐轴网格寻优
+            engine_kind = "param" if plan["approach"] == "code" else "weight"
+            engine_weights = normalize_weights(plan.get("weights") or base_weights)
+            code = str(plan.get("code") or "")
             if engine_kind == "weight":
-                tuned_weights = normalize_weights(params)
+                search_space = dict(plan.get("search_space") or {})
+                labels = {name: FACTOR_PLAIN.get(name, name) for name in search_space}
+            else:
+                search_space = dict(plan.get("param_space") or {})
+                labels = {name: name for name in search_space}
+
+            start_date, end_date = self._backtest_window()
+            rebalance_days = REBALANCE_DAYS
+            cost_buy = COST_BUY
+            cost_sell = COST_SELL
+            risk_free_rate = RISK_FREE_RATE
+
+            def evaluator(params: dict[str, Any]) -> dict[str, Any]:
+                if engine_kind == "weight":
+                    tuned_weights = normalize_weights(params)
+                    backtest = selection.run_backtest(
+                        self.data, tuned_weights, start=start_date, end=end_date,
+                        top_n=DEFAULT_TOP_N, rebalance_days=rebalance_days,
+                        cost_buy=cost_buy, cost_sell=cost_sell,
+                        risk_free_rate=risk_free_rate)
+                    return {"metrics": backtest["metrics"],
+                            "params": tuned_weights, "nav": backtest["nav"]}
+                trial_transform = custom.compile_code(code, params, validate=False)  # type: ignore[attr-defined]
                 backtest = selection.run_backtest(
-                    self.data, tuned_weights, start=start_date, end=end_date,
+                    self.data, engine_weights, start=start_date, end=end_date,
                     top_n=DEFAULT_TOP_N, rebalance_days=rebalance_days,
                     cost_buy=cost_buy, cost_sell=cost_sell,
-                    risk_free_rate=risk_free_rate)
+                    risk_free_rate=risk_free_rate, score_transform=trial_transform)
                 return {"metrics": backtest["metrics"],
-                        "params": tuned_weights, "nav": backtest["nav"]}
-            trial_transform = custom.compile_code(code, params, validate=False)  # type: ignore[attr-defined]
-            backtest = selection.run_backtest(
-                self.data, engine_weights, start=start_date, end=end_date,
-                top_n=DEFAULT_TOP_N, rebalance_days=rebalance_days,
-                cost_buy=cost_buy, cost_sell=cost_sell,
-                risk_free_rate=risk_free_rate, score_transform=trial_transform)
-            return {"metrics": backtest["metrics"],
-                    "params": dict(params), "nav": backtest["nav"]}
+                        "params": dict(params), "nav": backtest["nav"]}
 
-        step_title = "运行参数网格寻优" if engine_kind == "param" else "运行因子网格寻优"
-        add_step(step_title,
-                 (f"AI 已给出 {len(search_space)} 个参数的搜索范围，服务端逐个组合回测评估，"
-                  f"目标：{objective_label}。具体进度实时显示在寻优卡片中。"),
-                 "running", "tune")
-        yield "ui", publish()
+            step_title = "运行参数网格寻优" if engine_kind == "param" else "运行因子网格寻优"
+            add_step(step_title,
+                     (f"AI 已给出 {len(search_space)} 个参数的搜索范围，服务端逐个组合回测评估，"
+                      f"目标：{objective_label}。具体进度实时显示在寻优卡片中。"),
+                     "running", "tune")
+            yield "ui", publish()
 
-        final_event: dict[str, Any] | None = None
-        try:
-            for event in tuning.run_search(
-                    evaluator,
-                    space=search_space,
-                    base_params=engine_weights if engine_kind == "weight" else {},
-                    objective=objective,
-                    max_trials=plan.get("max_trials"),
-                    tolerance=tolerance,
-                    kind=engine_kind,
-                    labels=labels):
-                event_name = event.get("event")
-                if event_name == "start":
-                    tuning_state["start"] = event
-                    yield "ui", {"block": build_tuning_block(
-                        "running",
-                        progress={"trial": 0, "total": event.get("total") or 0,
-                                  "percent": 0, "elapsed": 0})}
-                    continue
-                if event_name == "trial":
-                    total = event.get("total") or 1
-                    elapsed = round(time.time() - tuning_state["started"], 1)
-                    percent = int(round(float(event.get("progress") or 0) * 100))
-                    progress = {"trial": event.get("trial", 0), "total": total,
-                                "percent": min(99, percent), "elapsed": elapsed}
-                    if event.get("error"):
-                        current = {"trial": event.get("trial"),
-                                   "label": event.get("label") or "该组合回测失败",
-                                   "error": str(event.get("error") or "")[:200]}
+            final_event: dict[str, Any] | None = None
+            try:
+                for event in tuning.run_search(
+                        evaluator,
+                        space=search_space,
+                        base_params=engine_weights if engine_kind == "weight" else {},
+                        objective=objective,
+                        max_trials=plan.get("max_trials"),
+                        tolerance=tolerance,
+                        kind=engine_kind,
+                        labels=labels):
+                    event_name = event.get("event")
+                    if event_name == "start":
+                        tuning_state["start"] = event
+                        yield "ui", {"block": build_tuning_block(
+                            "running",
+                            progress={"trial": 0, "total": event.get("total") or 0,
+                                      "percent": 0, "elapsed": 0})}
+                        continue
+                    if event_name == "trial":
+                        total = event.get("total") or 1
+                        elapsed = round(time.time() - tuning_state["started"], 1)
+                        percent = int(round(float(event.get("progress") or 0) * 100))
+                        progress = {"trial": event.get("trial", 0), "total": total,
+                                    "percent": min(99, percent), "elapsed": elapsed}
+                        if event.get("error"):
+                            current = {"trial": event.get("trial"),
+                                       "label": event.get("label") or "该组合回测失败",
+                                       "error": str(event.get("error") or "")[:200]}
+                            yield "ui", {"block": build_tuning_block(
+                                "running", progress=progress, current=current,
+                                best=best_public(tuning_state.get("best"), engine_kind),
+                                history=list(tuning_state["history"]))}
+                            continue
+                        tuning_state["history"].append(
+                            {"trial": event.get("trial"),
+                             "score": event.get("metric_value", event.get("score")) or 0})
+                        tuning_state["best"] = event.get("best") or tuning_state.get("best")
+                        current = {"trial": event.get("trial"), "label": event.get("label"),
+                                   "score": event.get("metric_value", event.get("score")),
+                                   "rank_score": event.get("score"),
+                                   "metrics": _json_safe(event.get("metrics") or {}),
+                                   "params": _json_safe(event.get("params") or {})}
+                        best_payload = best_public(tuning_state.get("best"), engine_kind)
+                        best_metric = float((tuning_state.get("best") or {}).get("metric_value")
+                                            or 0)
+                        steps[-1] = dict(
+                            steps[-1],
+                            detail=(f"已评估 {event.get('trial')}/{total} 组，"
+                                    f"当前最优{objective_label} {best_metric:.2f}"
+                                    + ("（本组更优）" if event.get("improved") else "") + "。"))
                         yield "ui", {"block": build_tuning_block(
                             "running", progress=progress, current=current,
-                            best=best_public(tuning_state.get("best"), engine_kind),
-                            history=list(tuning_state["history"]))}
+                            best=best_payload, history=list(tuning_state["history"]))}
+                        yield "ui", publish()
                         continue
-                    tuning_state["history"].append(
-                        {"trial": event.get("trial"),
-                         "score": event.get("metric_value", event.get("score")) or 0})
-                    tuning_state["best"] = event.get("best") or tuning_state.get("best")
-                    current = {"trial": event.get("trial"), "label": event.get("label"),
-                               "score": event.get("metric_value", event.get("score")),
-                               "rank_score": event.get("score"),
-                               "metrics": _json_safe(event.get("metrics") or {}),
-                               "params": _json_safe(event.get("params") or {})}
-                    best_payload = best_public(tuning_state.get("best"), engine_kind)
-                    best_metric = float((tuning_state.get("best") or {}).get("metric_value")
-                                        or 0)
-                    steps[-1] = dict(
-                        steps[-1],
-                        detail=(f"已评估 {event.get('trial')}/{total} 组，"
-                                f"当前最优{objective_label} {best_metric:.2f}"
-                                + ("（本组更优）" if event.get("improved") else "") + "。"))
-                    yield "ui", {"block": build_tuning_block(
-                        "running", progress=progress, current=current,
-                        best=best_payload, history=list(tuning_state["history"]))}
-                    yield "ui", publish()
-                    continue
-                if event_name == "done":
-                    final_event = event
-                    break
-        except tuning.TuningError as exc:
-            raise ServiceError(f"参数网格寻优失败：{exc}") from exc
-        if final_event is None:
-            raise ServiceError("参数网格寻优没有返回结果")
+                    if event_name == "done":
+                        final_event = event
+                        break
+            except tuning.TuningError as exc:
+                raise ServiceError(f"参数网格寻优失败：{exc}") from exc
+            if final_event is None:
+                raise ServiceError("参数网格寻优没有返回结果")
 
-        final_best = final_event.get("best") or {}
-        tuned_params = dict(final_best.get("params") or {})
-        candidate_nav = final_best.get("nav")
-        candidate_metrics = _json_safe(final_best.get("metrics") or {})
-        evaluated = int(final_event.get("evaluated") or final_event.get("total") or 0)
-        total_trials = int(final_event.get("total") or evaluated)
-        if engine_kind == "weight":
-            candidate_weights = normalize_weights(tuned_params)
-        else:
-            candidate_weights = engine_weights
-            try:
-                validation = custom.validate_code(code, tuned_params)  # type: ignore[attr-defined]
-            except custom.ModelValidationError as exc:  # type: ignore[attr-defined]
-                raise AgentError(f"AI 生成的模型引擎用最优参数校验失败：{exc}") from exc
-            checks = "、".join(str(item.get("name")) for item in validation.get("checks", []))
-        steps[-1] = dict(
-            steps[-1], status="done",
-            detail=(f"共评估 {evaluated} 组参数，按{objective_label}选出最优一组；"
-                    "结果下方寻优卡片可查看范围与得分走势。"))
-        final_tune_meta = {
-            "method": final_event.get("method"),
-            "objective": final_event.get("objective"),
-            "objective_label": final_event.get("objective_label"),
-            "space": final_event.get("space") or [],
-            "total": total_trials,
-        }
-        tune_public = {
-            "method": final_tune_meta["method"],
-            "objective": final_tune_meta["objective"],
-            "objective_label": final_tune_meta["objective_label"],
-            "trials": evaluated,
-            "total": total_trials,
-            "best_score": ((final_best.get("metric_value") if final_best else None)
-                           if final_best and final_best.get("metric_value") is not None
-                           else (final_best.get("score") if final_best else None)),
-            "best_rank_score": final_best.get("score") if final_best else None,
-            "best_constraint_ok": final_best.get("constraint_ok", True) if final_best else True,
-            "best_params": _json_safe(tuned_params),
-            "space": _json_safe(final_tune_meta["space"]),
-            "elapsed": final_event.get("elapsed"),
-        }
-        final_tuning_block = build_tuning_block(
-            "done", payload=final_tune_meta,
-            progress={"trial": evaluated, "total": total_trials, "percent": 100,
-                      "elapsed": final_event.get("elapsed")},
-            current={"trial": evaluated, "label": "寻优完成"},
-            best=best_public(final_best, engine_kind),
-            history=list(tuning_state["history"]))
-        yield "ui", {"block": final_tuning_block}
+            final_best = final_event.get("best") or {}
+            tuned_params = dict(final_best.get("params") or {})
+            candidate_nav = final_best.get("nav")
+            candidate_metrics = _json_safe(final_best.get("metrics") or {})
+            evaluated = int(final_event.get("evaluated") or final_event.get("total") or 0)
+            total_trials = int(final_event.get("total") or evaluated)
+            if engine_kind == "weight":
+                candidate_weights = normalize_weights(tuned_params)
+            else:
+                candidate_weights = engine_weights
+                try:
+                    validation = custom.validate_code(code, tuned_params)  # type: ignore[attr-defined]
+                except custom.ModelValidationError as exc:  # type: ignore[attr-defined]
+                    raise AgentError(f"AI 生成的模型引擎用最优参数校验失败：{exc}") from exc
+                checks = "、".join(str(item.get("name")) for item in validation.get("checks", []))
+            steps[-1] = dict(
+                steps[-1], status="done",
+                detail=(f"共评估 {evaluated} 组参数，按{objective_label}选出最优一组；"
+                        "结果下方寻优卡片可查看范围与得分走势。"))
+            final_tune_meta = {
+                "method": final_event.get("method"),
+                "objective": final_event.get("objective"),
+                "objective_label": final_event.get("objective_label"),
+                "space": final_event.get("space") or [],
+                "total": total_trials,
+            }
+            tune_public = {
+                "method": final_tune_meta["method"],
+                "objective": final_tune_meta["objective"],
+                "objective_label": final_tune_meta["objective_label"],
+                "trials": evaluated,
+                "total": total_trials,
+                "best_score": ((final_best.get("metric_value") if final_best else None)
+                               if final_best and final_best.get("metric_value") is not None
+                               else (final_best.get("score") if final_best else None)),
+                "best_rank_score": final_best.get("score") if final_best else None,
+                "best_constraint_ok": final_best.get("constraint_ok", True) if final_best else True,
+                "best_params": _json_safe(tuned_params),
+                "space": _json_safe(final_tune_meta["space"]),
+                "elapsed": final_event.get("elapsed"),
+            }
+            final_tuning_block = build_tuning_block(
+                "done", payload=final_tune_meta,
+                progress={"trial": evaluated, "total": total_trials, "percent": 100,
+                          "elapsed": final_event.get("elapsed")},
+                current={"trial": evaluated, "label": "寻优完成"},
+                best=best_public(final_best, engine_kind),
+                history=list(tuning_state["history"]))
+            yield "ui", {"block": final_tuning_block}
 
         # 3) 展示候选方案改动：权重 diff / 模型切换 / 代码改写
         final_plan = dict(plan)
@@ -750,8 +788,9 @@ class AppService:
             step_title = "写入 AI 重写的模型引擎"
             running_detail = "AI 已重写打分逻辑，代码逐行写入中…"
         elif final_plan["approach"] == "model_type":
-            step_title = "切换基础模型并写入寻优权重"
-            running_detail = "正在写入模型类型与寻优后的配置，改动逐行展示中…"
+            step_title = "写入模型配置" if switch_only else "切换基础模型并写入寻优权重"
+            running_detail = ("正在写入切换后的模型类型与预设权重…" if switch_only else
+                              "正在写入模型类型与寻优后的配置，改动逐行展示中…")
         else:
             step_title = "写入寻优后的因子权重"
             running_detail = "正在写入网格寻优得到的因子权重，改动逐行展示中…"
@@ -784,9 +823,13 @@ class AppService:
                                     "及子进程冒烟测试，最优参数已写入。")
         elif final_plan["approach"] == "model_type":
             info = registry.get_model(str(final_plan.get("model_type")))
-            steps[-1] = dict(steps[-1], status="done",
-                             detail=f"切换基础模型为{info.get('name')}，并按 AI 给出的范围完成"
-                                    "网格寻优，具体配置改动见下方改动框。")
+            steps[-1] = dict(
+                steps[-1], status="done",
+                detail=(f"已切换基础模型为{info.get('name')}，直接使用该模型预设权重，"
+                        "未做参数寻优。"
+                        if switch_only else
+                        f"切换基础模型为{info.get('name')}，并按 AI 给出的范围完成"
+                        "网格寻优，具体配置改动见下方改动框。"))
         else:
             changed = len([line for line in change_preview["diff"].splitlines()
                            if line.startswith("+") and not line.startswith("+++")])
@@ -839,21 +882,37 @@ class AppService:
         if not expectation_met:
             approval_actions.append(
                 {"label": "继续优化", "message": "继续优化模型，上一版未达到我的预期"})
+        if switch_only:
+            approval_title = "是否启用这个模型切换？"
+            approval_summary = (
+                f"已切换基础模型为「{target_model.get('name')}」，直接使用其预设权重；"
+                f"回测夏普 {float(base_metrics.get('sharpe', 0)):.2f} → "
+                f"{float(candidate_metrics.get('sharpe', 0)):.2f}。"
+                + ("" if expectation_met else f" 目标核对：{expectation_reason}"))
+            approval_risk = ("模型切换基于历史回测，历史业绩不代表未来表现；"
+                             "切换后如未达目标，可继续优化或保留原模型。")
+        else:
+            approval_title = ("是否启用这个网格寻优结果？" if expectation_met
+                              else "候选未达预期，是否仍要启用？")
+            approval_summary = (
+                f"服务端网格寻优（{tune_public.get('method', '逐轴网格搜索')}）共评估 "
+                f"{evaluated} 组参数，按{objective_label}"
+                + ("并在回撤上限约束下" if tolerance is not None else "")
+                + f"选出最优一组；回测夏普 "
+                f"{float(base_metrics.get('sharpe', 0)):.2f} → "
+                f"{float(candidate_metrics.get('sharpe', 0)):.2f}。"
+                + ("" if expectation_met else f" 目标核对：{expectation_reason}"))
+            approval_risk = ("最优参数由历史回测选出，可能存在过拟合；"
+                             + ("；".join(final_plan.get("risks") or [])
+                                or "历史回测不代表未来表现。")
+                             + ("" if expectation_met else
+                                " 注意：候选方案未达到您的目标，建议继续优化或先保留现模型。"))
         approval = {
             "id": "approval-" + uuid.uuid4().hex[:8],
             "type": "approval",
-            "title": "是否启用这个网格寻优结果？" if expectation_met else "候选未达预期，是否仍要启用？",
-            "summary": (f"服务端网格寻优（{tune_public.get('method', '逐轴网格搜索')}）共评估 "
-                        f"{evaluated} 组参数，按{objective_label}"
-                        + ("并在回撤上限约束下" if tolerance is not None else "")
-                        + f"选出最优一组；回测夏普 "
-                        f"{float(base_metrics.get('sharpe', 0)):.2f} → "
-                        f"{float(candidate_metrics.get('sharpe', 0)):.2f}。"
-                        + ("" if expectation_met else f" 目标核对：{expectation_reason}")),
-            "risk": ("最优参数由历史回测选出，可能存在过拟合；"
-                     + ("；".join(final_plan.get("risks") or []) or "历史回测不代表未来表现。")
-                     + ("" if expectation_met
-                        else " 注意：候选方案未达到您的目标，建议继续优化或先保留现模型。")),
+            "title": approval_title,
+            "summary": approval_summary,
+            "risk": approval_risk,
             "actions": approval_actions,
         }
         yield "ui", {"block": approval}
@@ -862,7 +921,10 @@ class AppService:
             note_text = ("候选方案未达到您的目标：" + expectation_reason
                          + " 您可以先不启用，或回复继续优化；我会更换基础引擎或重写打分逻辑，"
                            "再由服务端在新的参数范围内重新寻优。")
-        return [final_work["block"], final_tuning_block, approval], note_text, False
+        blocks = [final_work["block"], approval]
+        if not switch_only:
+            blocks.insert(1, final_tuning_block)
+        return blocks, note_text, False
 
     def _tuning_state(self, model: dict[str, Any], base_metrics: dict[str, Any],
                       factor_stats: dict[str, Any], recent_metrics: dict[str, Any],
@@ -916,6 +978,8 @@ class AppService:
         approach = str(plan.get("approach") or "")
         if approach == "model_type":
             info = registry.get_model(str(plan.get("model_type")))
+            if plan.get("switch_only"):
+                return str(info.get("name"))
             return f"{info.get('name')}（网格寻优）"
         if approach == "code":
             return "AI 生成模型"
@@ -994,6 +1058,7 @@ class AppService:
 
         if approach == "model_type":
             info = registry.get_model(str(proposal.get("model_type")))
+            switch_only = bool(proposal.get("switch_only"))
             file_name = "models/strategy.py · 模型类型与权重"
             current = (current_model or {})
             current_weights = current.get("weights") or {}
@@ -1004,8 +1069,9 @@ class AppService:
                 "- model_type: " + str(current.get("model_id") or "multi_factor"),
                 "+ model_type: " + str(info.get("id")),
                 "- name: " + str(current.get("name") or "均衡多因子"),
-                "+ name: " + str(info.get("name")) + "（网格寻优）",
-                "@@ 因子权重（AI 定范围，服务端寻优） @@",
+                "+ name: " + str(info.get("name")) + ("" if switch_only else "（网格寻优）"),
+                ("@@ 因子权重（模型预设权重） @@" if switch_only
+                 else "@@ 因子权重（AI 定范围，服务端寻优） @@"),
             ]
             added = removed = 2
             for name in FACTOR_NAMES:
@@ -1069,10 +1135,11 @@ class AppService:
 
     @staticmethod
     def _proposal_public(proposal: dict[str, Any], model_name: str | None = None) -> dict[str, Any]:
-        approach_label = {"model_type": "服务端网格寻优（切换基础模型）",
-                          "weights": "服务端网格寻优（因子权重）",
-                          "code": "服务端网格寻优（自定义引擎）"}.get(
-            str(proposal.get("approach")), "网格寻优")
+        approach_label = ("切换基础模型" if proposal.get("switch_only") else
+                          {"model_type": "服务端网格寻优（切换基础模型）",
+                           "weights": "服务端网格寻优（因子权重）",
+                           "code": "服务端网格寻优（自定义引擎）"}.get(
+                              str(proposal.get("approach")), "网格寻优"))
         return {
             "summary": proposal.get("summary", ""),
             "approach": approach_label,
