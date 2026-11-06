@@ -79,6 +79,26 @@ class ExplanationStyleTest(unittest.TestCase):
         self.assertTrue(is_explanation_question("这些都是什么意思"))
         self.assertFalse(is_explanation_question("帮我选股"))
 
+class SemanticSlotTest(unittest.TestCase):
+    def _agent(self):
+        return Agent(_RewriteLLM("收到，我记下了。"))
+
+    def test_continue_holding_maps_to_loss_reaction(self) -> None:
+        state = {"profile": {"complete": False, "confirmed": False,
+                             "missing": ["亏钱时的反应"], "summary": ""},
+                 "pending": None, "versions": [], "last_selection": None}
+        history = [{"role": "assistant", "content": "若持有期间真的出现这样的浮亏，您通常会怎么做，比如继续持有等待回升、分批补仓摊低成本，还是先减仓止损？大致说说您的习惯即可。"}]
+        plan = self._agent().plan(state, history, "继续持有")
+        self.assertEqual(plan.profile_delta.get("loss_reaction"), "继续持有等待修复")
+
+    def test_short_percentage_maps_to_drawdown(self) -> None:
+        state = {"profile": {"complete": False, "confirmed": False,
+                             "missing": ["能接受的最大亏损"], "summary": ""},
+                 "pending": None, "versions": [], "last_selection": None}
+        history = [{"role": "assistant", "content": "您最多能接受账户出现多大比例的回撤？"}]
+        plan = self._agent().plan(state, history, "10%")
+        self.assertEqual(plan.profile_delta.get("drawdown_tolerance"), "10%")
+
 class ConfirmationDedupTest(unittest.TestCase):
     def test_duplicate_confirmation_is_removed(self) -> None:
         text = ("已按您的要求完成回测，最大回撤由 19% 收窄至 16%。\n\n"

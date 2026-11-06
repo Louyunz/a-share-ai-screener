@@ -65,6 +65,13 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - 一次只确认一个信息点；信息足够时先做简明摘要，再请客户确认，不要反复追问；已经确认或已经回答过的画像字段不得再次询问。
 - 不重复客户原话，不做机械式分点罗列；能用两句话说清就不用五点。
 
+## 语义理解（重点）
+- 结合最近一轮助手提出的问题理解客户的短回答、省略句和口语，不要只做字面关键词匹配。
+- 如果助手在问“亏损反应/真亏了会怎么做/出现浮亏怎么办”，客户回答“继续持有、拿着、不卖、扛着、补仓、加仓、止损、减仓、割肉”等，都是对该画像字段的回答，必须写入 profile_delta.loss_reaction，不要解释成“持仓记录”、交易指令或要求客户补充持仓信息。
+- 如果助手在问期限/亏损比例/资金用途，客户只答“4 年”“10%”“子女教育”等短句，也要映射到对应槽位。
+- 客户已经回答过的信息不得再次追问；不要要求客户按固定措辞或选项作答。
+- 在输出 profile_delta 时保留客户原意，可以做适度规范化（例如“继续持有”可记为“继续持有等待修复”）。
+
 ## 客户追问与解释规范（重点）
 - 当客户问“什么是回撤 / 这是什么意思 / 为什么问这个 / 怎么理解 / 没看懂”时，先明确说出具体概念或字段，用一两句话解释它是什么、为什么影响适当性匹配，最多给一个生活化例子。
 - 如果客户只是询问概念，本轮可以只解释，不追问；不要为了采集画像强行把解释变成客户作答。
@@ -154,6 +161,59 @@ def chunk_text(text: str, size: int = 12) -> Iterator[str]:
 def asks_clarifying_question(reply: str) -> bool:
     """回复是否在向客户提问。"""
     return "？" in reply or "?" in reply
+
+
+SLOT_QUESTION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "loss_reaction": ("亏损反应", "真亏了", "出现浮亏", "下跌", "继续持有", "补仓", "止损", "怎么处理"),
+    "drawdown_tolerance": ("最大亏损", "回撤", "能接受亏", "亏损承受", "跌多少"),
+    "horizon": ("投资期限", "多久", "不用这笔钱", "什么时候用"),
+    "goal": ("投资目标", "资金用途", "用来做什么", "做什么用"),
+    "income_stability": ("收入稳定",),
+    "experience": ("投资经验", "基金", "股票"),
+}
+
+
+def infer_pending_slot(state: dict[str, Any], history: list[dict[str, str]] | None) -> str:
+    question = _last_assistant_text(history)
+    for slot, words in SLOT_QUESTION_KEYWORDS.items():
+        if any(word in question for word in words):
+            return slot
+    profile = state.get("profile") or {}
+    missing = [str(item) for item in (profile.get("missing") or [])]
+    for slot, words in SLOT_QUESTION_KEYWORDS.items():
+        if any(any(word in label for word in words) for label in missing):
+            return slot
+    return ""
+
+
+def infer_short_answer(state: dict[str, Any], history: list[dict[str, str]] | None,
+                       message: str) -> dict[str, str]:
+    """对上一轮问题的短回答做轻量语义映射；LLM 仍负责主要理解。"""
+    text = str(message or "").strip()
+    if not text or len(text) > 50:
+        return {}
+    slot = infer_pending_slot(state, history)
+    if slot == "loss_reaction":
+        if any(word in text for word in ("继续持有", "继续拿", "拿着", "不卖", "持有", "等待回升",
+                                         "等待修复", "扛", "忍着", "不动")):
+            return {"loss_reaction": "继续持有等待修复"}
+        if any(word in text for word in ("补仓", "加仓", "摊低", "摊薄")):
+            return {"loss_reaction": "分批补仓摊低成本"}
+        if any(word in text for word in ("止损", "卖出", "减仓", "割肉", "离场")):
+            return {"loss_reaction": "止损或减仓离场"}
+        if any(word in text for word in ("看情况", "不确定", "没想好", "不知道")):
+            return {"loss_reaction": "视回撤情况决定"}
+    if slot == "drawdown_tolerance":
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+        if match:
+            return {"drawdown_tolerance": match.group(1) + "%"}
+    if slot == "horizon":
+        match = re.search(r"(\d+)\s*年", text)
+        if match:
+            return {"horizon": match.group(1) + "年"}
+        if any(word in text for word in ("长期", "五年以上", "3年以上", "三年以上")):
+            return {"horizon": "3年以上"}
+    return {}
 
 
 def is_explanation_question(message: str) -> bool:
@@ -277,8 +337,11 @@ class Agent:
     # ------------------------------------------------------------------
     def plan(self, state: dict[str, Any], history: list[dict[str, str]],
              message: str) -> Plan:
+        last_question = _last_assistant_text(history)
         payload = json.dumps(
-            {"state": state, "user_message": message, "recent_history": history[-8:]},
+            {"state": state, "user_message": message, "recent_history": history[-8:],
+             "last_assistant_question": last_question,
+             "awaiting_slot": infer_pending_slot(state, history)},
             ensure_ascii=False)
         try:
             raw = self.llm.chat_json(
@@ -295,6 +358,10 @@ class Agent:
         delta = raw.get("profile_delta")
         if not isinstance(delta, dict):
             delta = {}
+        # 轻量兜底：短回答对应上一轮槽位时补进 profile_delta，避免“继续持有”被当成持仓查询
+        inferred = infer_short_answer(state, history, message)
+        for key, value in inferred.items():
+            delta.setdefault(key, value)
 
         plan = Plan(reply=reply, actions=actions, profile_delta=delta)
         # 澄清与执行分离：提问时本轮不执行动作；记录待执行意图，客户回答后再执行
