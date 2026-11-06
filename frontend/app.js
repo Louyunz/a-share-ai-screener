@@ -510,6 +510,7 @@
       + '<div class="card card-welcome"><div class="card-body">'
       + '<h2 class="welcome-title">你好，我是你的 AI 投资顾问</h2>'
       + '<p class="welcome-text">先用几句话说说你的投资想法就行——打算投多久、能接受亏多少、有没有不想碰的行业。我会边聊边把投资画像整理给你看，确认后直接帮你选股、解释结果，也能和你一起优化模型。</p>'
+      + '<p class="welcome-text">我可以：建立投资者画像、筛选 A 股并回测、解读结果、优化模型（更换基础模型 / 调整因子权重 / 由 AI 重写数学打分代码），重要变更由你审批，版本可回滚。</p>'
       + '<div class="starter-list">' + STARTERS.map(function (item) {
         return '<button class="starter" type="button" data-action="quick" data-message="' + esc(item.message) + '">' + esc(item.label) + '</button>';
       }).join('') + '</div>'

@@ -427,6 +427,18 @@ class AppService:
 
         model = self._active_model()
         weights, _ = self._model_engine(model)
+        runtime_before = self.store.get_state(session_id)
+        previous_pending = runtime_before.get("pending") or {}
+        previous_approach = self._previous_approach(previous_pending)
+        aggressive = self._wants_aggressive_retry(request_text, previous_pending)
+        aggressive_model = ""
+        aggressive_code = False
+        if aggressive:
+            if previous_approach == "weights":
+                aggressive_model = self._different_builtin_model(
+                    model, previous_pending.get("model") or {})
+            else:
+                aggressive_code = True
         from .engine import selection
 
         work_id = "work-" + uuid.uuid4().hex[:8]
@@ -459,25 +471,37 @@ class AppService:
         focus = self._factor_focus(top_df, weights)
         add_step("翻数据找线索", f"最近组合更看重：{'、'.join(focus[:3]) or '均衡配置'}；"
                                 "先把偏弱的环节找出来。", "done", "data")
+        if aggressive:
+            if aggressive_model:
+                info = registry.get_model(aggressive_model)
+                add_step("升级优化策略",
+                         f"上一版未达预期，本轮不再微调权重，直接更换基础模型为「{info.get('name')}」并重新回测。",
+                         "done", "plan")
+            else:
+                add_step("升级优化策略",
+                         "上一版未达预期，本轮不再微调权重，改为由 AI 重写数学打分模型并重新回测。",
+                         "done", "plan")
         yield "ui", publish()
 
         factor_stats = self._factor_stats(_scores, weights)
         recent_metrics = self._recent_metrics(model)
         custom_model = self._requested_custom_model(request_text)
-        force_code = self._wants_code_change(request_text) or bool(custom_model)
-        requested_model = "" if custom_model else self._requested_model_type(request_text)
+        force_code = self._wants_code_change(request_text) or bool(custom_model) or aggressive_code
+        requested_model = "" if custom_model else (aggressive_model or self._requested_model_type(request_text))
         if requested_model:
-            # 客户点名的是内置模型：优先按点名模型生成确定性方案，避免模型说“没有对应选项”
+            # 客户点名或激进重试要求更换基础模型：优先按目标模型生成确定性方案
             proposal = self._normalize_proposal(self._model_switch_proposal(requested_model), weights)
         else:
             proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
-                                                request_text, force_code, custom_model=custom_model)
+                                                request_text, force_code, custom_model=custom_model,
+                                                aggressive=aggressive, previous=previous_pending)
             proposal = self._normalize_proposal(proposal_raw, weights)
             if force_code and proposal["approach"] != "code":
-                # 客户点名自定义模型或明确要求改代码时，必须让 AI 写代码实现
+                # 客户点名自定义模型、要求改代码，或激进重试时必须让 AI 写代码实现
                 proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
                                                     request_text, True, strict=True,
-                                                    custom_model=custom_model)
+                                                    custom_model=custom_model,
+                                                    aggressive=aggressive, previous=previous_pending)
                 proposal = self._normalize_proposal(proposal_raw, weights)
         add_step("提出改进方案", str(proposal.get("summary", "")), "done", "plan")
         yield "ui", publish(proposal=self._proposal_public(proposal))
@@ -610,7 +634,7 @@ class AppService:
         note_text = ""
         if not expectation_met:
             note_text = ("候选方案未达到您的目标：" + expectation_reason
-                         + " 您可以先不启用，或回复「继续优化」让我换一种模型方向再试。")
+                         + " 您可以先不启用，或回复「继续优化」；我会直接更换基础模型或重写数学打分模型再试一版。")
         return [final_work["block"], approval], note_text, False
 
     @staticmethod
@@ -708,10 +732,22 @@ class AppService:
     def _propose_change(self, model: dict[str, Any], base_metrics: dict[str, Any],
                         factor_stats: dict[str, Any], recent_metrics: dict[str, Any],
                         request_text: str = "", force_code: bool = False,
-                        strict: bool = False, custom_model: str = "") -> dict[str, Any]:
+                        strict: bool = False, custom_model: str = "",
+                        aggressive: bool = False,
+                        previous: dict[str, Any] | None = None) -> dict[str, Any]:
         from .models import pipeline
+        previous = previous or {}
+        previous_model = previous.get("model") or {}
         state = {
             "proposal_request": True,
+            "escalation": {
+                "active": bool(aggressive),
+                "previous_approach": self._previous_approach(previous),
+                "previous_model": previous_model.get("model_id") or "",
+                "previous_name": previous_model.get("name") or "",
+            },
+            "previous_proposal": previous.get("proposal") or {},
+            "previous_metrics": previous.get("metrics") or {}, 
             "current_model": {"name": model.get("name"), "kind": model.get("kind"),
                               "model_id": model.get("model_id"),
                               "description": model.get("description")},
@@ -726,8 +762,9 @@ class AppService:
         }
         if strict:
             state["strict_requirement"] = (
-                "客户明确要求修改策略代码或点名自定义模型，本次必须输出 approach=code 的代码方案；"
-                "不得用内置模型或权重调整替代。"
+                "客户明确要求修改策略代码、点名自定义模型，或上一版未达预期需要激进升级；"
+                "本次必须输出 approach=code 的代码方案，主动重写数学打分逻辑，"
+                "不得用内置模型或权重调整替代，且应与上一版代码结构不同。"
             )
         try:
             raw = pipeline.build_candidate_proposal(self.llm, state)
@@ -914,6 +951,36 @@ class AppService:
             from .models import custom
             transform = custom.compile_code(str(model["code"]))
         return weights, transform
+
+    @staticmethod
+    def _wants_aggressive_retry(text: str, pending: dict[str, Any] | None = None) -> bool:
+        value = str(text or "")
+        return any(word in value for word in (
+            "继续优化", "上一版未达", "未达到我的预期", "没达到预期", "未达预期",
+            "再试一版", "换个方向", "更激进", "直接换", "重新优化模型",
+        )) or bool(pending and any(word in value for word in ("继续", "再试", "不满意")))
+
+    @staticmethod
+    def _previous_approach(pending: dict[str, Any] | None) -> str:
+        model = (pending or {}).get("model") or {}
+        if model.get("kind") == "code":
+            return "code"
+        if model.get("model_id") == "ai_tuned_weights":
+            return "weights"
+        if model.get("kind") == "builtin":
+            return "model_type"
+        return ""
+
+    @staticmethod
+    def _different_builtin_model(current: dict[str, Any],
+                                 previous: dict[str, Any] | None = None) -> str:
+        from .models import registry
+        excluded = {str((current or {}).get("model_id") or "multi_factor"),
+                    str((previous or {}).get("model_id") or "")}
+        for info in registry.list_models():
+            if info["id"] not in excluded:
+                return str(info["id"])
+        return "multi_factor" if "multi_factor" not in excluded else "low_vol_quality"
 
     @staticmethod
     def _wants_code_change(text: str) -> bool:

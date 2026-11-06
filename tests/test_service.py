@@ -112,6 +112,15 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue((works[-1].get("code_change") or {}).get("diff"), "点名自定义模型时应生成代码改动")
         self.assertEqual(works[-1]["status"], "done")
 
+        # 8.5) 点击“继续优化”：上一版 pending 为代码方案时，应升级为结构性重写
+        events, text = self.chat("继续优化模型，上一版未达到我的预期")
+        works = [block for block in _blocks(events) if block["type"] == "work"]
+        self.assertTrue(works)
+        titles = [step.get("title") for step in works[-1].get("steps", [])]
+        self.assertIn("升级优化策略", titles)
+        self.assertEqual((works[-1].get("proposal") or {}).get("approach"), "AI 生成新策略代码")
+        self.assertTrue((works[-1].get("code_change") or {}).get("diff"))
+
         # 9) 没有 pending 时模型仍要求“同意启用”：不能报错，应自动重新分析并生成候选
         self.service._save_runtime(self.sid, pending=None)
         original_plan = self.service.agent.plan

@@ -121,7 +121,13 @@ def _build_system_prompt() -> str:
         "必须使用 approach=\"code\"，不得用权重或内置模型替代；若 state.force_approach 非空，必须使用该 approach。",
         "若 state.requested_custom_model 非空，或客户点名内置清单之外的模型（如 SVM、随机森林、梯度提升、聚类、PCA 等），"
         "必须使用 approach=\"code\"，用 sklearn 在 transform 内实现该模型；不得拒绝、不得声称没有选项，也不得用内置模型替代。",
-        "在没有明确要求时，优先选择改动小、能解释清楚的方案；能用内置模型或权重调整解决时不要写代码。",
+        "优化模型时不要默认只微调因子权重。若当前模型存在明显短板、客户对收益/回撤不满意、"
+        "或 state.escalation.active 为 true，应优先考虑更换基础模型（approach=\"model_type\"）"
+        "或用 sklearn 重写数学打分逻辑（approach=\"code\"）。",
+        "当 state.escalation.active 为 true（客户点了继续优化/上一版未达预期）时，必须做结构性升级："
+        "禁止 only-weights 的微调；若 strict_requirement 要求 code，则必须重写数学打分逻辑，"
+        "并与 previous_proposal/previous_model 不同。",
+        "在没有明确要求且当前模型表现尚可时，优先选择改动小、能解释清楚的方案；不要为了写代码而写代码。",
         "",
         "## 内置模型清单",
         model_lines,
