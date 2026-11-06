@@ -373,6 +373,26 @@ class PipelineTests(unittest.TestCase):
             "recent_metrics": [{"as_of": "2024-10-31", "sharpe": 0.9, "cagr": 0.08}],
         }
 
+    def test_code_repair_retries_after_validation_error(self) -> None:
+        class _RepairLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_json(self, system, messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"approach": "code", "summary": "无效代码",
+                            "code": "def build_transform():\n    return 1\n"}
+                return {"approach": "code", "summary": "修复后的模型",
+                        "code": VALID_CODE, "risks": ["历史回测不代表未来表现"]}
+
+        llm = _RepairLLM()
+        proposal = build_candidate_proposal(llm, self._state())
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(proposal.get("repair_attempts"), 1)
+        self.assertEqual(proposal["approach"], "code")
+        self.assertTrue(proposal.get("code"))
+
     def test_normalize_model_type_approach(self) -> None:
         proposal = normalize_proposal(
             {

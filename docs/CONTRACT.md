@@ -166,6 +166,8 @@ def build_transform():
         return ...
     return transform
 ```
+AI 生成的代码先经过静态检查 + 子进程冒烟；若失败，服务端会把错误信息、原提案和客户诉求回传给同一模型进行自动修复，最多重试 2 次，修复成功后返回 `repair_attempts` 供 work 卡展示；仍失败才报错。
+
 允许 import：`math`、`numpy as np`、`pandas as pd`、`sklearn`（仅 preprocessing/svm/ensemble/linear_model/cluster/decomposition/pipeline/impute/neighbors/tree/metrics/utils 子模块）与 `scipy`；禁止：文件/网络/系统调用/动态执行/dunder 属性；源码 ≤6000 字符；必须通过 AST 白名单检查 + 子进程冒烟（10s 超时）。sklearn 模型基于当前截面做转导/无监督拟合或用加权因子合成分构造伪标签，不假设未来收益标签。
 
 ### 6.4 预期核对与继续优化

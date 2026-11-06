@@ -987,16 +987,40 @@
       + '<p class="chart-note">灰色为当前模型，青色为候选模型；回撤越接近 0 越好，其余指标越大越好。</p></div>';
   }
 
+  var CODE_TOKEN_RE = /(#[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|class|return|import|from|as|if|elif|else|for|while|in|not|and|or|is|None|True|False|lambda|with|try|except|finally|raise|yield|pass|break|continue|global|nonlocal|assert|del|async|await)\b|\b(\d+(?:\.\d+)?)\b|([A-Za-z_][A-Za-z0-9_]*)(?=\s*\()/g;
+
+  function highlightCodeText(text) {
+    var source = String(text || '');
+    var output = '';
+    var cursor = 0;
+    CODE_TOKEN_RE.lastIndex = 0;
+    var match;
+    while ((match = CODE_TOKEN_RE.exec(source)) !== null) {
+      output += esc(source.slice(cursor, match.index));
+      var cls = match[1] ? 'tok-comment'
+        : match[2] ? 'tok-string'
+          : match[3] ? 'tok-keyword'
+            : match[4] ? 'tok-number'
+              : 'tok-func';
+      output += '<span class="' + cls + '">' + esc(match[0]) + '</span>';
+      cursor = match.index + match[0].length;
+      if (match[0].length === 0) CODE_TOKEN_RE.lastIndex += 1;
+    }
+    return output + esc(source.slice(cursor));
+  }
+
   function codeBoxHtml(change) {
     if (!change || !change.diff) return '';
     var lines = String(change.diff).split('\n');
+    var isPython = change.kind === 'code' || /\.py\b/.test(String(change.file || ''));
     var rows = lines.map(function (line, index) {
       var cls = 'code-line';
       if (line.indexOf('+++') === 0 || line.indexOf('---') === 0) cls += ' is-file';
       else if (line.indexOf('@@') === 0) cls += ' is-hunk';
       else if (line.charAt(0) === '+') cls += ' is-add';
       else if (line.charAt(0) === '-') cls += ' is-del';
-      return '<div class="' + cls + '"><span class="code-ln">' + (index + 1) + '</span><span class="code-text">' + esc(line) + '</span></div>';
+      var textHtml = isPython ? highlightCodeText(line) : esc(line);
+      return '<div class="' + cls + '"><span class="code-ln">' + (index + 1) + '</span><span class="code-text">' + textHtml + '</span></div>';
     }).join('');
     var added = Number(change.added) || 0;
     var removed = Number(change.removed) || 0;
@@ -1006,7 +1030,9 @@
       + '<div class="code-head"><span class="code-head-left"><span class="code-kind">' + esc(kind) + '</span>'
       + '<span class="code-file">' + esc(change.file || 'models/strategy.py') + '</span></span>'
       + '<span class="code-stats">+' + added + ' / -' + removed + '</span></div>'
-      + '<pre class="code-box" aria-label="AI 正在修改的模型内容">' + rows + '</pre></div>';
+      + '<pre class="code-box" aria-label="AI 正在修改的模型内容">' + rows + '</pre>'
+      + '<p class="code-note"><strong>风险提示</strong> AI 生成或修改的模型仅用于历史回测演示，可能存在逻辑偏差或过拟合；历史业绩不代表未来实际表现，启用前请审阅代码并确认。</p>'
+      + '</div>';
   }
 
   function proposalHtml(proposal, showCodeDiff) {

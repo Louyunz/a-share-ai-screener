@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import difflib
 import re
 import time
 import uuid
@@ -504,6 +505,11 @@ class AppService:
                                                     aggressive=aggressive, previous=previous_pending)
                 proposal = self._normalize_proposal(proposal_raw, weights)
         add_step("提出改进方案", str(proposal.get("summary", "")), "done", "plan")
+        repair_attempts = int(proposal.get("repair_attempts") or 0)
+        if repair_attempts:
+            add_step("自动修复代码",
+                     f"首次生成的代码未通过校验，AI 已根据错误自动修复 {repair_attempts} 次，"
+                     "并通过静态检查与子进程冒烟。", "done", "check")
         yield "ui", publish(proposal=self._proposal_public(proposal))
 
         candidate_weights = proposal.get("weights") or weights

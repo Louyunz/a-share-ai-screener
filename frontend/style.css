@@ -623,3 +623,27 @@ body.wb-collapsed .workspace { grid-template-columns: minmax(0, 1fr); }
   content: " · 写入中";
   color: var(--color-accent);
 }
+
+
+/* 代码语法高亮 */
+.code-text .tok-keyword { color: #1D4ED8; font-weight: 500; }
+.code-text .tok-string { color: #B45309; }
+.code-text .tok-comment { color: #94A3B8; font-style: italic; }
+.code-text .tok-number { color: #6E56CF; }
+.code-text .tok-func { color: #1E3A5F; }
+
+/* 代码改动风险提示 */
+.code-note {
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-default);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.6;
+  background: var(--bg-page);
+}
+
+.code-note strong {
+  color: var(--status-warning);
+  font-weight: 600;
+}

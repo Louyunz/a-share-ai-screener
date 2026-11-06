@@ -137,6 +137,17 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("没有等待您确认", text)
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
 
+    def test_code_preview_works_when_current_model_has_code(self) -> None:
+        current = {"model_id": "ai_generated", "name": "AI 生成模型",
+                   "code": "def build_transform():\n    def transform(z, weights):\n        return z.iloc[:, 0]\n    return transform"}
+        new_code = ("import numpy as np\nimport pandas as pd\n\n"
+                    "def build_transform():\n    def transform(z, weights):\n"
+                    "        return z.mean(axis=1)\n    return transform")
+        preview = AppService._code_change(current, new_code)
+        self.assertTrue(preview["diff"])
+        self.assertGreater(preview["added"], 0)
+        self.assertIn("build_transform", preview["diff"])
+
     def test_model_type_preview_includes_factor_weights(self) -> None:
         from backend.models import registry
         current = {"model_id": "ai_tuned_weights", "name": "AI 调整权重",

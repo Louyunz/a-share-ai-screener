@@ -159,6 +159,17 @@ def _build_system_prompt() -> str:
     return "\n".join(sections)
 
 
+CODE_REPAIR_SYSTEM = """你是智投罗盘的量化模型代码修复助手。
+给定原始提案、校验错误信息和客户诉求，请修复 Python 模型代码并重新输出完整提案 JSON。
+要求：
+1. 只输出一个 JSON 对象，字段与原始提案一致，approach 必须为 code；
+2. 修复必须针对错误信息，不得删除安全检查要求、不得引入文件/网络/系统调用；
+3. 代码必须定义 build_transform()，返回 transform(z, weights)，输出有限 pandas.Series；
+4. 只允许 math/numpy/pandas/sklearn（模型相关子模块）/scipy；
+5. 不要解释修改过程。
+"""
+
+
 def _json_safe(value: Any) -> Any:
     """把 state 转成可 JSON 序列化的结构（NaN/Inf -> None，模型类型 -> dict）。"""
     if value is None or isinstance(value, (str, bool, int)):
@@ -422,16 +433,50 @@ def build_candidate_proposal(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
             f"LLM 返回的提案不是 JSON 对象：{_snippet(raw)}"
         )
 
-    try:
-        return normalize_proposal(dict(raw), base_weights=base_weights)
-    except ModelCodeError as exc:
-        raise ModelValidationError(
-            f"AI 生成的模型代码未通过校验：{exc}；原始返回：{_snippet(raw)}"
-        ) from exc
-    except ModelValidationError as exc:
-        raise ModelValidationError(
-            f"AI 返回的提案未通过校验：{exc}；原始返回：{_snippet(raw)}"
-        ) from exc
+    original_raw = dict(raw)
+    attempts = 0
+    while True:
+        try:
+            proposal = normalize_proposal(dict(raw), base_weights=base_weights)
+            if attempts:
+                proposal["repair_attempts"] = attempts
+            return proposal
+        except ModelCodeError as exc:
+            error = exc
+        except ModelValidationError as exc:
+            error = exc
+        if attempts >= 2 or str(original_raw.get("approach", "")) != "code":
+            if isinstance(error, ModelCodeError):
+                raise ModelValidationError(
+                    f"AI 生成的模型代码未通过校验（自动修复 {attempts} 次）：{error}；"
+                    f"原始返回：{_snippet(original_raw)}"
+                ) from error
+            raise ModelValidationError(
+                f"AI 返回的提案未通过校验（自动修复 {attempts} 次）：{error}；"
+                f"原始返回：{_snippet(original_raw)}"
+            ) from error
+        attempts += 1
+        repair_request = {
+            "error": str(error),
+            "original_proposal": _json_safe(raw),
+            "user_request": state_payload.get("user_request", ""),
+            "current_model": state_payload.get("current_model", {}),
+            "current_metrics": state_payload.get("current_metrics", {}),
+        }
+        try:
+            repaired = llm.chat_json(
+                CODE_REPAIR_SYSTEM,
+                [{"role": "user", "content": json.dumps(repair_request, ensure_ascii=False)}],
+            )
+        except Exception as exc:
+            raise ModelValidationError(
+                f"AI 代码修复调用失败：{type(exc).__name__}：{exc}"
+            ) from exc
+        if isinstance(repaired, Mapping) and "proposal" in repaired:
+            repaired = repaired["proposal"]
+        if not isinstance(repaired, Mapping):
+            raise ModelValidationError("AI 代码修复返回的不是 JSON 对象")
+        raw = dict(repaired)
 
 
 def describe_model(model: Mapping[str, Any] | str) -> str:
