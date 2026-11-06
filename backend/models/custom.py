@@ -4,7 +4,7 @@
 校验分三层，任何一层不通过都抛 :class:`ModelCodeError`：
 
 1. 规模与语法：源码 ≤ 6000 字符，且能被 ``ast.parse`` 解析；
-2. AST 白名单：只允许 ``math`` / ``numpy`` / ``pandas`` 三个导入，禁止
+2. AST 白名单：只允许 ``math`` / ``numpy`` / ``pandas`` / ``sklearn`` / ``scipy`` 导入，禁止
    文件、网络、系统调用与动态执行，禁止下划线属性访问；顶层只允许
    import、函数定义与常量赋值（禁止顶层副作用）；
 3. 子进程冒烟：在临时目录、独立 Python 子进程中把 10 列 ``z_*`` 与
@@ -49,7 +49,14 @@ _SMOKE_ROWS = 8
 _SMOKE_SEED = 20240601
 
 # 允许导入的模块根名
-ALLOWED_IMPORT_ROOTS = ("math", "numpy", "pandas")
+ALLOWED_IMPORT_ROOTS = ("math", "numpy", "pandas", "sklearn", "scipy")
+
+# sklearn 只允许模型/预处理相关的常用子模块，避免 datasets 等带文件 IO 的模块
+ALLOWED_SKLEARN_PREFIXES = (
+    "sklearn.preprocessing", "sklearn.svm", "sklearn.ensemble", "sklearn.linear_model",
+    "sklearn.cluster", "sklearn.decomposition", "sklearn.pipeline", "sklearn.impute",
+    "sklearn.neighbors", "sklearn.tree", "sklearn.metrics", "sklearn.utils",
+)
 
 # 受限执行环境里保留的内建函数/异常（其余内建全部移除）
 SAFE_BUILTIN_NAMES = frozenset(
@@ -220,6 +227,17 @@ class _RuleViolation(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _module_allowed(name: str) -> bool:
+    root = str(name).split(".")[0]
+    if root not in ALLOWED_IMPORT_ROOTS:
+        return False
+    if root == "sklearn":
+        return name == "sklearn" or any(
+            name == prefix or name.startswith(prefix + ".") for prefix in ALLOWED_SKLEARN_PREFIXES
+        )
+    return True
+
+
 def _check_imports(tree: ast.Module) -> list[str]:
     """校验 import 白名单，返回人类可读的导入清单。"""
     imports: list[str] = []
@@ -227,11 +245,11 @@ def _check_imports(tree: ast.Module) -> list[str]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                if root not in ALLOWED_IMPORT_ROOTS:
+                if not _module_allowed(alias.name):
                     raise _RuleViolation(
                         "imports",
                         f"第 {node.lineno} 行禁止导入 {alias.name}；"
-                        "只允许 math / numpy / pandas",
+                        "只允许 math / numpy / pandas / sklearn（模型相关子模块）/ scipy",
                     )
                 imports.append(
                     alias.name if alias.asname is None else f"{alias.name} as {alias.asname}"
@@ -241,11 +259,11 @@ def _check_imports(tree: ast.Module) -> list[str]:
                 raise _RuleViolation("imports", f"第 {node.lineno} 行禁止相对导入")
             module = node.module or ""
             root = module.split(".")[0]
-            if root not in ALLOWED_IMPORT_ROOTS:
+            if not _module_allowed(module):
                 raise _RuleViolation(
                     "imports",
                     f"第 {node.lineno} 行禁止从 {module or '未知模块'} 导入；"
-                    "只允许 math / numpy / pandas",
+                    "只允许 math / numpy / pandas / sklearn（模型相关子模块）/ scipy",
                 )
             for alias in node.names:
                 if alias.name == "*":

@@ -121,7 +121,7 @@ AI 追问原则：一次一个问题；先回应/共情，再问；提供生活�
 
 ### 6.1 内置模型类型（registry）
 
-至少 6 种：`multi_factor`（均衡多因子）、`low_vol_quality`（低波质量）、`momentum_growth`（趋势成长）、`value_dividend`（价值红利）、`contrarian`（反转）、`svm_linear`（SVM 线性核）。客户点名模型时服务端优先按点名模型生成候选方案。每个模型：`id/name/description/weights(10因子)`。
+内置 5 种：`multi_factor`（均衡多因子）、`low_vol_quality`（低波质量）、`momentum_growth`（趋势成长）、`value_dividend`（价值红利）、`contrarian`（反转）。客户点名清单外模型（SVM、随机森林、梯度提升、聚类等）时，走 `approach=code`，由 AI 用 sklearn 生成自定义模型代码并回测，不再维护固定模型白名单。每个模型：`id/name/description/weights(10因子)`。
 
 ### 6.2 LLM 提案 JSON（pipeline 输入）
 
@@ -148,7 +148,11 @@ def build_transform():
         return ...
     return transform
 ```
-允许 import：`math`、`numpy as np`、`pandas as pd`；禁止：文件/网络/系统调用/动态执行/dunder 属性；源码 ≤6000 字符；必须通过 AST 白名单检查 + 子进程冒烟（10s 超时）。
+允许 import：`math`、`numpy as np`、`pandas as pd`、`sklearn`（仅 preprocessing/svm/ensemble/linear_model/cluster/decomposition/pipeline/impute/neighbors/tree/metrics/utils 子模块）与 `scipy`；禁止：文件/网络/系统调用/动态执行/dunder 属性；源码 ≤6000 字符；必须通过 AST 白名单检查 + 子进程冒烟（10s 超时）。sklearn 模型基于当前截面做转导/无监督拟合或用加权因子合成分构造伪标签，不假设未来收益标签。
+
+### 6.4 预期核对与继续优化
+
+候选回测完成后，服务端根据用户本轮诉求（收益优先 / 回撤优先 / 默认夏普）与画像回撤上限核对是否达到目标，并在 work 卡新增「核对您的目标」步骤。未达预期时：审批卡标题改为「候选未达预期，是否仍要启用？」并增加「继续优化」动作；聊天回复明确差距，不会自动启用模型。用户选择「继续优化」会重新进入 analyze_model，生成下一轮候选。
 
 ### 6.4 pipeline 公开函数
 
@@ -170,7 +174,7 @@ def build_candidate_proposal(llm, state) -> Proposal  # 调 LLM 生成提案（p
 - SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`token` 事件逐字追加（前端打字机渲染）；`ui` 事件按 id upsert 卡片（work 卡步骤实时更新）。**代码/权重/模型类型改动流式契约**：服务端先发一个 `work` 块（`status=running`、最后一步 `修改模型代码/调整因子权重/切换模型类型` 为 running、`code_change.diff` 为空），随后按行重复发同一 id 的 `work` 块，`code_change.diff` 逐行增长，最后发 `status=done` 的完整块；前端按 id 覆盖渲染，因此代码框逐行出现。`error` 显示错误条+重试；停止生成通过 `AbortController` 取消请求。
 - 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧上下文，从 `/messages` 恢复聊天文本与富卡片（`blocks`）；历史对话通过 `GET /api/sessions` 归档列表切换。
 - 视觉：**Professional Financial SaaS / Light Mode**，参考 Linear + Bloomberg Terminal + Stripe Dashboard。Token：背景 `#F8FAFC`、卡片 `#FFFFFF`、品牌 Navy `#1E3A5F`、交互蓝 `#2563EB`、边框 `#E2E8F0`；卡片 1px 边框 / 10px 圆角 / 默认无阴影，按钮 6px 圆角，输入框 8px 圆角；正文 14px、辅助 12px、卡片标题 16px。**不使用动态渐变背景、玻璃拟态与大阴影**。
-- 模型切换：内置 6 种模型类型（含 `svm_linear` SVM 线性核）；客户文本点名模型时，服务端通过别名识别并优先按该模型生成候选方案，不再由 LLM 自由拒绝。SVM 是线性核风格的规则化因子权重模型，不做在线训练。
+- 模型切换：内置 5 种基础风格；客户点名其他模型时，服务端强制 `approach=code`，由 AI 使用 numpy/pandas/sklearn/scipy 写自定义模型代码并通过静态检查+冒烟后回测，不再由 LLM 以“没有对应选项”拒绝。模型代码只允许基于当前截面做转导/无监督拟合或伪标签蒸馏。
 - 确认话术：同一轮只允许出现一段确认请求；服务端修剪计划回复中的重复确认段落，并在动作 note 与回复重复时剥离 note 中的确认尾段；已确认画像字段不得重复询问。
 - 状态与金融语义：成功绿 / 警告琥珀 / 危险红 / 信息蓝；A 股涨跌沿用大陆习惯红色上涨、绿色下跌；收益、回撤、夏普等指标统一标注「历史回测数据，不代表未来实际表现」。
 - 禁止：mock 数据、独立页签、页面内直接调 selection/tune/profile 接口、伪造进度。

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from pathlib import Path
@@ -60,13 +61,19 @@ WORK_STEP_TEMPLATES = {
 
 
 MODEL_REQUEST_ALIASES: dict[str, tuple[str, ...]] = {
-    "svm_linear": ("svm", "支持向量机", "线性核", "support vector", "supportvector"),
     "low_vol_quality": ("低波质量", "低波稳健"),
     "multi_factor": ("均衡多因子", "均衡配置"),
     "momentum_growth": ("趋势成长", "动量成长"),
     "value_dividend": ("价值红利", "红利策略"),
     "contrarian": ("反转策略", "反转模型"),
 }
+
+
+CUSTOM_MODEL_KEYWORDS = (
+    "svm", "支持向量机", "随机森林", "randomforest", "xgboost", "lightgbm",
+    "梯度提升", "gbdt", "神经网络", "机器学习", "sklearn", "kmeans", "pca",
+    "聚类", "降维", "孤立森林", "isolationforest", "lasso", "ridge",
+)
 
 
 class ServiceError(RuntimeError):
@@ -440,19 +447,21 @@ class AppService:
 
         factor_stats = self._factor_stats(_scores, weights)
         recent_metrics = self._recent_metrics(model)
-        force_code = self._wants_code_change(request_text)
-        requested_model = self._requested_model_type(request_text)
+        custom_model = self._requested_custom_model(request_text)
+        force_code = self._wants_code_change(request_text) or bool(custom_model)
+        requested_model = "" if custom_model else self._requested_model_type(request_text)
         if requested_model:
-            # 客户点名模型：优先按点名模型生成确定性方案，避免模型说“没有对应选项”
+            # 客户点名的是内置模型：优先按点名模型生成确定性方案，避免模型说“没有对应选项”
             proposal = self._normalize_proposal(self._model_switch_proposal(requested_model), weights)
         else:
             proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
-                                                request_text, force_code)
+                                                request_text, force_code, custom_model=custom_model)
             proposal = self._normalize_proposal(proposal_raw, weights)
             if force_code and proposal["approach"] != "code":
-                # 客户明确要求改代码时，再明确约束一次
+                # 客户点名自定义模型或明确要求改代码时，必须让 AI 写代码实现
                 proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
-                                                    request_text, True, strict=True)
+                                                    request_text, True, strict=True,
+                                                    custom_model=custom_model)
                 proposal = self._normalize_proposal(proposal_raw, weights)
         add_step("提出改进方案", str(proposal.get("summary", "")), "done", "plan")
         yield "ui", publish(proposal=self._proposal_public(proposal))
@@ -538,6 +547,13 @@ class AppService:
                  f"夏普从 {float(base_metrics.get('sharpe', 0)):.2f} 变为 "
                  f"{float(candidate_metrics.get('sharpe', 0)):.2f}，等你确认后再启用。",
                  "done", "compare")
+        expectation = self._expectation(request_text, session_id)
+        expectation_met, expectation_reason = self._meets_expectation(
+            expectation, base_metrics, candidate_metrics)
+        add_step("核对您的目标", expectation_reason,
+                 "done" if expectation_met else "error", "check")
+        yield "ui", publish(proposal=self._proposal_public(proposal),
+                            comparison=comparison)
         candidate_model = self._candidate_model(proposal, model)
         pending = {
             "id": proposal.get("id") or uuid.uuid4().hex[:8],
@@ -556,22 +572,30 @@ class AppService:
                              comparison=comparison,
                              extra=final_extra)
         yield "ui", final_work
+        approval_actions = [
+            {"label": "同意，启用吧", "message": "同意启用这个改进"},
+            {"label": "先不启用", "message": "先别启用，我再想想"},
+        ]
+        if not expectation_met:
+            approval_actions.append({"label": "继续优化", "message": "继续优化模型，上一版未达到我的预期"})
         approval = {
             "id": "approval-" + uuid.uuid4().hex[:8],
             "type": "approval",
-            "title": "是否启用这个改进？",
+            "title": "是否启用这个改进？" if expectation_met else "候选未达预期，是否仍要启用？",
             "summary": (f"AI 建议：{proposal.get('summary', '')} "
                         f"回测夏普 {float(base_metrics.get('sharpe', 0)):.2f} → "
-                        f"{float(candidate_metrics.get('sharpe', 0)):.2f}。"),
-            "risk": "；".join(proposal.get("risks") or []) or "历史回测不代表未来表现。",
-            "actions": [
-                {"label": "同意，启用吧", "message": "同意启用这个改进"},
-                {"label": "先不启用", "message": "先别启用，我再想想"},
-            ],
+                        f"{float(candidate_metrics.get('sharpe', 0)):.2f}。"
+                        + ("" if expectation_met else f" 目标核对：{expectation_reason}")),
+            "risk": ("；".join(proposal.get("risks") or []) or "历史回测不代表未来表现。")
+                    + ("" if expectation_met else " 注意：候选方案未达到您的目标，建议继续优化或先保留现模型。"),
+            "actions": approval_actions,
         }
         yield "ui", {"block": approval}
-        return [final_work["block"], approval], ("需要您确认：新的模型方案已完成回测。是否启用？"
-                    "请回复「同意启用」应用该方案，或回复「先不启用」保留现有模型。"), False
+        note_text = "需要您确认：新的模型方案已完成回测。是否启用？"
+        if not expectation_met:
+            note_text = ("候选方案未达到您的目标：" + expectation_reason
+                         + " 您可以先不启用，或回复「继续优化」让我换一种模型方向再试。")
+        return [final_work["block"], approval], note_text, False
 
     @staticmethod
     def _requested_model_type(request_text: str) -> str:
@@ -583,6 +607,74 @@ class AppService:
                 if alias.lower().replace(" ", "") in text:
                     return model_id
         return ""
+
+    @staticmethod
+    def _requested_custom_model(request_text: str) -> str:
+        text = str(request_text or "").lower().replace(" ", "")
+        for keyword in CUSTOM_MODEL_KEYWORDS:
+            if keyword.lower() in text:
+                return keyword
+        return ""
+
+    def _target_drawdown(self, request_text: str, session_id: str) -> float | None:
+        text = str(request_text or "")
+        match = re.search(r"回撤[^0-9]{0,10}([0-9]+(?:\.[0-9]+)?)\s*%", text)
+        if not match:
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%[。；;\s]{0,4}回撤", text)
+        if match:
+            try:
+                return abs(float(match.group(1))) / 100.0
+            except ValueError:
+                return None
+        profile = self.store.get_profile(session_id) or {}
+        value = str((profile.get("slots") or {}).get("drawdown_tolerance") or "")
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", value)
+        if match:
+            try:
+                return abs(float(match.group(1))) / 100.0
+            except ValueError:
+                return None
+        return None
+
+    def _expectation(self, request_text: str, session_id: str) -> dict[str, Any]:
+        text = str(request_text or "")
+        if any(word in text for word in ("收益", "回报", "赚钱", "涨幅")):
+            objective = "cagr"
+        elif any(word in text for word in ("回撤", "风险", "波动")):
+            objective = "mdd"
+        else:
+            objective = "sharpe"
+        return {"objective": objective,
+                "tolerance": self._target_drawdown(request_text, session_id)}
+
+    @staticmethod
+    def _meets_expectation(expectation: dict[str, Any], base: dict[str, Any],
+                           candidate: dict[str, Any]) -> tuple[bool, str]:
+        objective = expectation.get("objective") or "sharpe"
+        tolerance = expectation.get("tolerance")
+        names = {"cagr": "年化收益", "sharpe": "夏普比率", "mdd": "最大回撤"}
+        try:
+            base_value = float(base.get(objective) or 0.0)
+            cand_value = float(candidate.get(objective) or 0.0)
+        except (TypeError, ValueError):
+            return False, "回测指标不完整，暂时无法判断是否达到目标。"
+        improved = cand_value > base_value + 1e-9
+        if objective == "mdd":
+            improved = cand_value > base_value + 1e-9
+        reason = (f"目标：{names.get(objective, objective)}较当前改善；"
+                  f"当前 {base_value:.4f} → 候选 {cand_value:.4f}。")
+        met = improved
+        if tolerance is not None:
+            cand_mdd = abs(float(candidate.get("mdd") or 0.0))
+            if cand_mdd > tolerance + 1e-9:
+                met = False
+                reason += (f"候选最大回撤 {cand_mdd * 100:.1f}% 仍高于您设定的 "
+                           f"{tolerance * 100:.0f}% 上限。")
+            else:
+                reason += f"候选最大回撤 {cand_mdd * 100:.1f}%，在 {tolerance * 100:.0f}% 上限内。"
+        elif not improved:
+            reason += "候选指标没有优于当前模型。"
+        return met, reason
 
     @staticmethod
     def _model_switch_proposal(model_type: str) -> dict[str, Any]:
@@ -600,7 +692,7 @@ class AppService:
     def _propose_change(self, model: dict[str, Any], base_metrics: dict[str, Any],
                         factor_stats: dict[str, Any], recent_metrics: dict[str, Any],
                         request_text: str = "", force_code: bool = False,
-                        strict: bool = False) -> dict[str, Any]:
+                        strict: bool = False, custom_model: str = "") -> dict[str, Any]:
         from .models import pipeline
         state = {
             "proposal_request": True,
@@ -613,10 +705,14 @@ class AppService:
             "recent_metrics": recent_metrics,
             "user_request": request_text,
             "force_approach": "code" if force_code else "",
+            "requested_custom_model": custom_model,
             "market": {"as_of": self.data.as_of, "universe": len(self.data.universe)},
         }
         if strict:
-            state["strict_requirement"] = "客户已明确要求修改策略代码，本次必须输出 approach=code 的代码方案。"
+            state["strict_requirement"] = (
+                "客户明确要求修改策略代码或点名自定义模型，本次必须输出 approach=code 的代码方案；"
+                "不得用内置模型或权重调整替代。"
+            )
         try:
             raw = pipeline.build_candidate_proposal(self.llm, state)
         except Exception as exc:  # noqa: BLE001

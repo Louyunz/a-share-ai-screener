@@ -72,6 +72,23 @@ _CODE_SAMPLE = """def build_transform():
         return score
     return transform"""
 
+_SKLEARN_SAMPLE = """import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+
+def build_transform():
+    def transform(z, weights):
+        x = z.fillna(0.0)
+        base = np.zeros(len(x), dtype=float)
+        for factor, weight in weights.items():
+            column = "z_" + factor
+            if column in x.columns:
+                base = base + float(weight) * x[column].to_numpy(dtype=float)
+        model = RandomForestRegressor(n_estimators=60, max_depth=3, random_state=42)
+        model.fit(x.to_numpy(dtype=float), base)
+        return pd.Series(model.predict(x.to_numpy(dtype=float)), index=z.index)
+    return transform"""
+
 
 def _build_system_prompt() -> str:
     """构造建模助手系统提示词（模型清单与因子说明从注册表动态生成）。"""
@@ -102,13 +119,13 @@ def _build_system_prompt() -> str:
         "（省略时沿用当前权重），code 必须通过静态安全检查和子进程冒烟测试。",
         "若 state.user_request 明确要求修改策略代码（如“改代码/修改源代码/build_transform/自定义代码”），"
         "必须使用 approach=\"code\"，不得用权重或内置模型替代；若 state.force_approach 非空，必须使用该 approach。",
+        "若 state.requested_custom_model 非空，或客户点名内置清单之外的模型（如 SVM、随机森林、梯度提升、聚类、PCA 等），"
+        "必须使用 approach=\"code\"，用 sklearn 在 transform 内实现该模型；不得拒绝、不得声称没有选项，也不得用内置模型替代。",
         "在没有明确要求时，优先选择改动小、能解释清楚的方案；能用内置模型或权重调整解决时不要写代码。",
         "",
         "## 内置模型清单",
         model_lines,
         "",
-        "客户点名清单内的模型（例如 SVM / 支持向量机）时，必须优先使用 approach=\"model_type\"，"
-        "model_type 使用对应 id（SVM → svm_linear）；不得声称没有对应选项，也不得擅自替换成其他风格。",
         "",
         "## 可用因子",
         f"{factor_lines}。",
@@ -118,11 +135,16 @@ def _build_system_prompt() -> str:
         "- 必须定义顶层函数 def build_transform():，它返回可调用的 transform(z, weights)。",
         "- z 是 pandas.DataFrame，含 10 列 z_ep、z_bp、...，index 是股票代码；weights 是 {因子名: 权重} 的 dict。",
         "- transform 必须返回 pandas.Series，index 与 z 对齐、长度一致且不含 NaN/Inf。",
-        "- 只允许 import math、import numpy as np、import pandas as pd；"
+        "- 允许 import math、numpy、pandas，以及 sklearn / scipy 的模型与预处理子模块；"
         "禁止文件/网络/系统调用与动态执行（open/exec/eval/compile/__import__ 等）；"
         "禁止访问下划线开头的属性（含 dunder）；源码不超过 6000 字符；不要打印、不要读写文件、不要定义类。",
-        "- 参考写法（实际代码顶部必须补上 import numpy as np 与 import pandas as pd）：",
+        "- sklearn 模型只能基于当前 z 截面做转导式/无监督拟合，或先用加权因子合成分构造伪标签再训练；"
+        "不得假设存在未来收益标签，不得使用 sklearn.datasets 或任何文件读写。"
+        "禁止导入 xgboost/lightgbm/torch/tensorflow 等未安装库；需要等价模型时用 sklearn 对应实现。",
+        "- 参考写法（简单因子组合，实际代码顶部必须补上 import numpy as np 与 import pandas as pd）：",
         _CODE_SAMPLE,
+        "- sklearn 参考写法（伪标签蒸馏，演示如何让 AI 自写任意模型）：",
+        _SKLEARN_SAMPLE,
         "",
         "## 面向普通用户",
         "summary、why、expected_effect、risks 会直接展示给用户：用生活化语言，避免英文术语和公式；"

@@ -210,22 +210,6 @@ _BUILTIN_DEFINITIONS: dict[str, dict[str, Any]] = {
             "size": 0.06,
         },
     },
-    "svm_linear": {
-        "name": "SVM 线性核",
-        "description": "线性核支持向量机风格的因子复合模型：以低波动、盈利质量和估值安全边际为核心，追求控回撤下的稳健打分；属于规则化权重模型，不进行在线训练。",
-        "weights": {
-            "ep": 0.10,
-            "bp": 0.08,
-            "roe": 0.18,
-            "ocf_to_profit": 0.16,
-            "revenue_growth": 0.06,
-            "momentum_60": 0.08,
-            "reversal_5": 0.06,
-            "volatility_60": 0.20,
-            "liquidity_20": 0.05,
-            "size": 0.03,
-        },
-    },
 }
 
 

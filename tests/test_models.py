@@ -118,9 +118,7 @@ class RegistryTests(unittest.TestCase):
     """内置模型注册表。"""
 
     def test_builtin_model_ids_complete(self) -> None:
-        self.assertGreaterEqual(len(MODEL_TYPES), 6)
-        self.assertIn("svm_linear", MODEL_TYPES)
-        self.assertIn("SVM", MODEL_TYPES["svm_linear"].name)
+        self.assertGreaterEqual(len(MODEL_TYPES), 5)
         for model_id in REQUIRED_MODEL_IDS:
             self.assertIn(model_id, MODEL_TYPES)
             self.assertEqual(MODEL_TYPES[model_id].id, model_id)
@@ -216,6 +214,21 @@ class RegistryTests(unittest.TestCase):
 
 class CustomCodeTests(unittest.TestCase):
     """AI 生成代码的静态校验与受限编译。"""
+
+    def test_sklearn_custom_model_is_allowed(self) -> None:
+        code = """import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+def build_transform():
+    def transform(z, weights):
+        matrix = z.fillna(0.0).to_numpy(dtype=float)
+        scaled = StandardScaler().fit_transform(matrix)
+        score = scaled.mean(axis=1)
+        return pd.Series(score, index=z.index)
+    return transform"""
+        info = validate_code(code)
+        self.assertTrue(any("sklearn.preprocessing" in item for item in info["imports"]))
 
     def test_valid_code_passes(self) -> None:
         info = validate_code(VALID_CODE)
