@@ -11,7 +11,10 @@
    权重喂给 ``build_transform()`` 返回的 transform，10 秒超时，校验返回
    ``pandas.Series``、长度一致且全部为有限数值。
 
-``compile_code`` 复用同一套校验，并在受限 ``__builtins__`` 环境里执行代码。
+支持参数化引擎（供服务端网格寻优）：``def build_transform(params=None)``，
+参数只能叫 ``params`` 且最多一个；冒烟子进程会把 ``params`` 传进去。
+``compile_code`` 复用同一套校验，并在受限 ``__builtins__`` 环境里执行代码；
+``validate=False`` 时可跳过重复校验，直接复用已经校验过的代码。
 """
 
 from __future__ import annotations
@@ -19,13 +22,15 @@ from __future__ import annotations
 import ast
 import builtins
 import json
+import math
 import os
 import random
 import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
@@ -155,7 +160,10 @@ def _run(payload, result):
     build_transform = namespace.get("build_transform")
     if not callable(build_transform):
         raise RuntimeError("build_transform 未定义或不可调用")
-    transform = build_transform()
+    if payload.get("build_transform_takes_params"):
+        transform = build_transform(dict(payload.get("params") or {}))
+    else:
+        transform = build_transform()
     if not callable(transform):
         raise RuntimeError("build_transform() 的返回值不可调用")
 
@@ -427,26 +435,45 @@ def _check_ast_safety(tree: ast.Module) -> None:
             )
 
 
-def _check_entrypoint(tree: ast.Module) -> None:
-    """静态检查 ``def build_transform():`` 入口。"""
-    build = None
+def _find_build_transform(tree: ast.Module) -> ast.FunctionDef | None:
+    """返回顶层 ``build_transform`` 定义（没有则 None）。"""
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name == "build_transform":
-            build = stmt
-            break
+            return stmt
+    return None
+
+
+def _build_transform_takes_params(build: ast.FunctionDef) -> bool:
+    """``build_transform`` 是否为 ``def build_transform(params)`` 形式。"""
+    positional = list(build.args.posonlyargs) + list(build.args.args)
+    return len(positional) == 1 and positional[0].arg == "params"
+
+
+def _check_entrypoint(tree: ast.Module) -> bool:
+    """静态检查 ``def build_transform()`` / ``def build_transform(params=None)``。
+
+    返回 ``build_transform`` 是否接收 ``params`` 参数。
+    """
+    build = _find_build_transform(tree)
     if build is None:
         raise _RuleViolation("entrypoint", "未找到顶层函数 def build_transform()")
     if build.decorator_list:
         raise _RuleViolation("entrypoint", "build_transform() 不允许使用装饰器")
     arguments = build.args
-    if (
-        arguments.posonlyargs
-        or arguments.args
-        or arguments.vararg
-        or arguments.kwonlyargs
-        or arguments.kwarg
-    ):
-        raise _RuleViolation("entrypoint", "build_transform() 不能带参数")
+    positional = list(arguments.posonlyargs) + list(arguments.args)
+    invalid = (
+        arguments.vararg is not None
+        or arguments.kwarg is not None
+        or bool(arguments.kwonlyargs)
+        or len(positional) > 1
+        or (len(positional) == 1 and positional[0].arg != "params")
+    )
+    if invalid:
+        raise _RuleViolation(
+            "entrypoint",
+            "build_transform() 只能无参数，或带一个名为 params 的参数"
+            "（调参引擎写法：def build_transform(params=None)）",
+        )
     has_return = any(
         isinstance(node, ast.Return) for node in ast.walk(build)
     )
@@ -454,6 +481,7 @@ def _check_entrypoint(tree: ast.Module) -> None:
         raise _RuleViolation(
             "entrypoint", "build_transform() 必须 return 一个 transform 函数"
         )
+    return _build_transform_takes_params(build)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +489,10 @@ def _check_entrypoint(tree: ast.Module) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _smoke_payload() -> dict[str, Any]:
+def _smoke_payload(
+    takes_params: bool = False,
+    params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     rng = random.Random(_SMOKE_SEED)
     factors = list(FACTOR_NAMES)
     z_values = {
@@ -473,19 +504,30 @@ def _smoke_payload() -> dict[str, Any]:
         "index": [f"6000{i:02d}" for i in range(_SMOKE_ROWS)],
         "weights": {name: round(1.0 / len(factors), 6) for name in factors},
         "z_values": z_values,
+        "params": dict(params or {}),
+        "build_transform_takes_params": bool(takes_params),
         "safe_builtins": sorted(SAFE_BUILTIN_NAMES),
         "allowed_import_roots": list(ALLOWED_IMPORT_ROOTS),
     }
 
 
-def _run_smoke_test(source: str) -> tuple[bool, str]:
+def _run_smoke_test(
+    source: str,
+    *,
+    takes_params: bool = False,
+    params: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
     """在临时目录的独立子进程中执行冒烟，返回 ``(是否通过, 说明)``。"""
     temp_dir = tempfile.mkdtemp(prefix="dsh_model_smoke_")
     try:
         base = Path(temp_dir)
         (base / "candidate.py").write_text(source, encoding="utf-8")
         (base / "payload.json").write_text(
-            json.dumps(_smoke_payload(), ensure_ascii=False), encoding="utf-8"
+            json.dumps(
+                _smoke_payload(takes_params=takes_params, params=params),
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
         driver = base / "smoke_driver.py"
         driver.write_text(_SMOKE_DRIVER, encoding="utf-8")
@@ -532,20 +574,48 @@ def _run_smoke_test(source: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-def validate_code(code: str) -> dict[str, Any]:
+def _clean_params(params: Mapping[str, Any] | None) -> dict[str, Any]:
+    """把调参参数转成可 JSON 序列化的数值 dict。"""
+    if params is None:
+        return {}
+    if not isinstance(params, Mapping):
+        raise ModelCodeError("params 必须是 dict（参数名 -> 数值）")
+    cleaned: dict[str, Any] = {}
+    for name, value in params.items():
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ModelCodeError(f"params[{name!r}] 必须是数值")
+        if isinstance(value, Integral):
+            cleaned[str(name)] = int(value)
+            continue
+        number = float(value)
+        if not math.isfinite(number):
+            raise ModelCodeError(f"params[{name!r}] 必须是有限数值")
+        cleaned[str(name)] = number
+    return cleaned
+
+
+def validate_code(
+    code: str,
+    params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """AST 白名单 + 子进程冒烟校验 AI 生成的模型源码。
+
+    支持两种入口：``def build_transform()`` 或
+    ``def build_transform(params=None)``（参数名必须叫 params，最多一个）。
+    ``params`` 会传给参数化引擎的 ``build_transform`` 并用于冒烟测试。
 
     Returns
     -------
     dict
         ``{"ok": True, "checks": [{"name", "status", "detail"}, ...],
-        "imports": [...]}``。
+        "imports": [...], "takes_params": bool}``。
 
     Raises
     ------
     ModelCodeError
         任一层校验不通过；异常的 ``checks`` / ``imports`` 属性保留明细。
     """
+    cleaned_params = _clean_params(params)
     checks: list[dict[str, str]] = []
     imports: list[str] = []
 
@@ -592,21 +662,33 @@ def validate_code(code: str) -> dict[str, Any]:
     record("ast_safety", "AST 白名单通过：无危险导入/调用/属性访问")
 
     try:
-        _check_entrypoint(tree)
+        takes_params = _check_entrypoint(tree)
     except _RuleViolation as exc:
         fail(exc.check, exc.detail)
-    record("entrypoint", "已定义 build_transform() 且带 return")
+    record(
+        "entrypoint",
+        "已定义 build_transform(params) 且带 return"
+        if takes_params
+        else "已定义 build_transform() 且带 return",
+    )
 
-    ok, detail = _run_smoke_test(source)
+    ok, detail = _run_smoke_test(
+        source, takes_params=takes_params, params=cleaned_params
+    )
     if not ok:
         fail("smoke", detail)
     record("smoke", detail or "子进程冒烟测试通过")
 
-    return {"ok": True, "checks": checks, "imports": imports}
+    return {
+        "ok": True,
+        "checks": checks,
+        "imports": imports,
+        "takes_params": takes_params,
+    }
 
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """受限 ``__import__``：只放行 math / numpy / pandas。"""
+    """受限 ``__import__``：只放行 math / numpy / pandas / sklearn / scipy。"""
     root = str(name).split(".")[0]
     if level or root not in ALLOWED_IMPORT_ROOTS:
         raise ImportError(f"不允许导入模块: {name}")
@@ -623,16 +705,48 @@ def _restricted_builtins() -> dict[str, Any]:
     return allowed
 
 
-def compile_code(code: str) -> Callable[..., Any]:
-    """校验通过后在受限环境编译代码，返回 ``transform(z, weights)``。
+def compile_code(
+    code: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    validate: bool = True,
+) -> Callable[..., Any]:
+    """编译模型代码，返回 ``transform(z, weights)``。
+
+    Parameters
+    ----------
+    code:
+        模型源码；``def build_transform()`` 或
+        ``def build_transform(params=None)``。
+    params:
+        调参参数；参数化引擎编译时作为 ``build_transform(params)`` 的入参。
+    validate:
+        默认 ``True`` 会先做 AST + 子进程冒烟校验；服务端网格寻优复用同一份
+        已校验代码时可传 ``False`` 跳过重复校验（不重复启动冒烟子进程）。
 
     Raises
     ------
     ModelCodeError
         校验、编译或 ``build_transform()`` 执行失败。
     """
-    validate_code(code)
-    source = code.strip()
+    cleaned_params = _clean_params(params)
+    if validate:
+        info = validate_code(code, params=cleaned_params)
+        takes_params = bool(info.get("takes_params"))
+        source = code.strip()
+    else:
+        if not isinstance(code, str) or not code.strip():
+            raise ModelCodeError("模型代码必须是非空字符串")
+        source = code.strip()
+        try:
+            tree = ast.parse(source, filename="<ai_model>")
+        except SyntaxError as exc:
+            raise ModelCodeError(
+                f"模型代码语法错误：第 {exc.lineno} 行 {exc.msg}"
+            ) from exc
+        build = _find_build_transform(tree)
+        takes_params = build is not None and _build_transform_takes_params(build)
+
     namespace: dict[str, Any] = {
         "__builtins__": _restricted_builtins(),
         "__name__": "ai_custom_model",
@@ -648,7 +762,9 @@ def compile_code(code: str) -> Callable[..., Any]:
     if not callable(build_transform):
         raise ModelCodeError("模型代码未提供可调用的 build_transform()")
     try:
-        transform = build_transform()
+        transform = (
+            build_transform(cleaned_params) if takes_params else build_transform()
+        )
     except Exception as exc:
         raise ModelCodeError(
             f"build_transform() 执行失败：{type(exc).__name__}: {exc}"

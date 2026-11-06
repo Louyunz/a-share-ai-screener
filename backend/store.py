@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _now() -> str:
@@ -66,6 +66,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS version (
                 id TEXT PRIMARY KEY,
                 parent_id TEXT,
+                session_id TEXT,
                 model_json TEXT NOT NULL,
                 metrics_json TEXT NOT NULL,
                 summary TEXT NOT NULL DEFAULT '',
@@ -92,6 +93,12 @@ class Store:
         if "blocks_json" not in columns:
             self._conn.execute(
                 "ALTER TABLE message ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]'")
+        version_columns = [row[1] for row in self._conn.execute("PRAGMA table_info(version)")]
+        if "session_id" not in version_columns:
+            self._conn.execute("ALTER TABLE version ADD COLUMN session_id TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_version_session "
+            "ON version(session_id, created_at)")
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -209,13 +216,14 @@ class Store:
     # ------------------------------------------------------------------
     def create_version(self, model: dict[str, Any], metrics: dict[str, Any], *,
                        status: str = "candidate", parent_id: str | None = None,
-                       source: str = "ai_optimize", summary: str = "") -> str:
+                       source: str = "ai_optimize", summary: str = "",
+                       session_id: str | None = None) -> str:
         version_id = _new_id("v")
         with self._lock:
             self._conn.execute(
-                "INSERT INTO version(id, parent_id, model_json, metrics_json, summary, source, "
-                "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (version_id, parent_id, json.dumps(model, ensure_ascii=False),
+                "INSERT INTO version(id, parent_id, session_id, model_json, metrics_json, summary, "
+                "source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (version_id, parent_id, session_id, json.dumps(model, ensure_ascii=False),
                  json.dumps(metrics, ensure_ascii=False), summary, source, status, _now()))
             self._conn.commit()
         return version_id
@@ -226,10 +234,15 @@ class Store:
                 "SELECT * FROM version WHERE id = ?", (version_id,)).fetchone()
         return self._version_row(row) if row else None
 
-    def list_versions(self) -> list[dict[str, Any]]:
+    def list_versions(self, session_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM version ORDER BY created_at ASC, id ASC").fetchall()
+            if session_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM version ORDER BY created_at ASC, id ASC").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM version WHERE session_id = ? "
+                    "ORDER BY created_at ASC, id ASC", (session_id,)).fetchall()
         return [self._version_row(row) for row in rows]
 
     def active_version(self) -> dict[str, Any] | None:
@@ -282,9 +295,11 @@ class Store:
 
     @staticmethod
     def _version_row(row: sqlite3.Row) -> dict[str, Any]:
+        keys = row.keys()
         return {
             "id": row["id"],
             "parent_id": row["parent_id"],
+            "session_id": row["session_id"] if "session_id" in keys else None,
             "model": json.loads(row["model_json"]),
             "metrics": json.loads(row["metrics_json"]),
             "summary": row["summary"],

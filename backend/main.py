@@ -124,12 +124,10 @@ def create_app(service: AppService | None = None) -> FastAPI:
             return _error(exc)
 
     @app.get("/api/versions")
-    def versions() -> Any:
+    def versions(request: Request) -> Any:
         try:
-            service = get_service()
-            active = service.store.active_version()
-            return {"versions": [service._version_public(item) for item in service.store.list_versions()],
-                    "active_id": active["id"] if active else None}
+            session_id = request.query_params.get("session") or None
+            return get_service().versions(session_id)
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 

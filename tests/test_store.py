@@ -2,6 +2,7 @@
 """SQLite 存储测试（v2：会话/消息/画像/模型版本/运行态）。"""
 from __future__ import annotations
 
+import sqlite3
 import unittest
 
 from backend.store import SCHEMA_VERSION, Store
@@ -94,6 +95,49 @@ class StoreTest(unittest.TestCase):
         older = sessions[1]
         self.assertEqual(older["message_count"], 2)
         self.assertTrue(older["profile_summary"])
+
+    def test_migrates_legacy_version_table(self) -> None:
+        """旧库（v3，version 表无 session_id）应自动迁移而不是启动报错。"""
+        path = self.dir / "legacy.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE version (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                model_json TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'ai_optimize',
+                status TEXT NOT NULL DEFAULT 'candidate',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
+            PRAGMA user_version=3;
+            """
+        )
+        conn.execute(
+            "INSERT INTO version(id, parent_id, model_json, metrics_json, summary, source, status, created_at)"
+            " VALUES ('v-legacy', NULL, '{\"name\":\"旧模型\",\"weights\":{\"ep\":1}}', '{}',"
+            " '旧版本', 'ai_optimize', 'active', '2024-01-01T00:00:00')"
+        )
+        conn.commit()
+        conn.close()
+        store = Store(path)
+        try:
+            columns = [row[1] for row in store._conn.execute("PRAGMA table_info(version)")]
+            self.assertIn("session_id", columns)
+            version = store.get_version("v-legacy")
+            self.assertIsNotNone(version)
+            self.assertEqual(version["session_id"], None)
+            self.assertEqual(store.list_versions(session_id="no-session"), [])
+            user_version = int(store._conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(user_version, SCHEMA_VERSION)
+        finally:
+            store.close()
 
     def test_unknown_version(self) -> None:
         with self.assertRaises(KeyError):

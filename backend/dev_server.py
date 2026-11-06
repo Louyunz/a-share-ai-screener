@@ -10,7 +10,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .config import FRONTEND_DIR
 from .data import DataError
@@ -98,18 +98,17 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         try:
             if path == "/api/health":
                 return self._send_json(200, self.service.health())
             if path == "/api/sessions":
                 return self._send_json(200, self.service.list_sessions())
             if path == "/api/versions":
-                active = self.service.store.active_version()
-                return self._send_json(200, {
-                    "versions": [self.service._version_public(item)
-                                 for item in self.service.store.list_versions()],
-                    "active_id": active["id"] if active else None})
+                query = parse_qs(parsed.query or "")
+                session_id = (query.get("session") or [""])[0] or None
+                return self._send_json(200, self.service.versions(session_id))
             match = re.match(r"^/api/sessions/([^/]+)/messages$", path)
             if match:
                 return self._send_json(200, self.service.messages(match.group(1)))

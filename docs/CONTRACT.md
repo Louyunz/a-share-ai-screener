@@ -1,4 +1,4 @@
-# A 股 AI 选股助手 · v2 契约（对话优先 + AI 主动执行 + AI 参与建模）
+# A 股 AI 选股助手 · v2.1 契约（对话优先 + AI 定引擎/范围 + 服务端网格寻优）
 
 > 本文件是 v2 唯一契约。旧版接口/页面/兜底设计直接替换，不保留兼容层；历史版本见 git。
 
@@ -14,8 +14,9 @@
 1. **一个对话框完成全部操作**：画像采集、确认、选股、解读、追问、模型优化、版本启用/回滚，全部在同一个聊天流里完成。没有模块页签、没有独立的“运行/确认”按钮页面。
 2. **AI 主动执行（用户确认后）**：AI 判断用户意图并调用后端动作。画像确认、发起选股等低风险动作，在用户对话中确认后由 AI 直接执行；应用模型变更/启用版本等高影响动作，在聊天中给出审批卡，用户点击聊天内快捷回复或直接说“同意”后执行。
 3. **普通用户语言**：AI 不用专业术语提问；必须把“回撤、夏普、因子”等翻译成生活化解释；一次只问一个问题；先共情再提问。
-4. **AI 真正参与建模**：AI 可以切换内置模型类型、调整参数、生成/修改选股模型源码（受静态检查与冒烟测试约束），并用回测结果向用户解释为什么更好。
-5. **AI 工作过程可见**：优化过程中，前端实时展示 AI 的步骤（分析→提出方案→改代码→检查→回测→对比→等待确认），步骤由后端真实动作产生，不伪造。
+4. **AI 定引擎，服务端调参**：AI 负责选择/编写底层打分引擎并给出参数搜索范围；最终权重或代码参数由服务端在范围内网格寻优、逐组回测选出。AI 不直接拍最终参数。
+5. **AI 工作过程可见**：优化过程中，前端实时展示 AI 的步骤（分析 → 提出调参方案 → 服务端网格寻优 → 写入改动 → 回测 → 对比 → 等待确认），步骤由后端真实动作产生，不伪造。寻优进度卡按真实回测事件实时更新。
+6. **模型会话隔离**：模型改动只在被启用的会话内生效；新建对话默认使用「均衡多因子」模型，不继承上一个对话的模型。每个会话保留自己的版本链，可独立回滚。
 
 ## 1.1 数据源（真实数据）
 
@@ -33,8 +34,8 @@
 | POST | `/api/sessions` | `{session_id}` |
 | POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
 | GET | `/api/sessions/{sid}/messages` | 文本 + 富卡片历史 `{messages:[{role,content,blocks,created_at}]}` |
-| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection}` |
-| GET | `/api/versions` | 版本列表（兼容保留给状态面板） |
+| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别 |
+| GET | `/api/versions?session={sid}` | 版本列表；带 `session` 时只返回该会话版本链（`model_scope=session`），不带时返回全局归档 |
 
 不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
 
@@ -74,28 +75,47 @@
 {"id":"work-1","type":"work","title":"AI 正在优化模型",
  "status":"running|done|error",
  "steps":[{"title":"看当前表现","detail":"近两年年化 12%，最大回撤 18%","status":"done","kind":"analysis"},
-          {"title":"提出方案","detail":"把权重更多放给低波动和盈利质量","status":"running","kind":"plan"}],
+          {"title":"运行因子网格寻优","detail":"已评估 18/21 组，当前最优夏普 0.83","status":"running","kind":"tune"}],
  "comparison":{"current":{"sharpe":1.0},"candidate":{"sharpe":1.2}},
- "proposal":{"summary":"...","approach":"model_type|weights|code",
-             "model_name":"低波质量","diff":"（code 方案时的 diff 摘要）",
-             "risks":["..."]}}
+ "code_change":{"file":"models/strategy.py","language":"python","kind":"code|weights|model_type",
+                "diff":"逐行 diff","added":12,"removed":3},
+ "proposal":{"summary":"...","approach":"服务端网格寻优（因子权重）",
+             "model_name":"网格寻优权重","why":"...","expected_effect":"...","risks":["..."]}}
 ```
+
+**tuning**（服务端参数网格寻优进度卡；同一 id 实时 upsert）
+```json
+{"id":"tune-1","type":"tuning","title":"参数网格寻优","status":"running|done|error",
+ "method":"逐因子网格搜索|参数网格搜索",
+ "objective":"sharpe|cagr|mdd","objective_label":"夏普比率",
+ "space":[{"key":"roe","label":"赚钱能力","min":0.04,"max":0.24,"step":0.04}],
+ "progress":{"trial":12,"total":21,"percent":57,"elapsed":4.8},
+ "current":{"trial":12,"label":"赚钱能力 = 0.2","score":0.31,
+            "metrics":{"cagr":0.11,"sharpe":0.31,"mdd":-0.16},"params":{"roe":0.2}},
+ "best":{"trial":10,"label":"第 10 组","score":0.33,
+         "metrics":{"cagr":0.12,"sharpe":0.33,"mdd":-0.15},
+         "params":{"ep":0.1,"roe":0.2},"weights":{"ep":0.1,"roe":0.2},"constraint_ok":true},
+ "history":[{"trial":1,"score":0.12},{"trial":2,"score":0.18}],
+ "note":"网格寻优基于历史回测逐组评估，最优参数可能存在过拟合；候选仍需确认后才会启用。"}
+```
+说明：`space` 是 AI 给出的搜索范围（权重类为 10 因子，代码类为引擎参数）；进度、最优指标与得分走势由服务端每次回测后实时推送，前端不得伪造。`best.score`/`history.score` 是展示用真实目标指标（如夏普），选取排序时若回撤超限会在内部使用 `rank_score` 惩罚，`constraint_ok` 表示最优组是否满足回撤约束。
 
 **approval**（审批卡；用户可在聊天里点快捷回复，也可直接说话）
 ```json
-{"id":"approval-1","type":"approval","title":"是否启用这个改进？",
- "summary":"AI 建议把模型切成「低波质量」并微调权重，回测 Sharpe 从 1.02 升到 1.21。",
- "risk":"这是演示系统，不构成投资建议。",
- "actions":[{"label":"同意，启用吧","message":"同意启用这个改进"},
-            {"label":"先看看细节","message":"先不启用，展开说说风险"}]}
+{"id":"approval-1","type":"approval","title":"是否启用这个网格寻优结果？",
+ "summary":"服务端网格寻优（逐因子网格搜索）共评估 21 组参数，按夏普比率选出最优一组；回测夏普 0.40 → 0.83。",
+ "risk":"最优参数由历史回测选出，可能存在过拟合；历史回测不代表未来实际表现。",
+ "actions":[{"label":"同意","message":"同意启用这个改进"},
+            {"label":"暂存","message":"先别启用，我再想想"}]}
 ```
 
-**version**（版本卡）
+**version**（版本卡；版本与当前模型均为会话级）
 ```json
-{"id":"version-1","type":"version","active":{"id":"v...","name":"低波质量",
- "metrics":{"sharpe":1.2}},
- "versions":[{"id":"v...","name":"低波质量","status":"candidate","created_at":"..."}]}
+{"id":"version-1","type":"version","active":{"version_id":"v...","name":"网格寻优权重",
+ "kind":"builtin","metrics":{"sharpe":1.2}},
+ "versions":[{"id":"v...","name":"网格寻优权重","status":"active","created_at":"..."}]}
 ```
+用户同意后仅当前会话启用新模型；新建对话时 `active_model` 为默认「均衡多因子」，`versions` 为空。
 
 ## 4. AI 动作与权限（后端执行，前端不直接调）
 
@@ -111,15 +131,20 @@ Planner 每轮输出：
 | `confirm_profile` | 用户本轮明确确认（可以/确认/没问题/就按这个来）且画像必填齐全 | 写入 confirmed，返回 profile 卡，AI 回复确认 |
 | `run_selection` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | 有最近一次选股结果 | 基于事实回答追问 |
-| `analyze_model` | 画像已确认即可 | AI 分析当前模型表现 → 生成候选方案（切模型/调参/改代码）→ 静态检查 → 冒烟 → 回测 → work 卡 + approval 卡，**不自动启用** |
-| `apply_pending_change` | 存在待审批方案且用户本轮明确同意 | 保存新模型版本并设为 active，返回 version 卡 |
-| `rollback_version` | 用户明确要求回滚 | 切回上一版本，返回 version 卡 |
+| `analyze_model` | 画像已确认即可 | AI 分析当前模型 → 产出「底层引擎 + 参数搜索范围」调参方案 → 服务端逐轴网格寻优（实时推送 tuning 卡进度）→ 写入改动 diff → 候选回测 → work 卡 + tuning 卡 + approval 卡，**不自动启用** |
+| `apply_pending_change` | 存在待审批方案且用户本轮明确同意 | 在当前会话保存新模型版本并设为会话 active，返回 version 卡；其他会话与新对话不受影响 |
+| `rollback_version` | 用户明确要求回滚且当前会话存在可回滚版本 | 沿当前会话版本链切回上一版，返回 version 卡 |
 
 低风险动作不允许在缺少用户确认时触发；高影响动作必须有本轮明确同意。所有动作由后端校验，不信任前端。
 
-**继续优化升级**：用户点击审批卡的「继续优化」或说“上一版未达预期”时，服务端读取上一版 pending 方案并做结构性升级，禁止只微调权重：
+**AI 与服务的调参分工**：
+- AI 只输出 `approach + search_space/param_space + code`（见 6.2），**不输出最终权重/参数值**；
+- 服务端在范围内执行逐轴网格搜索，逐组回测后按目标指标保留最优（见 6.5）；
+- 最终候选的权重/参数由服务端写回模型与改动框，并在 tuning 卡中展示搜索范围与得分走势。
+
+**继续优化升级**：用户点击审批卡的「继续优化」或说“上一版未达预期”时，服务端读取上一版 pending 方案并做结构性升级，禁止只微调参数：
 - 上一版是 `weights` → 直接选择另一个内置基础模型（`model_type`）；
-- 上一版是 `model_type` 或 `code` → 强制 `approach=code`，由 AI 重写数学打分逻辑并重新回测；
+- 上一版是 `model_type` 或 `code` → 强制 `approach=code`，由 AI 重写参数化数学打分引擎，再由服务端重新寻优；
 - 会话会在 work 卡中明确展示「升级优化策略」步骤，并说明本轮采取的结构性策略。
 
 **动作前置校验（防止状态不一致）**：若模型输出 `apply_pending_change` 但 runtime 中没有 pending 方案，服务端不执行该动作、不报错，而是自动改为 `analyze_model` 重新分析并生成候选；若回复声称有模型改进方案待确认但既没有 pending 也没有动作，同样自动进入分析。历史版本为空时 `rollback_version` 也会被拦截并给出说明。
@@ -141,49 +166,83 @@ AI 追问原则：一次一个问题；先回应/共情，再问；提供生活�
 
 内置 5 种：`multi_factor`（均衡多因子）、`low_vol_quality`（低波质量）、`momentum_growth`（趋势成长）、`value_dividend`（价值红利）、`contrarian`（反转）。客户点名清单外模型（SVM、随机森林、梯度提升、聚类等）时，走 `approach=code`，由 AI 用 sklearn 生成自定义模型代码并回测，不再维护固定模型白名单。每个模型：`id/name/description/weights(10因子)`。
 
-### 6.2 LLM 提案 JSON（pipeline 输入）
+### 6.2 LLM 调参方案 JSON（AI 只出引擎 + 范围）
+
+`build_tuning_plan` 要求 LLM 只输出「引擎 + 搜索范围」，由服务端执行真实调参：
 
 ```json
-{"approach":"model_type|weights|code",
+{"approach":"weights|model_type|code",
  "summary":"一句普通用户能懂的话，说明为什么这样改",
- "model_type":"low_vol_quality",
- "weights":{"ep":0.1,...10项...},
- "code":"python 源码（approach=code 时）",
+ "model_type":"low_vol_quality（仅 model_type）",
+ "search_space":{"ep":{"min":0.04,"max":0.2,"step":0.04},"roe":{...}},
+ "param_space":{"lookback":{"min":10,"max":60,"step":10,"type":"int","default":20}},
+ "weights":{"ep":0.1,...},         // 可选：基底权重，省略时用当前权重
+ "code":"python 源码（仅 code）",
+ "objective":"sharpe|cagr|mdd",
+ "max_trials":24,
  "why":"数据依据（引用真实指标）",
  "expected_effect":"预期改善方向",
  "risks":["..."]}
 ```
 
-### 6.3 自定义模型代码契约
+校验规则：
+- `weights/model_type`：`search_space` 至少 3 个已知因子，每个 `{min,max,step}` 满足 `0<=min<=max<=0.4`、`step>0`、网格档数 >=2；键顺序即搜索优先级。
+- `code`：必须提供 `param_space`（1~4 个合法参数名，`{min,max,step,type,default}`，`type=int|float`）与参数化代码；`code` 方案不能带 `search_space`，`weights/model_type` 不能带 `param_space`。
+- `objective` 缺省 `sharpe`；`max_trials` 为整数，服务端寻优再按 4~64 收敛。
+- 校验失败时服务端把错误信息 + 原方案回传 LLM 自动修复，最多 2 次（`TUNING_REPAIR_SYSTEM`），成功返回 `repair_attempts`，work 卡展示「自动修复调参方案」。
+
+### 6.3 参数化自定义模型代码契约
 
 AI 生成的代码必须定义：
 ```python
-def build_transform():
+import numpy as np
+import pandas as pd
+
+def build_transform(params=None):
+    params = params or {}
+    lookback = int(params.get("lookback", 20))
+
     def transform(z, weights):
         # z: pandas.DataFrame，列含 z_ep/z_bp/...（10 个方向对齐后的因子 z 值）
         # weights: dict[str,float]
+        # params: AI 在 param_space 中声明的参数，服务端寻优时逐组传入
         # 返回 pandas.Series（index 与 z 对齐）
         return ...
     return transform
 ```
-AI 生成的代码先经过静态检查 + 子进程冒烟；若失败，服务端会把错误信息、原提案和客户诉求回传给同一模型进行自动修复，最多重试 2 次，修复成功后返回 `repair_attempts` 供 work 卡展示；仍失败才报错。
-
-允许 import：`math`、`numpy as np`、`pandas as pd`、`sklearn`（仅 preprocessing/svm/ensemble/linear_model/cluster/decomposition/pipeline/impute/neighbors/tree/metrics/utils 子模块）与 `scipy`；禁止：文件/网络/系统调用/动态执行/dunder 属性；源码 ≤6000 字符；必须通过 AST 白名单检查 + 子进程冒烟（10s 超时）。sklearn 模型基于当前截面做转导/无监督拟合或用加权因子合成分构造伪标签，不假设未来收益标签。
+- `build_transform` 允许无参数，或恰好一个名为 `params` 的参数；其他签名由 entrypoint 检查拒绝。
+- 寻优循环复用已校验代码（`compile_code(code, params, validate=False)`），不重复跑子进程冒烟；候选确定后再用最终参数做一次 `validate_code(code, tuned_params)`。
+- 静态检查/AST 白名单/子进程冒烟规则不变（math/numpy/pandas/sklearn/scipy、禁止文件/网络/系统调用/动态执行/下划线属性、源码 ≤6000 字符、10s 冒烟超时）。
 
 ### 6.4 预期核对与继续优化
 
-候选回测完成后，服务端根据用户本轮诉求（收益优先 / 回撤优先 / 默认夏普）与画像回撤上限核对是否达到目标，并在 work 卡新增「核对您的目标」步骤。未达预期时：审批卡标题改为「候选未达预期，是否仍要启用？」并增加「继续优化」动作；聊天回复明确差距，不会自动启用模型。用户选择「继续优化」会重新进入 analyze_model，生成下一轮候选。
+候选回测完成后，服务端根据用户本轮诉求（收益优先 / 回撤优先 / 默认夏普）与画像回撤上限核对是否达到目标，并在 work 卡新增「核对您的目标」步骤。未达预期时：审批卡标题改为「候选未达预期，是否仍要启用？」并增加「继续优化」动作；聊天回复明确差距，不会自动启用模型。用户选择「继续优化」会重新进入 analyze_model，并按结构性升级策略更换引擎或重写代码，再由服务端重新寻优。
 
-### 6.4 pipeline 公开函数
+### 6.5 服务端网格寻优（`backend/engine/tuning.py`）
+
+- 输入：AI 给出的 `search_space/param_space`、当前基底权重/参数、目标指标 `objective`、回撤上限 `tolerance`、预算 `max_trials`。
+- 算法：基线评估 → 按 search_space 顺序逐轴轮转 → 每个轴取若干网格候选（默认每轴 2~5 个）→ 其余参数固定为当前最优 → 每组跑同一区间回测 → 按目标指标保留最优；最大回撤超过画像上限时重罚（优先选不超限的组合）。
+- 事件：`run_search` 逐个 yield `start/trial/done` 事件，service 将其映射为 `tuning` 卡片进度推送；事件包含当前试次、总试次、当前参数、最优参数/指标与得分走势。
+- 评估次数硬约束在 `max_trials` 内；单组回测异常被跳过，全部失败才报错。
+- `mdd` 目标直接比较回撤值（越接近 0 越好）；`cagr/sharpe` 越大越好。
+
+### 6.6 pipeline 与安全模块公开函数
 
 ```python
-def list_models() -> list[dict]                       # 内置模型清单
-def normalize_proposal(raw: dict) -> Proposal         # 校验字段、权重、模型类型
-def validate_code(code: str) -> dict                  # AST+冒烟，失败抛 ModelCodeError
-def compile_code(code: str) -> callable               # 返回 transform(z,weights)
-def build_candidate_proposal(llm, state) -> Proposal  # 调 LLM 生成提案（prompt 在 pipeline 内）
+# backend/models/pipeline.py
+def normalize_tuning_plan(raw, base_weights=None, current_model=None) -> dict
+def build_tuning_plan(llm, state) -> dict          # 调 LLM 生成「引擎+范围」，含自动修复
+TUNING_SYSTEM / TUNING_REPAIR_SYSTEM               # 调参方案提示词
+
+# legacy（保留兼容，不再被 analyze_model 使用）
+def normalize_proposal(raw, base_weights=None) -> dict
+def build_candidate_proposal(llm, state) -> dict
+
+# backend/models/custom.py
+def validate_code(code, params=None) -> dict        # AST + 冒烟；返回 takes_params 等
+def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 ```
-`selection.screen/run_backtest` 增加可选参数 `score_transform=None`（Lead 实现，供自定义代码接入）。
+`backend/models/registry.py` 继续提供 5 种内置模型；`selection.screen/run_backtest` 的 `score_transform` 钩子用于接入参数化自定义引擎。
 
 ## 7. 前端（Professional Financial SaaS 三栏）
 
@@ -191,17 +250,18 @@ def build_candidate_proposal(llm, state) -> Proposal  # 调 LLM 生成提案（p
 - 布局：**顶部工具栏 56px + 左侧导航 224px + 中间 AI 对话工作区（最小 560px）+ 右侧投资上下文 320px**；页面边距 24px、栏间距 16px。小于 1024px 时导航收为图标，移动端为抽屉；小于 1200px 时右侧上下文改为可开合抽屉。
 - 导航：左侧为 AI 投资顾问 / 投资组合 / 策略分析 / 历史记录 / 模型管理 / 系统设置；投资组合、策略分析、模型管理、设置使用当前会话状态渲染只读弹窗，不改后端接口。对话区头部提供历史、清空、新对话；输入区支持快捷操作、停止生成、重新生成、清空输入与文本附件。
 - 交互：对话是唯一的写操作入口；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。
-- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`token` 事件逐字追加（前端打字机渲染）；`ui` 事件按 id upsert 卡片（work 卡步骤实时更新）。**代码/权重/模型类型改动流式契约**：服务端先发一个 `work` 块（`status=running`、最后一步 `修改模型代码/调整因子权重/切换模型类型` 为 running、`code_change.diff` 为空），随后按行重复发同一 id 的 `work` 块，`code_change.diff` 逐行增长，最后发 `status=done` 的完整块；前端按 id 覆盖渲染，因此代码框逐行出现。`error` 显示错误条+重试；停止生成通过 `AbortController` 取消请求。
-- 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧上下文，从 `/messages` 恢复聊天文本与富卡片（`blocks`）；历史对话通过 `GET /api/sessions` 归档列表切换。
+- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`token` 事件逐字追加（前端打字机渲染）；`ui` 事件按 id upsert 卡片（work 卡步骤、tuning 卡进度与得分走势实时更新）。**代码/权重/模型类型改动流式契约**：服务端先发一个 `work` 块（`status=running`、最后一步 `写入寻优后的因子权重/切换基础模型并写入寻优权重/写入 AI 重写的模型引擎` 为 running、`code_change.diff` 为空），随后按行重复发同一 id 的 `work` 块，`code_change.diff` 逐行增长，最后发 `status=done` 的完整块；前端按 id 覆盖渲染，因此代码框逐行出现。**寻优进度契约**：服务端先发 `tuning` 块（`status=running`、`progress.trial=0`），之后每完成一组回测就发同一 id、同一范围的 `tuning` 块（`progress`、`current`、`best`、`history` 更新），结束时发 `status=done/progress.percent=100` 的块。`error` 显示错误条+重试；停止生成通过 `AbortController` 取消请求。
+- 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧上下文（会话级 active_model/versions），从 `/messages` 恢复聊天文本与富卡片（`blocks`，含 tuning 卡）；历史对话通过 `GET /api/sessions` 归档列表切换，切换后右侧模型/版本随会话同步。新建对话必须回到默认「均衡多因子」模型。
 - 视觉：**Professional Financial SaaS / Light Mode**，参考 Linear + Bloomberg Terminal + Stripe Dashboard。Token：背景 `#F8FAFC`、卡片 `#FFFFFF`、品牌 Navy `#1E3A5F`、交互蓝 `#2563EB`、边框 `#E2E8F0`；卡片 1px 边框 / 10px 圆角 / 默认无阴影，按钮 6px 圆角，输入框 8px 圆角；正文 14px、辅助 12px、卡片标题 16px。**不使用动态渐变背景、玻璃拟态与大阴影**。
-- 模型切换：内置 5 种基础风格；客户点名其他模型时，服务端强制 `approach=code`，由 AI 使用 numpy/pandas/sklearn/scipy 写自定义模型代码并通过静态检查+冒烟后回测，不再由 LLM 以“没有对应选项”拒绝。模型代码只允许基于当前截面做转导/无监督拟合或伪标签蒸馏。
+- 模型切换：内置 5 种基础风格；客户点名其他模型时，服务端强制 `approach=code`，由 AI 用 numpy/pandas/sklearn/scipy 写参数化模型代码并通过静态检查+冒烟，再由服务端网格寻优；不再由 LLM 以“没有对应选项”拒绝。模型代码只允许基于当前截面做转导/无监督拟合或伪标签蒸馏。
+- 调参进度卡：`tuning` 卡展示进度条（已评估/总组数）、目标指标、当前最优指标与参数、搜索范围（可折叠）和得分走势；所有数值来自服务端真实回测事件，禁止前端伪造进度。
 - 确认话术：同一轮只允许出现一段确认请求；画像确认由 AI 自然询问。模型方案审批由 AI 结合回测结果说明 + 审批卡完成；服务端不再追加上一版候选的固定「需要您确认：是否启用……」兜底，避免与其他提问叠加。重复确认段落仍会被修剪；已确认画像字段不得重复询问。
 - 状态与金融语义：成功绿 / 警告琥珀 / 危险红 / 信息蓝；A 股涨跌沿用大陆习惯红色上涨、绿色下跌；收益、回撤、夏普等指标统一标注「历史回测数据，不代表未来实际表现」。
 - 禁止：mock 数据、独立页签、页面内直接调 selection/tune/profile 接口、伪造进度。
 
 ## 8. 文件与分工
 
-- Lead：`backend/agent.py`、`backend/service.py`、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`tests/` 集成测试、文档。
-- **chat-ui-dev**：只写 `frontend/` 下 `index.html`、`app.js`、`style.css`、`charts.js`。
-- **model-pipeline-dev**：只写 `backend/models/*.py`、`tests/test_models.py`。
-- 完成标准：`node --check` 通过；后端 `unittest discover` 通过；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘帮我优化模型’→看 AI 步骤→聊天内同意→版本更新”全流程。
+- Lead：`backend/agent.py`、`backend/service.py`、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`backend/engine/tuning.py`（服务端网格寻优）、`tests/` 集成测试、`scripts/e2e_smoke.py`、文档。
+- **chat-ui-dev**：只写 `frontend/` 下 `index.html`、`app.js`、`style.css`、`charts.js`（含 tuning 卡与实时进度）。
+- **model-pipeline-dev**：只写 `backend/models/*.py`、`backend/llm.py`（FakeLLM）、`tests/test_models.py`。
+- 完成标准：`node --check` 通过；后端 `unittest discover` 通过；E2E 通过；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘帮我优化模型’→观察网格寻优进度→审批→当前会话模型更新→新对话回到默认模型→回滚”全流程。

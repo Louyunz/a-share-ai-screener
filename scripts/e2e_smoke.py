@@ -119,26 +119,38 @@ def main(argv: list[str] | None = None) -> int:
 
         events = client.chat(sid, "帮我优化一下模型")
         work = _blocks(events, "work")[-1]
+        tuning = _blocks(events, "tuning")[-1]
         approval = _blocks(events, "approval")[-1]
-        assert work["status"] == "done" and len(work["steps"]) >= 5, work
+        assert work["status"] == "done" and len(work["steps"]) >= 6, work
         assert approval["actions"], approval
+        assert tuning["status"] == "done", tuning
+        assert tuning["progress"]["total"] > 1, tuning
+        assert tuning["space"], "应展示 AI 给出的调参范围"
         code_change = work.get("code_change") or {}
         assert code_change.get("diff"), "AI 修改代码时应返回逐行 diff"
         assert code_change.get("added", 0) > 0
-        print(f"[e2e] AI 完成 {len(work['steps'])} 步建模，等待用户审批："
-              f"{work['proposal']['summary']}")
+        print(f"[e2e] AI 定引擎/范围 + 服务端寻优 {tuning['progress']['trial']} 组，"
+              f"等待用户审批：{work['proposal']['summary']}")
 
         events = client.chat(sid, "同意，启用这个改进")
         version = _blocks(events, "version")[-1]
         assert version["active"]["version_id"], version
-        print(f"[e2e] 已启用新模型：{version['active']['name']}")
+        state = client.get(f"/api/sessions/{sid}/state")
+        print(f"[e2e] 当前会话已启用新模型：{state['active_model']['name']}")
+
+        # 新对话必须回到默认模型，不能沿用上一个对话的模型
+        other_sid = client.post("/api/sessions")["session_id"]
+        other_state = client.get(f"/api/sessions/{other_sid}/state")
+        assert other_state["active_model"]["name"] == "均衡多因子", other_state["active_model"]
+        print("[e2e] 新对话使用默认模型：均衡多因子")
 
         events = client.chat(sid, "回滚到上一个版本")
         assert _blocks(events, "version"), events
         state = client.get(f"/api/sessions/{sid}/state")
-        print(f"[e2e] 回滚后当前模型：{state['active_model']['name']}，"
-              f"历史版本 {len(state['versions'])} 个")
-        print("[e2e] ✅ 单对话全链路通过")
+        assert state["active_model"]["name"] == "均衡多因子", state["active_model"]
+        print(f"[e2e] 回滚后当前会话模型：{state['active_model']['name']}，"
+              f"会话版本 {len(state['versions'])} 个")
+        print("[e2e] [OK] 单对话全链路通过")
         return 0
     finally:
         httpd.shutdown()

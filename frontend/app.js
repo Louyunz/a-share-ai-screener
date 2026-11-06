@@ -67,6 +67,7 @@
     check: '检查',
     backtest: '回测',
     compare: '对比',
+    tune: '寻优',
     wait: '等待确认',
     version: '版本',
     selection: '选股',
@@ -83,6 +84,7 @@
     check: 'check',
     backtest: 'chart',
     compare: 'chart',
+    tune: 'pulse',
     wait: 'shield',
     version: 'layers',
     selection: 'target',
@@ -360,10 +362,14 @@
 
   async function loadVersions() {
     try {
-      var data = await apiGet('/api/versions', 2);
+      var path = state.sessionId
+        ? '/api/versions?session=' + encodeURIComponent(state.sessionId)
+        : '/api/versions';
+      var data = await apiGet(path, 2);
       var list = data && (data.versions || data.items) ? (data.versions || data.items) : data;
       var versions = normalizeVersions(list);
-      if (versions.length) state.versions = versions;
+      // 会话状态接口已返回当前会话版本链，这里只作为兜底，避免把其他会话的版本显示进来
+      if (!state.versions.length && versions.length) state.versions = versions;
       if (!state.activeModel) {
         var active = findActiveVersion(versions, data ? data.active_id : '');
         if (active) state.activeModel = normalizeModel(active);
@@ -451,7 +457,7 @@
   function normalizeModel(raw) {
     if (!raw || typeof raw !== 'object') return null;
     return {
-      id: raw.id ? String(raw.id) : '',
+      id: raw.id ? String(raw.id) : (raw.version_id ? String(raw.version_id) : ''),
       name: raw.name ? String(raw.name) : (raw.model_name ? String(raw.model_name) : '未命名模型'),
       description: raw.description ? String(raw.description) : '',
       metrics: raw.metrics && typeof raw.metrics === 'object' ? raw.metrics : null,
@@ -510,6 +516,7 @@
       + '<div class="card card-welcome"><div class="card-body">'
       + '<h2 class="welcome-title">你好，我是你的 AI 投资顾问</h2>'
       + '<p class="welcome-text">先用几句话说说你的投资想法就行——打算投多久、能接受亏多少、有没有不想碰的行业。我会边聊边把投资画像整理给你看，确认后直接帮你选股、解释结果，也能和你一起优化模型。</p>'
+      + '<p class="welcome-text">每个新对话默认从均衡多因子模型开始；模型调整只影响当前会话，新对话会回到默认模型。</p>'
       + '<p class="welcome-text">我可以：建立投资者画像、筛选 A 股并回测、解读结果、优化模型（更换基础模型 / 调整因子权重 / 由 AI 重写数学打分代码），重要变更由你审批，版本可回滚。</p>'
       + '<div class="starter-list">' + STARTERS.map(function (item) {
         return '<button class="starter" type="button" data-action="quick" data-message="' + esc(item.message) + '">' + esc(item.label) + '</button>';
@@ -714,6 +721,8 @@
         return approvalCardHtml(block);
       case 'version':
         return versionCardHtml(block);
+      case 'tuning':
+        return tuningCardHtml(block);
       default:
         return genericCardHtml(block);
     }
@@ -1151,6 +1160,287 @@
       + '<div class="card-body">' + activeHtml + listHtml + '</div></article>';
   }
 
+  /* ---------------------------------------------------------- 网格寻优卡 */
+  function tuningObjectiveLabel(block) {
+    if (block && block.objective_label) return String(block.objective_label);
+    var objective = block && block.objective ? String(block.objective) : '';
+    if (objective === 'sharpe') return '夏普比率';
+    if (objective === 'cagr') return '年化收益';
+    if (objective === 'mdd') return '最大回撤';
+    return '综合得分';
+  }
+
+  function formatTuningScore(block, value) {
+    var score = num(value);
+    if (score === null) return '—';
+    var objective = block && block.objective ? String(block.objective) : '';
+    if (objective === 'cagr' || objective === 'mdd') return fmtPct(score, 1);
+    return fmtNum(score, 2);
+  }
+
+  function fmtParamValue(value) {
+    var numberValue = num(value);
+    if (numberValue === null) {
+      return value === undefined || value === null || value === '' ? '—' : String(value);
+    }
+    if (Math.abs(numberValue - Math.round(numberValue)) < 1e-9) return String(Math.round(numberValue));
+    return String(Number(numberValue.toFixed(4)));
+  }
+
+  function fmtElapsed(seconds) {
+    var value = num(seconds);
+    if (value === null || value < 0) return '';
+    if (value < 60) return '用时 ' + fmtNum(value, 1) + ' 秒';
+    var minutes = Math.floor(value / 60);
+    var rest = Math.round(value % 60);
+    return '用时 ' + minutes + ' 分 ' + rest + ' 秒';
+  }
+
+  function tuningProgress(block) {
+    var payload = block && block.progress && typeof block.progress === 'object' ? block.progress : {};
+    var trial = num(payload.trial);
+    if (trial === null) trial = num(payload.evaluated);
+    if (trial === null && block && block.current && typeof block.current === 'object') {
+      trial = num(block.current.trial);
+    }
+    var total = num(payload.total);
+    var percent = num(payload.percent);
+    if (percent !== null && percent > 0 && percent <= 1) percent = percent * 100;
+    if (percent === null) {
+      if (trial !== null && total !== null && total > 0) {
+        percent = (trial / total) * 100;
+      } else {
+        percent = block && block.status === 'done' ? 100 : 0;
+      }
+    }
+    percent = clamp(percent, 0, 100);
+    var evaluated;
+    if (trial !== null || total !== null) {
+      evaluated = '已评估 ' + (trial === null ? '—' : trial) + ' / ' + (total === null ? '—' : total) + ' 组';
+    } else {
+      evaluated = block && block.status === 'done' ? '评估完成' : '正在启动…';
+    }
+    return {
+      trial: trial,
+      total: total,
+      percent: percent,
+      elapsed: num(payload.elapsed),
+      evaluated: evaluated
+    };
+  }
+
+  function tuningHistoryData(block) {
+    var history = Array.isArray(block && block.history) ? block.history : [];
+    var labels = [];
+    var values = [];
+    history.forEach(function (point, index) {
+      if (!point || typeof point !== 'object') return;
+      var score = num(point.score);
+      if (score === null) return;
+      var trial = num(point.trial);
+      labels.push(trial === null ? String(index + 1) : String(trial));
+      values.push(score);
+    });
+    if (values.length > 60) {
+      labels = labels.slice(values.length - 60);
+      values = values.slice(values.length - 60);
+    }
+    return { labels: labels, values: values };
+  }
+
+  function tuningParamsData(block, best) {
+    var space = block && Array.isArray(block.space) ? block.space : [];
+    var labels = {};
+    space.forEach(function (axis) {
+      if (axis && typeof axis === 'object' && axis.key) {
+        labels[String(axis.key)] = axis.label
+          ? String(axis.label)
+          : (FACTOR_SHORT[axis.key] || FACTOR_LABELS[axis.key] || String(axis.key));
+      }
+    });
+    var weights = best && best.weights && typeof best.weights === 'object' ? best.weights : null;
+    var params = best && best.params && typeof best.params === 'object' ? best.params : null;
+    var source = null;
+    var weightMode = false;
+    if (weights && Object.keys(weights).length) {
+      source = weights;
+      weightMode = true;
+    } else if (params && Object.keys(params).length) {
+      source = params;
+      var factorKeys = Object.keys(FACTOR_LABELS);
+      var keys = Object.keys(params);
+      var factorMatches = 0;
+      keys.forEach(function (key) {
+        if (factorKeys.indexOf(key) !== -1) factorMatches += 1;
+      });
+      var method = block && block.method ? String(block.method) : '';
+      weightMode = method.indexOf('参数') === -1 && factorMatches === keys.length;
+    }
+    if (!source) return { type: '', entries: [] };
+    var entries = Object.keys(source).map(function (key) {
+      var value = num(source[key]);
+      if (value === null) return null;
+      return {
+        key: key,
+        label: weightMode ? (FACTOR_SHORT[key] || FACTOR_LABELS[key] || String(key)) : (labels[key] || String(key)),
+        value: value
+      };
+    }).filter(function (entry) {
+      return !!entry;
+    });
+    if (weightMode) {
+      entries.sort(function (left, right) {
+        return right.value - left.value;
+      });
+    }
+    return { type: weightMode ? 'weight' : 'param', entries: entries.slice(0, 5) };
+  }
+
+  function tuningMetricsHtml(best) {
+    if (!best || typeof best !== 'object') return '';
+    var metrics = best.metrics && typeof best.metrics === 'object' ? best.metrics : null;
+    if (!metrics) return '';
+    var keys = ['cagr', 'sharpe', 'mdd'];
+    var cells = keys.map(function (key) {
+      var value = num(metrics[key]);
+      if (value === null) return '';
+      return '<div class="tuning-metric"><span>' + esc(metricMeta(key).label) + '</span>'
+        + '<strong>' + esc(formatMetric(key, value)) + '</strong></div>';
+    }).filter(Boolean).join('');
+    if (!cells) return '';
+    return '<div class="tuning-metrics">' + cells + '</div>';
+  }
+
+  function tuningParamsHtml(block, best) {
+    var data = tuningParamsData(block, best);
+    if (!data.entries.length) return '';
+    if (data.type === 'weight') {
+      var max = 0;
+      data.entries.forEach(function (entry) {
+        if (entry.value > max) max = entry.value;
+      });
+      if (!(max > 0)) max = 1;
+      var rows = data.entries.map(function (entry) {
+        var width = clamp((entry.value / max) * 100, 0, 100);
+        return '<div class="weight-row"><span class="weight-code">' + esc(entry.label) + '</span>'
+          + '<span class="weight-track"><i class="weight-fill" style="width:' + width.toFixed(1) + '%"></i></span>'
+          + '<span class="weight-pct">' + fmtNum(entry.value, 3) + '</span></div>';
+      }).join('');
+      return '<div class="sub-block"><div class="sub-title"><h4>当前最优参数</h4>'
+        + '<span class="sub-meta">Top ' + data.entries.length + ' 因子权重</span></div>'
+        + '<div class="weight-list">' + rows + '</div></div>';
+    }
+    var paramRows = data.entries.map(function (entry) {
+      return '<div class="tuning-param-row"><span>' + esc(entry.label) + '</span>'
+        + '<b>' + esc(fmtParamValue(entry.value)) + '</b></div>';
+    }).join('');
+    return '<div class="sub-block"><div class="sub-title"><h4>当前最优参数</h4>'
+      + '<span class="sub-meta">' + data.entries.length + ' 项参数</span></div>'
+      + '<div class="tuning-param-list">' + paramRows + '</div></div>';
+  }
+
+  function tuningSpaceHtml(block) {
+    var space = block && Array.isArray(block.space) ? block.space.filter(function (axis) {
+      return axis && typeof axis === 'object';
+    }) : [];
+    if (!space.length) return '';
+    var method = block.method ? String(block.method) : '';
+    var unit = method.indexOf('参数') !== -1 ? '参数' : '因子';
+    var rows = space.map(function (axis) {
+      var label = axis.label
+        ? String(axis.label)
+        : (FACTOR_LABELS[axis.key] || FACTOR_SHORT[axis.key] || String(axis.key || '参数'));
+      return '<tr><td>' + esc(label) + '</td>'
+        + '<td>[' + esc(fmtParamValue(axis.min)) + ', ' + esc(fmtParamValue(axis.max)) + ']</td>'
+        + '<td>' + esc(fmtParamValue(axis.step)) + '</td></tr>';
+    }).join('');
+    return '<details class="tuning-space"><summary>搜索范围（' + space.length + ' 个' + unit + '）</summary>'
+      + '<div class="tuning-space-body"><table class="tuning-space-table">'
+      + '<thead><tr><th>参数 / 因子</th><th>搜索范围</th><th>步长</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div></details>';
+  }
+
+  function tuningCardHtml(block) {
+    var payload = block && typeof block === 'object' ? block : {};
+    var status = payload.status === 'done' ? 'done' : payload.status === 'error' ? 'error' : 'running';
+    var statusLabel = status === 'done' ? '已完成' : status === 'error' ? '失败' : '寻优中';
+    var statusClass = status === 'done' ? 'is-ok' : status === 'error' ? 'is-error' : 'is-run';
+    var statusPill = '<span class="status-pill ' + statusClass + '">'
+      + (status === 'running' ? '<i class="spinner"></i>' : '') + statusLabel + '</span>';
+    var progress = tuningProgress(payload);
+    var elapsedText = progress.elapsed !== null && progress.elapsed > 0 ? fmtElapsed(progress.elapsed) : '';
+    var percentText = Math.round(progress.percent) + '%';
+    var progressHtml = '<div class="tuning-progress">'
+      + '<div class="tuning-progress-head"><span>' + esc(progress.evaluated) + '</span>'
+      + (elapsedText ? '<span class="tuning-elapsed">' + esc(elapsedText) + '</span>' : '')
+      + '<b class="tuning-percent">' + percentText + '</b></div>'
+      + '<div class="progress-line"><i style="width:' + progress.percent.toFixed(1) + '%"></i></div>'
+      + '</div>';
+
+    var objectiveLabel = tuningObjectiveLabel(payload);
+    var best = payload.best && typeof payload.best === 'object' ? payload.best : null;
+    var bestHasData = !!(best && (num(best.trial) !== null || num(best.score) !== null
+      || (best.metrics && typeof best.metrics === 'object' && Object.keys(best.metrics).length)
+      || (best.params && typeof best.params === 'object' && Object.keys(best.params).length)
+      || (best.weights && typeof best.weights === 'object' && Object.keys(best.weights).length)));
+    var current = payload.current && typeof payload.current === 'object' ? payload.current : null;
+    var bestMeta = [];
+    if (bestHasData) {
+      var bestTrial = num(best.trial);
+      if (bestTrial !== null) bestMeta.push('第 ' + bestTrial + ' 组');
+      bestMeta.push(objectiveLabel + ' ' + formatTuningScore(payload, best.score));
+    }
+
+    var tags = [];
+    tags.push('<span class="tag">方法 · ' + esc(payload.method ? String(payload.method) : '网格搜索') + '</span>');
+    tags.push('<span class="tag">目标 · ' + esc(objectiveLabel) + '</span>');
+    if (status === 'running' && current) {
+      var currentTrial = num(current.trial);
+      var currentLabel = current.label
+        ? String(current.label)
+        : (currentTrial !== null ? '第 ' + currentTrial + ' 组' : '');
+      if (currentLabel) tags.push('<span class="tag is-live">正在评估 · ' + esc(currentLabel) + '</span>');
+    }
+    var tagsHtml = '<div class="tuning-tags">' + tags.join('') + '</div>';
+
+    var metricsHtml = bestHasData ? tuningMetricsHtml(best) : '';
+    var bestHtml = '';
+    if (bestHasData) {
+      if (metricsHtml) {
+        bestHtml += '<div class="sub-block"><div class="sub-title"><h4>当前最优</h4>'
+          + '<span class="sub-meta">' + esc(bestMeta.join(' · ')) + '</span></div>' + metricsHtml + '</div>';
+      }
+      bestHtml += tuningParamsHtml(payload, best);
+    } else {
+      bestHtml = '<p class="tuning-wait">'
+        + (status === 'error' ? '这次寻优没有产出可用结果。' : '等待第一组评估结果…') + '</p>';
+    }
+
+    var historyData = tuningHistoryData(payload);
+    var chartHtml = '<div class="sub-block"><div class="sub-title"><h4>得分走势</h4>'
+      + '<span class="sub-meta">共 ' + historyData.values.length + ' 个评估点</span></div>'
+      + (historyData.values.length >= 2
+        ? '<div class="chart-box" data-chart="tuning-score"></div>'
+        : '<div class="chart-empty">' + esc(historyData.values.length
+          ? '正在累计评估结果，至少 2 组数据后显示走势。'
+          : '等待第一组评估结果…') + '</div>')
+      + '</div>';
+
+    var spaceHtml = tuningSpaceHtml(payload);
+    var note = payload.note
+      ? String(payload.note)
+      : '网格寻优基于历史回测，最优参数可能存在过拟合；候选仍需确认后才会启用。';
+
+    return '<article class="card card-tuning is-' + status + '">'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>' + esc(payload.title || '参数网格寻优') + '</h3></div>'
+      + statusPill + '</header>'
+      + '<div class="card-body">'
+      + progressHtml + tagsHtml + bestHtml + spaceHtml + chartHtml
+      + '<p class="tuning-note">' + esc(note) + '</p>'
+      + '</div></article>';
+  }
+
   /* ============================== 卡片挂载与图表 ============================== */
   function upsertCard(block) {
     if (!block || !block.id || !block.type) return;
@@ -1221,6 +1511,30 @@
         });
       }
     }
+    if (block.type === 'tuning') {
+      var tuningHost = node.querySelector('[data-chart="tuning-score"]');
+      if (tuningHost) {
+        var tuningData = tuningHistoryData(block);
+        if (tuningData.values.length >= 2) {
+          window.Charts.line(tuningHost, {
+            labels: tuningData.labels,
+            series: [{
+              name: tuningObjectiveLabel(block) + '得分',
+              values: tuningData.values
+            }]
+          }, {
+            width: 660,
+            height: 190,
+            yFormatter: function (value) { return fmtNum(value, 2); },
+            xFormatter: function (label) { return '#' + label; },
+            ariaLabel: '网格寻优得分走势',
+            emptyText: '暂无可绘制的寻优数据'
+          });
+        } else {
+          tuningHost.innerHTML = '<div class="chart-empty">正在累计评估结果，至少 2 组数据后显示走势。</div>';
+        }
+      }
+    }
   }
 
   function syncFromBlock(block) {
@@ -1239,6 +1553,9 @@
         break;
       case 'work':
         syncWorkActivity(block);
+        break;
+      case 'tuning':
+        syncTuningActivity(block);
         break;
       case 'approval':
         pushActivity('approval-' + block.id, '等待用户确认：' + (block.title || '待审批方案'), 'waiting', 'wait');
@@ -1274,6 +1591,28 @@
     } else if (!steps.some(function (step) { return step && step.status === 'running'; })) {
       pushActivity('work:' + block.id + ':overall', block.title || 'AI 正在工作', 'running', 'ai');
     }
+  }
+
+  function syncTuningActivity(block) {
+    var payload = block && typeof block === 'object' ? block : {};
+    var progress = tuningProgress(payload);
+    var best = payload.best && typeof payload.best === 'object' ? payload.best : null;
+    var bestText = best ? (tuningObjectiveLabel(payload) + ' ' + formatTuningScore(payload, best.score)) : '';
+    var key = 'tuning:' + payload.id;
+    if (payload.status === 'done') {
+      pushActivity(key, '参数网格寻优完成' + (bestText ? ' · 最优' + bestText : ''), 'done', 'tune');
+      return;
+    }
+    if (payload.status === 'error') {
+      pushActivity(key, '参数网格寻优失败' + (payload.note ? ' · ' + truncate(payload.note, 36) : ''), 'error', 'tune');
+      return;
+    }
+    var text = '参数网格寻优进行中';
+    if (progress.trial !== null || progress.total !== null) {
+      text += ' · 第 ' + (progress.trial === null ? '—' : progress.trial) + ' / ' + (progress.total === null ? '—' : progress.total) + ' 组';
+    }
+    if (bestText) text += ' · 当前最优 ' + bestText;
+    pushActivity(key, text, 'running', 'tune');
   }
 
   /* ============================== 工作台 ============================== */
@@ -1378,6 +1717,7 @@
       html += '<div class="wb-model-top"><strong>' + esc(model.name) + '</strong><span class="status-pill is-ok">运行中</span></div>'
         + (model.description ? '<p class="wb-model-desc">' + esc(model.description) + '</p>' : '')
         + (chips ? '<div class="wb-chips">' + chips + '</div>' : '')
+        + (model.id || model.name ? '<p class="wb-session-note">模型调整仅对当前会话生效；新建对话将使用默认均衡多因子模型。</p>' : '')
         + '<p class="wb-note">年化收益、夏普比率、最大回撤等均为历史回测数据，不代表未来实际表现，不构成投资建议。</p>';
     } else {
       html += '<p class="wb-empty">还没有启用的自定义模型。跟 AI 说帮我优化模型，它会先给你方案，再等你确认。</p>';

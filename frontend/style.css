@@ -647,3 +647,51 @@ body.wb-collapsed .workspace { grid-template-columns: minmax(0, 1fr); }
   color: var(--status-warning);
   font-weight: 600;
 }
+
+
+/* ================================================================
+ * 网格寻优（服务端参数网格搜索）实时进度卡
+ * ================================================================ */
+.card-tuning.is-running { border-color: #BFDBFE; }
+
+.tuning-progress { margin-bottom: 12px; }
+.tuning-progress-head { display: flex; align-items: baseline; gap: 10px; color: var(--text-muted); font-size: 12px; }
+.tuning-progress-head > span:first-child { color: var(--text-secondary); }
+.tuning-elapsed { font-family: var(--font-mono); font-size: 11px; }
+.tuning-percent { margin-left: auto; color: var(--color-primary); font-family: var(--font-mono); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tuning-progress .progress-line { margin-top: 6px; height: 6px; }
+.tuning-progress .progress-line i { background: var(--color-accent); }
+
+.tuning-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.tuning-tags .tag { white-space: nowrap; }
+.tuning-tags .tag.is-live { color: var(--color-accent); border-color: #BFDBFE; background: #EFF6FF; }
+
+.tuning-wait { margin: 0 0 12px; color: var(--text-muted); font-size: 13px; }
+
+.tuning-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 8px; }
+.tuning-metric { padding: 10px 12px; border: 1px solid var(--border-default); border-radius: var(--radius-card); background: var(--bg-page); }
+.tuning-metric span { display: block; color: var(--text-muted); font-size: 11px; }
+.tuning-metric strong { display: block; margin-top: 2px; color: var(--text-primary); font-family: var(--font-mono); font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.tuning-param-list { display: flex; flex-direction: column; gap: 6px; }
+.tuning-param-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 7px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-button); background: var(--bg-page); font-size: 12px; }
+.tuning-param-row span { color: var(--text-muted); }
+.tuning-param-row b { color: var(--text-primary); font-family: var(--font-mono); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.tuning-space { margin-top: 14px; overflow: hidden; border: 1px solid var(--border-default); border-radius: var(--radius-card); background: var(--bg-surface); }
+.tuning-space summary { display: flex; align-items: center; gap: 6px; padding: 9px 12px; color: var(--text-secondary); font-size: 12px; list-style: none; cursor: pointer; }
+.tuning-space summary::-webkit-details-marker { display: none; }
+.tuning-space summary::before { content: "▸"; color: var(--text-muted); font-size: 10px; transition: transform 120ms ease; }
+.tuning-space summary:hover { color: var(--color-accent); }
+.tuning-space[open] summary::before { transform: rotate(90deg); }
+.tuning-space-body { padding: 0 12px 12px; overflow-x: auto; }
+.tuning-space-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.tuning-space-table th { padding: 6px 8px; border-bottom: 1px solid var(--border-default); color: var(--text-muted); font-size: 11px; font-weight: 500; text-align: left; white-space: nowrap; }
+.tuning-space-table td { padding: 6px 8px; border-bottom: 1px solid var(--bg-secondary); color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tuning-space-table td:first-child { color: var(--text-secondary); font-family: var(--font-sans); font-size: 12px; }
+.tuning-space-table tr:last-child td { border-bottom: 0; }
+
+.tuning-note { margin: 14px 0 0; padding-top: 10px; border-top: 1px solid var(--border-default); color: var(--text-muted); font-size: 11px; line-height: 1.6; }
+
+/* 工作台 · 会话级模型提示 */
+.wb-session-note { margin: 10px 0 0; padding: 8px 10px; border: 1px solid #BFDBFE; border-left: 3px solid var(--color-accent); border-radius: var(--radius-button); color: var(--text-secondary); font-size: 11px; line-height: 1.6; background: #EFF6FF; }

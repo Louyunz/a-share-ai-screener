@@ -109,7 +109,7 @@ class OpenAICompatClient:
 class FakeLLM:
     """确定性模型：驱动无 Key 的自动化测试与现场演示。
 
-    匹配规则只依赖输入 JSON 的键（planner / proposal_request / facts），
+    匹配规则只依赖输入 JSON 的键（tuning_request / planner / proposal_request / facts），
     不猜测自然语言；真实产品路径使用 OpenAICompatClient。
     """
 
@@ -124,6 +124,8 @@ class FakeLLM:
                 payload = extract_json(content)
             except LLMError:
                 payload = {}
+        if payload.get("tuning_request"):
+            return self._tuning_plan(payload)
         if "proposal_request" in payload:
             request = payload["proposal_request"]
             return self._proposal(request if isinstance(request, dict) else payload)
@@ -313,6 +315,51 @@ class FakeLLM:
             "why": "回测显示当前组合波动偏大，低波动和反转因子最近贡献更稳定。",
             "expected_effect": "波动和最大回撤有望下降，收益略降但持有体验更好。",
             "risks": ["低波动策略在快速上涨行情里可能跑输", "这是历史回测，不代表未来"],
+        }
+
+    # ------------------------------------------------------------------
+    # 调参方案（AI 只给引擎 + 搜索范围，具体参数由服务端网格寻优）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _tuning_plan(request: dict[str, Any]) -> dict[str, Any]:
+        code = (
+            "import numpy as np\n"
+            "import pandas as pd\n"
+            "\n"
+            "def build_transform(params=None):\n"
+            "    options = params or {}\n"
+            "    tilt = float(options.get('tilt', 0.5))\n"
+            "\n"
+            "    def transform(z, weights):\n"
+            "        score = pd.Series(0.0, index=z.index, dtype=float)\n"
+            "        for factor, weight in weights.items():\n"
+            "            column = 'z_' + factor\n"
+            "            if column in z.columns:\n"
+            "                values = pd.to_numeric(z[column], errors='coerce').fillna(0.0)\n"
+            "                score = score + float(weight) * values\n"
+            "        extra = pd.to_numeric(z['z_volatility_60'], errors='coerce').fillna(0.0)\n"
+            "        return score + tilt * extra\n"
+            "\n"
+            "    return transform\n"
+        )
+        return {
+            "approach": "code",
+            "summary": "让引擎自带一个可调的「稳健倾斜」旋钮，服务端会在 0~0.6 之间自动试出最合适的值。",
+            "why": "当前组合波动偏大，低波动因子还有加码空间。",
+            "expected_effect": "网格寻优后波动和最大回撤有望下降。",
+            "risks": ["低波动倾斜过大时，快速上涨行情可能跑输", "历史回测不代表未来表现"],
+            "code": code,
+            "param_space": {
+                "tilt": {
+                    "min": 0,
+                    "max": 0.6,
+                    "step": 0.2,
+                    "type": "float",
+                    "default": 0.5,
+                }
+            },
+            "objective": "sharpe",
+            "max_trials": 12,
         }
 
     # ------------------------------------------------------------------

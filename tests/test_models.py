@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 
+from backend.llm import FakeLLM
 from backend.models import (
     DEFAULT_MODEL_ID,
     MODEL_TYPES,
@@ -25,6 +28,12 @@ from backend.models import (
     normalize_proposal,
     validate_code,
     validate_weights,
+)
+from backend.models.pipeline import (
+    TUNING_REPAIR_SYSTEM,
+    TUNING_SYSTEM,
+    build_tuning_plan,
+    normalize_tuning_plan,
 )
 from backend.models.registry import FACTOR_NAMES, MAX_WEIGHT
 
@@ -66,6 +75,42 @@ ARRAY_CODE = '''import numpy as np
 def build_transform():
     def transform(z, weights):
         return np.zeros(len(z))
+
+    return transform
+'''
+
+# 参数化引擎：build_transform(params=None)，tilt 控制低波动因子的额外加分
+PARAM_CODE = '''import numpy as np
+import pandas as pd
+
+
+def build_transform(params=None):
+    options = params or {}
+    tilt = float(options.get("tilt", 0.5))
+
+    def transform(z, weights):
+        score = pd.Series(0.0, index=z.index, dtype=float)
+        for factor, weight in weights.items():
+            column = "z_" + factor
+            if column in z.columns:
+                values = pd.to_numeric(z[column], errors="coerce").fillna(0.0)
+                score = score + float(weight) * values
+        extra = pd.to_numeric(z["z_volatility_60"], errors="coerce").fillna(0.0)
+        return score + tilt * extra
+
+    return transform
+'''
+
+# 必须拿到 params 才能运行的参数化引擎（用于验证冒烟确实传入 params）
+REQUIRE_PARAMS_CODE = '''import pandas as pd
+
+
+def build_transform(params=None):
+    options = dict(params or {})
+    boost = float(options["boost"])
+
+    def transform(z, weights):
+        return pd.Series(0.0, index=z.index) + boost
 
     return transform
 '''
@@ -112,6 +157,19 @@ class FakeProposalLLM:
         if self.error is not None:
             raise self.error
         return self.response
+
+
+class SequenceLLM:
+    """按调用顺序返回预设响应的假 LLM（用于自动修复测试）。"""
+
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, list[dict[str, str]]]] = []
+
+    def chat_json(self, system: str, messages: list[dict[str, str]]) -> dict:
+        self.calls.append((system, messages))
+        index = min(len(self.calls) - 1, len(self.responses) - 1)
+        return self.responses[index]
 
 
 class RegistryTests(unittest.TestCase):
@@ -307,10 +365,66 @@ def build_transform():
         self.assertIn("build_transform", str(ctx.exception))
 
     def test_build_transform_with_params_rejected(self) -> None:
+        # 参数名必须是 params；其他名字（如 config）被拒绝
         code = "def build_transform(config):\n    return config\n"
         with self.assertRaises(ModelCodeError) as ctx:
             validate_code(code)
         self.assertEqual(ctx.exception.checks[-1]["name"], "entrypoint")
+        self.assertIn("params", str(ctx.exception))
+
+    def test_build_transform_with_two_params_rejected(self) -> None:
+        code = "def build_transform(params, extra=None):\n    return params\n"
+        with self.assertRaises(ModelCodeError) as ctx:
+            validate_code(code)
+        self.assertEqual(ctx.exception.checks[-1]["name"], "entrypoint")
+
+    def test_parameterized_build_transform_allowed(self) -> None:
+        info = validate_code(PARAM_CODE, params={"tilt": 0.2})
+        self.assertTrue(info["ok"])
+        self.assertTrue(info["takes_params"])
+        self.assertEqual(
+            [item["name"] for item in info["checks"]],
+            ["source_size", "syntax", "imports", "ast_safety", "entrypoint", "smoke"],
+        )
+        # 无参数的旧写法继续通过
+        self.assertFalse(validate_code(VALID_CODE)["takes_params"])
+
+    def test_parameterized_engine_respects_params(self) -> None:
+        frame = _z_frame()
+        weights = _equal_weights()
+        low = compile_code(PARAM_CODE, params={"tilt": 0.0})(frame, weights)
+        high = compile_code(PARAM_CODE, params={"tilt": 2.0})(frame, weights)
+        self.assertIsInstance(low, pd.Series)
+        diff = (high - low).to_numpy(dtype=float)
+        expected = 2.0 * frame["z_volatility_60"].fillna(0.0).to_numpy(dtype=float)
+        np.testing.assert_allclose(diff, expected, rtol=1e-12)
+
+    def test_compile_code_validate_false_skips_validation(self) -> None:
+        with mock.patch(
+            "backend.models.custom.validate_code",
+            side_effect=AssertionError("validate=False 时不应重复校验"),
+        ):
+            transform = compile_code(
+                PARAM_CODE, params={"tilt": 0.25}, validate=False
+            )
+            output = transform(_z_frame(), _equal_weights())
+        self.assertIsInstance(output, pd.Series)
+        self.assertTrue(np.all(np.isfinite(output.to_numpy(dtype=float))))
+
+    def test_compile_code_validate_false_still_checks_syntax(self) -> None:
+        with self.assertRaises(ModelCodeError):
+            compile_code("def build_transform(:\n", validate=False)
+
+    def test_params_are_passed_to_smoke(self) -> None:
+        # 不传 params 时冒烟应失败；传了才通过 —— 证明参数真的进了 build_transform
+        with self.assertRaises(ModelCodeError) as ctx:
+            validate_code(REQUIRE_PARAMS_CODE)
+        self.assertEqual(ctx.exception.checks[-1]["name"], "smoke")
+        self.assertTrue(validate_code(REQUIRE_PARAMS_CODE, params={"boost": 0.5})["ok"])
+
+    def test_validate_code_rejects_non_mapping_params(self) -> None:
+        with self.assertRaises(ModelCodeError):
+            validate_code(PARAM_CODE, params=[("tilt", 0.5)])  # type: ignore[arg-type]
 
     def test_build_transform_without_return_rejected(self) -> None:
         code = "def build_transform():\n    pass\n"
@@ -632,6 +746,390 @@ class PipelineTests(unittest.TestCase):
     def test_describe_model_invalid_type(self) -> None:
         with self.assertRaises(ModelValidationError):
             describe_model(123)  # type: ignore[arg-type]
+
+
+class TuningPlanTests(unittest.TestCase):
+    """调参方案：AI 只产出引擎 + 搜索范围，最终参数由服务端网格寻优。"""
+
+    @staticmethod
+    def _state() -> dict:
+        return PipelineTests._state()
+
+    @staticmethod
+    def _search_space() -> dict:
+        return {
+            "volatility_60": {"min": 0.05, "max": 0.25, "step": 0.1},
+            "roe": {"min": 0.1, "max": 0.3, "step": 0.1},
+            "ep": {"min": 0.0, "max": 0.2, "step": 0.1},
+        }
+
+    @staticmethod
+    def _param_space() -> dict:
+        return {
+            "tilt": {
+                "min": 0,
+                "max": 0.6,
+                "step": 0.2,
+                "type": "float",
+                "default": 0.5,
+            }
+        }
+
+    def _valid_raw(self, approach: str = "weights") -> dict:
+        raw: dict = {
+            "approach": approach,
+            "summary": "在几个关键因子上做小范围搜索",
+            "why": "最近回撤偏大，低波动因子值得多给一点权重",
+            "expected_effect": "回撤和波动有望下降",
+            "risks": ["收益可能略降"],
+            "objective": "sharpe",
+            "max_trials": 20,
+        }
+        if approach == "weights":
+            raw["search_space"] = self._search_space()
+        elif approach == "model_type":
+            raw["model_type"] = "low_vol_quality"
+            raw["search_space"] = self._search_space()
+        else:
+            raw["code"] = PARAM_CODE
+            raw["param_space"] = self._param_space()
+        return raw
+
+    # ------------------------------------------------------------------
+    # normalize_tuning_plan
+    # ------------------------------------------------------------------
+    def test_normalize_tuning_plan_weights_approach(self) -> None:
+        base = {"ep": 0.2, "bp": 0.2, "roe": 0.2}
+        plan = normalize_tuning_plan(self._valid_raw("weights"), base_weights=base)
+        self.assertEqual(plan["approach"], "weights")
+        self.assertIsNone(plan["model_type"])
+        self.assertIsNone(plan["code"])
+        self.assertEqual(plan["param_space"], {})
+        self.assertEqual(
+            list(plan["search_space"]), ["volatility_60", "roe", "ep"]
+        )
+        self.assertEqual(
+            plan["search_space"]["ep"],
+            {"min": 0.0, "max": 0.2, "step": 0.1},
+        )
+        self.assertEqual(plan["objective"], "sharpe")
+        self.assertEqual(plan["max_trials"], 20)
+        self.assertAlmostEqual(plan["weights"]["ep"], 1.0 / 3.0, places=12)
+        self.assertEqual(plan["risks"], ["收益可能略降"])
+
+    def test_normalize_tuning_plan_model_type_approach(self) -> None:
+        plan = normalize_tuning_plan(self._valid_raw("model_type"))
+        self.assertEqual(plan["model_type"], "low_vol_quality")
+        _assert_weights_close(
+            self, plan["weights"], get_model("low_vol_quality")["weights"]
+        )
+        self.assertEqual(list(plan["search_space"]), ["volatility_60", "roe", "ep"])
+        self.assertEqual(plan["param_space"], {})
+
+    def test_normalize_tuning_plan_code_approach(self) -> None:
+        base = {"ep": 0.2, "bp": 0.2, "roe": 0.2}
+        plan = normalize_tuning_plan(self._valid_raw("code"), base_weights=base)
+        self.assertEqual(plan["approach"], "code")
+        self.assertIsNone(plan["model_type"])
+        self.assertEqual(plan["search_space"], {})
+        self.assertEqual(plan["code"], PARAM_CODE.strip())
+        self.assertEqual(
+            plan["param_space"],
+            {
+                "tilt": {
+                    "min": 0.0,
+                    "max": 0.6,
+                    "step": 0.2,
+                    "type": "float",
+                    "default": 0.5,
+                }
+            },
+        )
+        self.assertAlmostEqual(plan["weights"]["ep"], 1.0 / 3.0, places=12)
+
+    def test_normalize_tuning_plan_int_param_normalized(self) -> None:
+        raw = self._valid_raw("code")
+        raw["param_space"] = {
+            "tilt": self._param_space()["tilt"],
+            "rounds": {"min": 1, "max": 5, "step": 1, "type": "int"},
+        }
+        plan = normalize_tuning_plan(raw)
+        self.assertEqual(
+            plan["param_space"]["rounds"],
+            {"min": 1, "max": 5, "step": 1, "type": "int", "default": 1},
+        )
+
+    def test_normalize_tuning_plan_uses_current_model_weights(self) -> None:
+        raw = self._valid_raw("weights")
+        plan = normalize_tuning_plan(raw, current_model="low_vol_quality")
+        _assert_weights_close(
+            self, plan["weights"], get_model("low_vol_quality")["weights"]
+        )
+        plan = normalize_tuning_plan(
+            raw, current_model=get_model("value_dividend")
+        )
+        _assert_weights_close(
+            self, plan["weights"], get_model("value_dividend")["weights"]
+        )
+
+    def test_normalize_tuning_plan_result_keys(self) -> None:
+        plan = normalize_tuning_plan(self._valid_raw("weights"))
+        self.assertEqual(
+            set(plan),
+            {
+                "approach",
+                "summary",
+                "model_type",
+                "weights",
+                "code",
+                "search_space",
+                "param_space",
+                "objective",
+                "max_trials",
+                "why",
+                "expected_effect",
+                "risks",
+            },
+        )
+
+    def test_normalize_tuning_plan_objective_and_max_trials(self) -> None:
+        raw = self._valid_raw("weights")
+        raw["objective"] = "CAGR"
+        raw["max_trials"] = 12.0
+        plan = normalize_tuning_plan(raw)
+        self.assertEqual(plan["objective"], "cagr")
+        self.assertEqual(plan["max_trials"], 12)
+
+        raw = self._valid_raw("weights")
+        del raw["objective"]
+        del raw["max_trials"]
+        plan = normalize_tuning_plan(raw)
+        self.assertEqual(plan["objective"], "sharpe")
+        self.assertEqual(plan["max_trials"], 12)
+
+        # 归一化不 clamp：跨出 8~48 的值留给服务端限制
+        raw = self._valid_raw("weights")
+        raw["max_trials"] = 100
+        self.assertEqual(normalize_tuning_plan(raw)["max_trials"], 100)
+
+        for bad in (
+            {"objective": "profit"},
+            {"objective": 1},
+            {"max_trials": "12"},
+            {"max_trials": 0},
+            {"max_trials": 12.5},
+        ):
+            raw = self._valid_raw("weights")
+            raw.update(bad)
+            with self.subTest(bad=bad), self.assertRaises(ModelValidationError):
+                normalize_tuning_plan(raw)
+
+    def test_normalize_tuning_plan_rejects_bad_search_space(self) -> None:
+        valid = self._search_space()
+        cases = {
+            "missing": None,
+            "fewer_than_3": {
+                "volatility_60": valid["volatility_60"],
+                "roe": valid["roe"],
+            },
+            "unknown_factor": {
+                **valid,
+                "unknown_factor": {"min": 0.0, "max": 0.1, "step": 0.1},
+            },
+            "min_gt_max": {
+                "volatility_60": {"min": 0.3, "max": 0.1, "step": 0.1},
+                "roe": valid["roe"],
+                "ep": valid["ep"],
+            },
+            "step_zero": {
+                "volatility_60": {"min": 0.0, "max": 0.2, "step": 0},
+                "roe": valid["roe"],
+                "ep": valid["ep"],
+            },
+            "over_max": {
+                "volatility_60": {"min": 0.1, "max": 0.5, "step": 0.1},
+                "roe": valid["roe"],
+                "ep": valid["ep"],
+            },
+            "negative_min": {
+                "volatility_60": {"min": -0.05, "max": 0.2, "step": 0.1},
+                "roe": valid["roe"],
+                "ep": valid["ep"],
+            },
+            "single_level": {
+                "volatility_60": {"min": 0.1, "max": 0.1, "step": 0.1},
+                "roe": valid["roe"],
+                "ep": valid["ep"],
+            },
+            "not_mapping": "oops",
+        }
+        for label, search_space in cases.items():
+            raw = self._valid_raw("weights")
+            if search_space is None:
+                del raw["search_space"]
+            else:
+                raw["search_space"] = search_space
+            with self.subTest(case=label), self.assertRaises(ModelValidationError):
+                normalize_tuning_plan(raw)
+
+    def test_normalize_tuning_plan_rejects_bad_param_space(self) -> None:
+        tilt = self._param_space()["tilt"]
+        cases = {
+            "missing": None,
+            "empty": {},
+            "too_many": {
+                f"p{index}": {"min": 0.0, "max": 0.1, "step": 0.1}
+                for index in range(5)
+            },
+            "bad_name": {"1bad": tilt},
+            "keyword": {"class": tilt},
+            "min_gt_max": {"tilt": {"min": 0.5, "max": 0.1, "step": 0.1}},
+            "step_zero": {"tilt": {"min": 0.0, "max": 0.5, "step": 0}},
+            "single_level": {"tilt": {"min": 0.2, "max": 0.2, "step": 0.1}},
+            "bad_type": {"tilt": {**tilt, "type": "string"}},
+            "default_out_of_range": {"tilt": {**tilt, "default": 0.9}},
+            "int_not_integer": {
+                "count": {"min": 1, "max": 5, "step": 0.5, "type": "int"}
+            },
+        }
+        for label, param_space in cases.items():
+            raw = self._valid_raw("code")
+            if param_space is None:
+                del raw["param_space"]
+            else:
+                raw["param_space"] = param_space
+            with self.subTest(case=label), self.assertRaises(ModelValidationError):
+                normalize_tuning_plan(raw)
+
+    def test_normalize_tuning_plan_rejects_bad_code(self) -> None:
+        raw = self._valid_raw("code")
+        raw["code"] = "import os\n\n\ndef build_transform(params=None):\n    return None\n"
+        with self.assertRaises(ModelCodeError):
+            normalize_tuning_plan(raw)
+
+        raw = self._valid_raw("code")
+        raw["code"] = VALID_CODE  # 旧写法：不接收 params
+        with self.assertRaises(ModelValidationError) as ctx:
+            normalize_tuning_plan(raw)
+        self.assertIn("params", str(ctx.exception))
+
+    def test_normalize_tuning_plan_rejects_mismatched_fields(self) -> None:
+        raw = self._valid_raw("code")
+        raw["search_space"] = self._search_space()
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan(raw)
+
+        raw = self._valid_raw("weights")
+        raw["param_space"] = self._param_space()
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan(raw)
+
+    def test_normalize_tuning_plan_required_fields(self) -> None:
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan({"approach": "weights"})  # 缺 summary/search_space
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan({"approach": "magic", "summary": "x"})
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan(["not", "a", "dict"])  # type: ignore[arg-type]
+
+        raw = self._valid_raw("model_type")
+        del raw["model_type"]
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan(raw)
+
+        raw = self._valid_raw("model_type")
+        raw["model_type"] = "not_a_model"
+        with self.assertRaises(ModelValidationError):
+            normalize_tuning_plan(raw)
+
+    # ------------------------------------------------------------------
+    # build_tuning_plan
+    # ------------------------------------------------------------------
+    def test_fake_llm_tuning_plan_matches_contract(self) -> None:
+        raw = FakeLLM().chat_json(
+            TUNING_SYSTEM,
+            [{"role": "user", "content": json.dumps({"tuning_request": True})}],
+        )
+        self.assertEqual(raw["approach"], "code")
+        self.assertIn("build_transform(params=None)", raw["code"])
+        self.assertIn("tilt", raw["param_space"])
+        self.assertEqual(raw["param_space"]["tilt"]["default"], 0.5)
+        self.assertEqual(raw["objective"], "sharpe")
+        self.assertEqual(raw["max_trials"], 12)
+        for key in ("summary", "why", "risks"):
+            self.assertTrue(raw.get(key))
+        plan = normalize_tuning_plan(raw)
+        self.assertEqual(plan["approach"], "code")
+        self.assertIn("tilt", plan["param_space"])
+
+    def test_build_tuning_plan_with_fake_llm(self) -> None:
+        plan = build_tuning_plan(FakeLLM(), self._state())
+        self.assertEqual(plan["approach"], "code")
+        self.assertEqual(plan["max_trials"], 12)
+        self.assertEqual(plan["objective"], "sharpe")
+        self.assertEqual(plan["repair_attempts"], 0)
+        self.assertEqual(plan["param_space"]["tilt"]["default"], 0.5)
+        self.assertIn("build_transform(params=None)", plan["code"])
+
+    def test_build_tuning_plan_prompt_and_state(self) -> None:
+        llm = FakeProposalLLM(self._valid_raw("weights"))
+        plan = build_tuning_plan(llm, self._state())
+        self.assertEqual(plan["approach"], "weights")
+        self.assertEqual(plan["repair_attempts"], 0)
+        self.assertEqual(len(llm.calls), 1)
+        system, messages = llm.calls[0]
+        self.assertEqual(system, TUNING_SYSTEM)
+        self.assertIn("网格", TUNING_SYSTEM)
+        self.assertEqual(len(messages), 1)
+        payload = json.loads(messages[0]["content"])
+        self.assertTrue(payload["tuning_request"])
+        self.assertIn("current_metrics", payload)
+
+    def test_build_tuning_plan_auto_repair(self) -> None:
+        bad = self._valid_raw("weights")
+        bad["search_space"] = {"volatility_60": {"min": 0.05, "max": 0.25, "step": 0.1}}
+        llm = SequenceLLM([bad, self._valid_raw("weights")])
+        plan = build_tuning_plan(llm, self._state())
+        self.assertEqual(plan["repair_attempts"], 1)
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(llm.calls[1][0], TUNING_REPAIR_SYSTEM)
+        repair_payload = json.loads(llm.calls[1][1][0]["content"])
+        self.assertIn("error", repair_payload)
+        self.assertIn("search_space", repair_payload["error"])
+
+    def test_build_tuning_plan_repair_exhausted(self) -> None:
+        bad = self._valid_raw("weights")
+        bad["search_space"] = {"volatility_60": {"min": 0.05, "max": 0.25, "step": 0.1}}
+        llm = SequenceLLM([bad, bad, bad])
+        with self.assertRaises(ModelValidationError) as ctx:
+            build_tuning_plan(llm, self._state())
+        self.assertIn("自动修复 2 次", str(ctx.exception))
+        self.assertEqual(len(llm.calls), 3)
+
+    def test_build_tuning_plan_rejects_non_mapping_state(self) -> None:
+        with self.assertRaises(ModelValidationError):
+            build_tuning_plan(FakeLLM(), ["not", "a", "dict"])  # type: ignore[arg-type]
+
+    def test_build_tuning_plan_invalid_state_weights(self) -> None:
+        state = self._state()
+        state["weights"] = {"ep": -1}
+        llm = FakeProposalLLM(self._valid_raw("weights"))
+        with self.assertRaises(ModelValidationError):
+            build_tuning_plan(llm, state)
+        self.assertEqual(llm.calls, [])
+
+    def test_fake_llm_planner_behavior_unchanged(self) -> None:
+        plan = FakeLLM().chat_json(
+            "planner",
+            [
+                {
+                    "role": "user",
+                    "content": json.dumps({"user_message": "你好", "state": {}}),
+                }
+            ],
+        )
+        self.assertIn("reply", plan)
+        self.assertIn("actions", plan)
 
 
 if __name__ == "__main__":
