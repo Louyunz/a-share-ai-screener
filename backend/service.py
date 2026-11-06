@@ -476,7 +476,7 @@ class AppService:
             if aggressive_model:
                 info = registry.get_model(aggressive_model)
                 add_step("升级优化策略",
-                         f"上一版未达预期，本轮不再微调权重，直接更换基础模型为「{info.get('name')}」并重新回测。",
+                         f"上一版未达预期，本轮不再微调权重，直接更换基础模型为{info.get('name')}并重新回测。",
                          "done", "plan")
             else:
                 add_step("升级优化策略",
@@ -564,7 +564,7 @@ class AppService:
                                 extra={"code_change": change_preview})
         elif proposal["approach"] == "model_type":
             steps[-1] = dict(steps[-1], status="done",
-                             detail=f"切换模型类型为「{info.get('name')}」：{info.get('description')}；"
+                             detail=f"切换模型类型为{info.get('name')}：{info.get('description')}；"
                                     "具体配置改动见下方改动框。")
             yield "ui", publish(proposal=self._proposal_public(proposal, model_name=info.get("name")),
                                 extra={"code_change": change_preview})
@@ -619,8 +619,8 @@ class AppService:
                              extra=final_extra)
         yield "ui", final_work
         approval_actions = [
-            {"label": "同意，启用吧", "message": "同意启用这个改进"},
-            {"label": "先不启用", "message": "先别启用，我再想想"},
+            {"label": "同意", "message": "同意启用这个改进"},
+            {"label": "暂存", "message": "先别启用，我再想想"},
         ]
         if not expectation_met:
             approval_actions.append({"label": "继续优化", "message": "继续优化模型，上一版未达到我的预期"})
@@ -640,7 +640,7 @@ class AppService:
         note_text = ""
         if not expectation_met:
             note_text = ("候选方案未达到您的目标：" + expectation_reason
-                         + " 您可以先不启用，或回复「继续优化」；我会直接更换基础模型或重写数学打分模型再试一版。")
+                         + " 您可以先不启用，或回复继续优化；我会直接更换基础模型或重写数学打分模型再试一版。")
         return [final_work["block"], approval], note_text, False
 
     @staticmethod
@@ -729,7 +729,7 @@ class AppService:
         return {
             "approach": "model_type",
             "model_type": model_type,
-            "summary": f"按您的要求切换为「{info.get('name')}」模型：{info.get('description')}",
+            "summary": f"按您的要求切换为{info.get('name')}模型：{info.get('description')}",
             "why": "您明确点名了该模型；本次先保留既有因子框架，切换为对应风格权重后再做同区间回测。",
             "expected_effect": "风格与您指定的模型一致；收益与回撤变化以本次候选回测数据为准。",
             "risks": ["历史回测不代表未来实际表现。", "切换风格后短期表现可能与原模型差异较大。"],
@@ -915,7 +915,7 @@ class AppService:
         version_block = self._version_block()
         yield "ui", {"block": version_block}
         metrics = active.get("metrics") or {}
-        return [version_block], (f"已启用「{self._model_name(active)}」；回测夏普 "
+        return [version_block], (f"已启用{self._model_name(active)}；回测夏普 "
                     f"{float(metrics.get('sharpe', 0)):.2f}，之后选股会用这个新模型。"), False
 
     def _rollback(self, session_id: str):
@@ -925,7 +925,7 @@ class AppService:
         self.store.rollback(previous["id"], reason="user_rollback")
         version_block = self._version_block()
         yield "ui", {"block": version_block}
-        return [version_block], f"已切回「{self._model_name(previous)}」。", False
+        return [version_block], f"已切回{self._model_name(previous)}。", False
 
     # ------------------------------------------------------------------
     # 状态与模型
