@@ -595,3 +595,31 @@ body.history-open, body.info-open { overflow: hidden; }
 /* 上下文收起后，在对话区头部保留展开入口 */
 body.wb-collapsed .context-toggle { display: inline-flex; }
 body.wb-collapsed .workspace { grid-template-columns: minmax(0, 1fr); }
+
+
+/* AI 回复流式打字光标 */
+.bubble.is-typing::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--color-accent);
+  animation: caretBlink 0.85s steps(1) infinite;
+}
+
+@keyframes caretBlink {
+  50% { opacity: 0; }
+}
+
+/* 代码正在逐行写入 */
+.card-work.is-running .code-change {
+  border-color: #BFDBFE;
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.06);
+}
+
+.card-work.is-running .code-file::after {
+  content: " · 写入中";
+  color: var(--color-accent);
+}

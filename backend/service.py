@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
@@ -437,13 +438,45 @@ class AppService:
         transform = None
         checks = ""
         change_preview = self._change_preview(model, proposal)
+        diff_lines = str(change_preview.get("diff") or "").split("\n")
+
+        # 代码 / 配置改动流式写入：先发空改动框，再逐行推送，最后补全统计
+        info = None
+        if proposal["approach"] == "code":
+            step_title = "修改模型代码"
+            running_detail = "正在根据方案改写策略打分逻辑，代码逐行写入中…"
+        elif proposal["approach"] == "model_type":
+            info = registry.get_model(str(proposal.get("model_type")))
+            candidate_weights = info["weights"]
+            step_title = "切换模型类型"
+            running_detail = "正在写入模型类型与配置，改动逐行展示中…"
+        else:
+            step_title = "调整因子权重"
+            running_detail = "正在写入新的因子权重，改动逐行展示中…"
+        add_step(step_title, running_detail, "running", "code")
+        partial_change = dict(change_preview)
+        partial_change["diff"] = ""
+        partial_change["added"] = 0
+        partial_change["removed"] = 0
+        yield "ui", publish(proposal=self._proposal_public(proposal), extra={"code_change": partial_change})
+        for index, line in enumerate(diff_lines):
+            if not line and index == len(diff_lines) - 1:
+                continue
+            partial = diff_lines[:index + 1]
+            partial_change = dict(change_preview)
+            partial_change["diff"] = "\n".join(partial)
+            partial_change["added"] = len([item for item in partial if item.startswith("+") and not item.startswith("+++")])
+            partial_change["removed"] = len([item for item in partial if item.startswith("-") and not item.startswith("---")])
+            yield "ui", publish(proposal=self._proposal_public(proposal), extra={"code_change": partial_change})
+            time.sleep(0.03)
+
         if proposal["approach"] == "code":
             from .models import custom
             validation = custom.validate_code(proposal["code"])
             checks = "、".join(str(item.get("name")) for item in validation.get("checks", []))
-            add_step("修改模型代码",
-                     f"改写策略打分逻辑：新增 {change_preview['added']} 行、"
-                     f"删除 {change_preview['removed']} 行，具体改动见下方代码框。", "done", "code")
+            steps[-1] = dict(steps[-1], status="done",
+                             detail=f"改写策略打分逻辑：新增 {change_preview['added']} 行、"
+                                    f"删除 {change_preview['removed']} 行，具体改动见下方代码框。")
             yield "ui", publish(proposal=self._proposal_public(proposal),
                                 extra={"code_change": change_preview})
             add_step("执行代码安全检查", f"通过静态检查（{checks or '导入、危险调用、返回格式'}）"
@@ -452,18 +485,16 @@ class AppService:
             yield "ui", publish(proposal=self._proposal_public(proposal),
                                 extra={"code_change": change_preview})
         elif proposal["approach"] == "model_type":
-            info = registry.get_model(str(proposal.get("model_type")))
-            candidate_weights = info["weights"]
-            add_step("切换模型类型",
-                     f"切换模型类型为「{info.get('name')}」：{info.get('description')}；"
-                     "具体配置改动见下方改动框。", "done", "code")
+            steps[-1] = dict(steps[-1], status="done",
+                             detail=f"切换模型类型为「{info.get('name')}」：{info.get('description')}；"
+                                    "具体配置改动见下方改动框。")
             yield "ui", publish(proposal=self._proposal_public(proposal, model_name=info.get("name")),
                                 extra={"code_change": change_preview})
         else:
             changed = len([line for line in change_preview["diff"].splitlines()
                            if line.startswith("+") and not line.startswith("+++")])
-            add_step("调整因子权重",
-                     f"调整 {changed} 个因子权重，具体改动见下方改动框。", "done", "code")
+            steps[-1] = dict(steps[-1], status="done",
+                             detail=f"调整 {changed} 个因子权重，具体改动见下方改动框。")
             yield "ui", publish(proposal=self._proposal_public(proposal),
                                 extra={"code_change": change_preview})
 

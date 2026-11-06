@@ -73,6 +73,12 @@ class ChatFlowTest(unittest.TestCase):
         code_change = works[-1].get("code_change") or {}
         self.assertTrue(code_change.get("diff"), "AI 改代码时应返回代码 diff 供前端展示")
         self.assertGreater(code_change.get("added", 0), 0)
+        # 流式写入：同一 work 卡片应多次推送，code_change.diff 逐行增长
+        streamed = [block for block in works if block.get("status") == "running"]
+        self.assertGreaterEqual(len(streamed), 3, "代码改动应通过多条 running work 事件流式推送")
+        diff_lengths = [len((block.get("code_change") or {}).get("diff") or "") for block in works]
+        self.assertGreater(diff_lengths[-1], diff_lengths[0])
+        self.assertGreaterEqual(len(set(diff_lengths)), 3, "代码 diff 应逐行增长而不是一次性出现")
         self.assertTrue(approvals)
         self.assertIn("需要您确认", text)
         self.assertIn("同意启用", text)

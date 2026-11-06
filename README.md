@@ -77,6 +77,10 @@ $env:LLM_MODEL = "deepseek-chat"
 
 截图来自真实浏览器联调（示例数据 + FakeLLM / 真实 DeepSeek）；真实模型下文字与解读由所选模型生成。
 
+**流式输出**：AI 回复通过 SSE `token` 事件逐字渲染（前端打字机队列）；AI 修改代码/权重/模型类型时，改动框在 `work` 卡片内按行流式写入，`修改模型代码 → 安全检查和回测 → 对比 → 审批` 步骤同步推进：
+
+![代码改动流式写入](docs/screenshots/10_streaming_code.png)
+
 ## 设计系统
 
 - **定位**：Professional Financial SaaS。借鉴 Linear 的极简信息层级、Bloomberg Terminal 的金融数据密度、Stripe Dashboard 的卡片与表格规范；去装饰化，每个视觉元素都有信息功能。
