@@ -1,8 +1,8 @@
-# 智投罗盘 · AI 选股助手（MVP）
+# 智投罗盘 · AI 投资助手（MVP）
 
-一个「只用一个聊天框」完成全部操作的 A 股 AI 选股应用：AI 先像朋友一样了解你，再自动完成选股、解读，并能自己分析模型、生成/修改选股代码、回测对比，最后等你点头后才启用。
+一个面向 A 股投资场景的 AI 智能投资顾问：先用自然语言建立投资者画像，再生成适配策略、完成选股与解读，并能分析模型、生成/修改选股代码、回测对比，最后等待用户确认后才启用。
 
-- 前端：原生 JS 单页（无构建链、无 CDN、纯 SVG 图表），一个聊天流 + 右侧 AI 工作台
+- 前端：原生 JS + 纯 SVG 图表，无构建链、无 CDN；**Professional Financial SaaS** 三栏布局（左侧导航 / 中间 AI 对话工作区 / 右侧投资上下文）
 - 后端：FastAPI（单进程同时托管页面与 API）+ SQLite + pandas
 - 数据：AkShare 为主、Tushare 为辅；离线缓存自动选择 parquet/CSV；无网络时可用内置示例数据
 - 模型：10 因子选股引擎 + 5 种内置模型类型 + AI 生成自定义打分代码（AST 白名单 + 子进程冒烟 + 回测验证）
@@ -55,45 +55,46 @@ $env:LLM_MODEL = "deepseek-chat"
 
 ## 界面
 
-| 对话建画像 | 选股结果 |
+| 三栏工作区（导航 / AI 对话 / 投资上下文） | 选股结果与回测指标 |
 |---|---|
-| ![对话建画像](docs/screenshots/01_ai_chat.png) | ![选股结果](docs/screenshots/02_selection.png) |
+| ![三栏工作区](docs/screenshots/01_ai_chat.png) | ![选股结果](docs/screenshots/02_selection.png) |
 
-| AI 优化过程（方案/对比/审批） | 模型版本 |
+| 模型管理（版本与指标） | 历史记录 |
 |---|---|
-| ![AI 优化过程](docs/screenshots/03_interpretation.png) | ![模型版本](docs/screenshots/04_tuning.png) |
+| ![模型管理](docs/screenshots/03_model.png) | ![历史记录](docs/screenshots/04_history.png) |
 
-AI 修改策略代码时，聊天内实时展示带行号的代码框（逐行 diff，新增/删除高亮）；消息卡片随对话落库，刷新页面后仍可恢复：
-
-![AI 代码框](docs/screenshots/05_ai_code.png)
-![刷新后恢复代码框](docs/screenshots/06_history_code.png)
-
-| 历史对话归档 | 收起 AI 工作台 |
+| 代码改动 diff | 投资组合 |
 |---|---|
-| ![历史对话归档](docs/screenshots/07_history_archive.png) | ![收起工作台](docs/screenshots/08_workbench_collapsed.png) |
+| ![代码改动](docs/screenshots/06_code.png) | ![投资组合](docs/screenshots/07_portfolio.png) |
+
+| 收起右侧上下文 | 移动端导航抽屉 |
+|---|---|
+| ![收起上下文](docs/screenshots/05_collapsed.png) | ![移动端导航](docs/screenshots/08_mobile_nav.png) |
+
+移动端投资上下文抽屉：
+
+![移动端上下文](docs/screenshots/09_mobile_context.png)
 
 截图来自真实浏览器联调（示例数据 + FakeLLM / 真实 DeepSeek）；真实模型下文字与解读由所选模型生成。
 
-AI 工作时，背景流体自动加速、提高饱和度：
+## 设计系统
 
-![AI 工作中的流体背景](docs/screenshots/09_ai_working.png)
+- **定位**：Professional Financial SaaS。借鉴 Linear 的极简信息层级、Bloomberg Terminal 的金融数据密度、Stripe Dashboard 的卡片与表格规范；去装饰化，每个视觉元素都有信息功能。
+- **布局**：顶部工具栏 56px；左侧导航 224px（<1024px 收为图标，移动端为抽屉）；中间对话区最小 560px；右侧投资上下文 320px（可收起，窄屏为抽屉）；页面边距 24px、栏间距 16px。
+- **颜色**：主背景 `#F8FAFC`、卡片 `#FFFFFF`、品牌 Navy `#1E3A5F`、交互蓝 `#2563EB`、辅助蓝 `#DBEAFE`；边框 `#E2E8F0`、强边框 `#CBD5E1`；正文 `#0F172A` / `#475569`，辅助文字 `#94A3B8`。
+- **状态与金融语义**：成功 `#15803D` / 警告 `#B45309` / 危险 `#DC2626` / 信息 `#2563EB`；A 股涨跌沿用中国大陆习惯，红色上涨、绿色下跌；所有收益、回撤、夏普等指标旁标注「历史回测数据，不代表未来实际表现」。
+- **卡片 / 按钮 / 输入**：卡片白底、1px `#E2E8F0` 边框、10px 圆角、默认无阴影；按钮 6px 圆角、默认 36px 高；输入框 8px 圆角、白色背景、最小 56px，聚焦边框变蓝。
+- **字体与数字**：`Inter, PingFang SC, Microsoft YaHei, Noto Sans CJK SC`；金融指标和表格数字使用 `font-variant-numeric: tabular-nums`，避免变化时跳动。
+- **克制交互**：页面淡入 150ms、按钮/输入聚焦 120–150ms；不使用动态渐变背景、玻璃拟态、持续发光 AI 图标或无意义悬浮动画；支持 `prefers-reduced-motion`。
+- **AI 对话组织**：AI 回复不只输出大段文字，还以指标卡、数据表格、代码 diff、方案对比、风险提示等结构化卡片呈现；审批与启用必须经过聊天确认。
 
-## 视觉与交互设计
+## 导航与对话管理
 
-- **浅色 Apple 风格**：Apple 系统字体栈、浅灰白背景、大圆角、留白与克制的蓝色主色；页面内不使用深色背景。
-- **动态流体背景**：Canvas 2D 柔和色团持续流动；AI 处理请求时（`body.ai-working`）速度倍率从 1 平滑升到约 3.6，模糊度降低、饱和度升高，顶栏同时出现「AI 正在工作 · 流体加速」提示，回复结束后回落。
-- **沉浸光感卡片**：对话卡片使用真实 `backdrop-filter` 磨砂（blur + saturation + brightness）、层次渐变描边、环境光晕与内层高光；指针经过时，镜面边缘光（Fresnel rim）与内部高光跟随指针移动（由 `--glass-x/--glass-y` 驱动），并根据卡片类型（选股/优化/审批/画像）呈现蓝、紫、暖橙等不同氛围光。
-- **光学与无障碍细节**：内容自适应透明度（浅色背景更通透）、柔和彩色投影；支持 `prefers-reduced-motion`（关闭动画）与 `prefers-reduced-transparency`（退化为实色磨砂面板）。
-- **绿色使用纪律**：绿色仅用于负向数据（股票/组合下跌、最大回撤等），上涨与正收益使用红系；成功、进行中、普通状态全部使用蓝色或中性灰，避免把绿色当装饰色。
-- **新对话与历史归档**：顶栏「新对话」创建会话；「历史对话」打开归档，可切换回任意历史会话并恢复聊天卡片与代码框。
-- **全宽顶栏与贴边工作台**：顶栏固定在页面顶部、与视口等宽；右侧工作台贴齐页面右边缘；工作台内部滚动容器（`.wb-scroll`）保持透明，卡片间距 20px，透出背后的流体背景而不是灰色底。
-
-## 对话管理
-
-- 顶栏 **新对话**：立即创建并切换到全新会话；
-- 顶栏 **历史对话**：打开归档面板，按最近更新时间列出全部会话（首条用户消息作为标题、消息数、画像摘要、是否已确认），点击任意一条即可切回继续；
-- 所有会话、画像、模型版本和聊天富卡片都保存在本地 SQLite 中，刷新页面或重启服务不会丢失；
-- AI 工作台支持一键收起，宽屏下对话区自动占满整个宽度。
+- **左侧导航**：AI 投资顾问、投资组合、策略分析、历史记录、模型管理、系统设置；投资组合 / 策略分析 / 模型管理使用真实会话状态生成只读详情弹窗，不改变后端接口。
+- **对话区头部**：显示当前会话名与运行状态；提供历史、清空、新对话；输入区提供分析组合、查看模型、生成报告、上传资料等快捷操作，并支持停止生成、重新生成、清空输入。
+- **投资上下文**：自动展示画像、AI 活动、当前模型与版本、最近选股结果；宽屏可收起，窄屏通过「上下文」按钮打开抽屉。
+- **历史记录**：按最近更新时间列出全部会话（首条用户消息作为标题、消息数、画像摘要、是否已确认），可切换回任意会话并恢复聊天卡片与代码框。
+- 所有会话、画像、模型版本和聊天富卡片都保存在本地 SQLite 中，刷新页面或重启服务不会丢失。
 
 ## AI 表达与确认规范
 
@@ -118,7 +119,7 @@ backend/
   engine/            A 股 10 因子、筛选/组合、T+1/涨跌停/停牌/成本回测
   models/            内置模型类型、AI 代码安全校验与编译、提案流水线
 frontend/
-  index.html / app.js / style.css / charts.js / fluid.js
+  index.html / app.js / style.css / charts.js
 tests/               95+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
 scripts/             构建缓存、启动、重置、全量测试、E2E 冒烟
 docs/                接口契约、运行手册、设计摘要、界面截图
@@ -128,12 +129,13 @@ docs/                接口契约、运行手册、设计摘要、界面截图
 
 ```powershell
 & $py -m unittest discover -s tests -v
-$node --check frontend/app.js; $node --check frontend/charts.js
+$node --check frontend/app.js
+$node --check frontend/charts.js
 & $py scripts\e2e_smoke.py
 ```
 
 - 全量测试：引擎、模型安全校验（含拒绝危险代码/死循环超时）、Agent 计划、对话全流程、SQLite、HTTP/SSE
-- 浏览器 E2E：真实 Edge 驱动“说话 → AI 追问 → 确认 → 选股 → 优化 → 同意 → 版本更新”全流程
+- 浏览器 E2E：真实 Edge 驱动“说话 → AI 追问 → 确认 → 选股 → 优化 → 同意 → 版本更新”全流程；另验证三栏尺寸（56/224/320）、卡片 Token、FakeLLM 对话→画像→选股→刷新恢复、清空对话与移动端抽屉。
 - 风险提示：本项目为比赛演示原型，历史回测不代表未来收益，不构成投资建议。
 
 ## 参考话术来源（提示词依据）
@@ -144,8 +146,8 @@ $node --check frontend/app.js; $node --check frontend/charts.js
 - 证券投资顾问业务与适当性管理要求：[证券投资顾问业务暂行规定](https://www.10jqka.com.cn)
 - 财富管理路演支持话术参考：[FinClaw bank wealth-management skill](https://github.com/aifinlab/finclaw/blob/main/skills/bank-t191-wealth-management-roadshow-support-assistant/SKILL.md)
 
-## 视觉设计参考
+## 设计参考
 
-- 沉浸光感材质（华为开发者问答）：[沉浸光感材质在卡片中如何使用](https://developer.huawei.com/consumer/cn/forum/topic/0207211216415627050?fid=0109140870620153026)、[接入沉浸光感后如何增强效果](https://developer.huawei.com/consumer/cn/forum/topic/0202219337594255098?fid=0101587865002800104)
-- Apple Liquid Glass 设计语言：[Apple 新软件设计新闻稿](https://www.apple.com.cn/newsroom/2025/06/apple-introduces-a-delightful-and-elegant-new-software-design/)、[WWDC25 Liquid Glass 介绍](https://developer.apple.com/la/videos/play/wwdc2025/219/)
-- 玻璃材质的光学实现参考（磨砂、镜面高光锐度、内容自适应强度、无障碍回退）：[liquid_glass_widgets 文档](https://pub.dev/packages/liquid_glass_widgets/versions/0.17.1)
+- [Linear](https://linear.app/)：极简布局、信息层级与克制的交互。
+- [Bloomberg Terminal](https://www.bloomberg.com/professional/products/bloomberg-terminal/)：金融数据密度、指标层次与表格表达。
+- [Stripe Dashboard](https://stripe.com/docs/dashboard)：卡片、字体、表格与状态设计规范。

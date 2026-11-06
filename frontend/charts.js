@@ -9,17 +9,17 @@
   var NS = 'http://www.w3.org/2000/svg';
   var uid = 0;
   var COLORS = {
-    blue: '#0071E3',
-    cyan: '#0A84FF',
-    orange: '#C77700',
-    green: '#1F8F63',
-    red: '#C9333D',
-    violet: '#6E56CF',
-    slate: '#8E8E93',
-    text: '#6E6E73',
-    muted: '#8E8E93',
-    grid: 'rgba(0, 0, 0, 0.06)',
-    axis: 'rgba(0, 0, 0, 0.10)'
+    blue: '#2563EB',
+    cyan: '#2563EB',
+    orange: '#B45309',
+    green: '#16A34A',
+    red: '#DC2626',
+    violet: '#1E3A5F',
+    slate: '#64748B',
+    text: '#475569',
+    muted: '#94A3B8',
+    grid: '#E2E8F0',
+    axis: '#CBD5E1'
   };
 
   /* ------------------------------------------------------------- 基础工具 */
@@ -130,7 +130,7 @@
       var label = document.createElement('span');
       label.textContent = row.label;
       var value = document.createElement('b');
-      value.style.color = row.color || '#1D1D1F';
+      value.style.color = row.color || '#0F172A';
       value.textContent = row.value;
       line.appendChild(label);
       line.appendChild(value);
@@ -204,8 +204,8 @@
     var defs = svgEl('defs');
     var gradId = nextId('bar-grad');
     var grad = svgEl('linearGradient', { id: gradId, x1: '0', y1: '0', x2: '1', y2: '0' });
-    grad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': '#0071E3' }));
-    grad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': '#5AC8FA' }));
+    grad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': '#2563EB' }));
+    grad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': '#2563EB' }));
     defs.appendChild(grad);
     svg.appendChild(defs);
 
@@ -221,7 +221,7 @@
 
       var specs = [];
       if (hasCandidate) {
-        specs.push({ key: 'current', value: item.current, y: centerY - 7.5, h: 5, fill: '#C7C7CC', opacity: 0.7 });
+        specs.push({ key: 'current', value: item.current, y: centerY - 7.5, h: 5, fill: '#CBD5E1', opacity: 0.7 });
         specs.push({ key: 'candidate', value: item.candidate, y: centerY + 2.5, h: 6, fill: 'url(#' + gradId + ')', opacity: 1 });
       } else {
         specs.push({ key: 'current', value: item.current, y: centerY - 3.5, h: 7, fill: 'url(#' + gradId + ')', opacity: 1 });
@@ -234,7 +234,7 @@
         var barW = Math.abs(endX - zeroX);
         group.appendChild(svgEl('rect', {
           x: plotX, y: spec.y, width: plotW, height: spec.h, rx: spec.h / 2,
-          fill: 'rgba(0, 0, 0, 0.04)'
+          fill: '#EFF6FF'
         }));
         if (barW > 0.2) {
           var rect = svgEl('rect', {
@@ -256,13 +256,13 @@
         var valueNode;
         if (hasCandidate) {
           valueNode = textEl(plotRight + valueWidth - 4, centerY + 3, '', { 'text-anchor': 'end', class: 'chart-mono' });
-          var currentSpan = svgEl('tspan', { fill: '#6E6E73' });
+          var currentSpan = svgEl('tspan', { fill: '#475569' });
           currentSpan.textContent = item.current === null ? '—' : formatter(item.current, item);
           valueNode.appendChild(currentSpan);
-          var arrow = svgEl('tspan', { fill: '#1D1D1F', dx: '3' });
+          var arrow = svgEl('tspan', { fill: '#0F172A', dx: '3' });
           arrow.textContent = '→';
           valueNode.appendChild(arrow);
-          var candidateSpan = svgEl('tspan', { fill: '#0071E3', dx: '3' });
+          var candidateSpan = svgEl('tspan', { fill: '#2563EB', dx: '3' });
           candidateSpan.textContent = item.candidate === null ? '—' : formatter(item.candidate, item);
           valueNode.appendChild(candidateSpan);
         } else {
@@ -374,9 +374,9 @@
     var defs = svgEl('defs');
     var areaId = nextId('area-grad');
     var areaGrad = svgEl('linearGradient', { id: areaId, x1: '0', y1: '0', x2: '0', y2: '1' });
-    areaGrad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': 'rgba(0, 113, 227, 0.16)' }));
-    areaGrad.appendChild(svgEl('stop', { offset: '70%', 'stop-color': 'rgba(0, 113, 227, 0.04)' }));
-    areaGrad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': 'rgba(0, 113, 227, 0)' }));
+    areaGrad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': 'rgba(37, 99, 235, 0.08)' }));
+    areaGrad.appendChild(svgEl('stop', { offset: '70%', 'stop-color': 'rgba(37, 99, 235, 0.06)' }));
+    areaGrad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': 'rgba(37, 99, 235, 0.06)' }));
     defs.appendChild(areaGrad);
     svg.appendChild(defs);
 
@@ -445,7 +445,7 @@
         if (labelY < 12) labelY = endPoint.y + 15;
         svg.appendChild(textEl(endPoint.x - 3, labelY, yFormatter(endPoint.value), {
           'text-anchor': 'end',
-          fill: seriesIndex === 0 ? '#0071E3' : '#8E8E93',
+          fill: seriesIndex === 0 ? '#2563EB' : '#64748B',
           class: 'chart-mono'
         }));
       }
@@ -457,7 +457,7 @@
     var hoverGroup = svgEl('g', { opacity: '0' });
     var hoverLine = svgEl('line', {
       x1: 0, y1: margin.top, x2: 0, y2: margin.top + plotH,
-      stroke: 'rgba(0, 0, 0, 0.12)', 'stroke-width': 0.8, 'stroke-dasharray': '2 3'
+      stroke: '#E2E8F0', 'stroke-width': 0.8, 'stroke-dasharray': '2 3'
     });
     hoverGroup.appendChild(hoverLine);
     var hoverDots = series.map(function (item) {
@@ -534,15 +534,15 @@
     var defs = svgEl('defs');
     var gradId = nextId('gauge-grad');
     var grad = svgEl('linearGradient', { id: gradId, x1: '0', y1: '0', x2: '1', y2: '1' });
-    grad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': '#0071E3' }));
-    grad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': '#0A84FF' }));
+    grad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': '#2563EB' }));
+    grad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': '#2563EB' }));
     defs.appendChild(grad);
     svg.appendChild(defs);
 
     var center = size / 2;
     svg.appendChild(svgEl('circle', {
       cx: center, cy: center, r: radius,
-      fill: 'none', stroke: 'rgba(0, 0, 0, 0.10)', 'stroke-width': thickness
+      fill: 'none', stroke: '#E2E8F0', 'stroke-width': thickness
     }));
     var progress = svgEl('circle', {
       cx: center, cy: center, r: radius,
@@ -558,14 +558,14 @@
     var valueText = textEl(center, center - 1, display, {
       'text-anchor': 'middle',
       'dominant-baseline': 'middle',
-      fill: '#F5F5F7',
+      fill: '#F1F5F9',
       class: 'gauge-value'
     });
     valueText.style.fontSize = (size * 0.2) + 'px';
     svg.appendChild(valueText);
     var labelText = textEl(center, center + size * 0.2, label, {
       'text-anchor': 'middle',
-      fill: '#8E8E93',
+      fill: '#64748B',
       class: 'gauge-label'
     });
     labelText.style.fontSize = Math.max(7, size * 0.105) + 'px';

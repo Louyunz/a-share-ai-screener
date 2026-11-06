@@ -161,14 +161,16 @@ def build_candidate_proposal(llm, state) -> Proposal  # 调 LLM 生成提案（p
 ```
 `selection.screen/run_backtest` 增加可选参数 `score_transform=None`（Lead 实现，供自定义代码接入）。
 
-## 7. 前端（单对话页）
+## 7. 前端（Professional Financial SaaS 三栏）
 
-- 文件：`frontend/index.html`、`app.js`、`style.css`、`charts.js`、`fluid.js`（SVG 图表 + Canvas 流体背景）。
-- 布局：**左侧 = 唯一聊天流**（消息、AI 回复、内嵌卡片）；**右侧 = AI 工作台**（自动显示当前画像摘要、AI 活动时间线、当前模型/版本）；窄屏折叠为单列。没有页签/没有模块切换。顶栏提供「新对话」「历史对话」。
-- 交互：输入框即可完成全部操作；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。
-- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`ui` 事件按 id upsert 卡片（work 卡步骤实时更新）；`token` 逐字追加；`error` 显示错误条+重试。
-- 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧工作台，从 `/messages` 恢复聊天文本与富卡片（`blocks`）；历史对话通过 `GET /api/sessions` 归档列表切换。
-- 视觉：**浅色 Apple 风格 / 毛玻璃**。动态 Canvas 流体背景（AI 工作时加速：常态能量 1 → 工作约 3）；卡片使用 `backdrop-filter` 毛玻璃并随指针产生高光；配色严禁深色背景。绿色严格限制：仅用于负向数据（股票下跌、最大回撤等），上涨/正收益用红色，状态/成功态使用蓝色；文字使用 Apple 灰阶。
+- 文件：`frontend/index.html`、`app.js`、`style.css`、`charts.js`（纯原生 JS + SVG，无构建链/无 CDN）。
+- 布局：**顶部工具栏 56px + 左侧导航 224px + 中间 AI 对话工作区（最小 560px）+ 右侧投资上下文 320px**；页面边距 24px、栏间距 16px。小于 1024px 时导航收为图标，移动端为抽屉；小于 1200px 时右侧上下文改为可开合抽屉。
+- 导航：左侧为 AI 投资顾问 / 投资组合 / 策略分析 / 历史记录 / 模型管理 / 系统设置；投资组合、策略分析、模型管理、设置使用当前会话状态渲染只读弹窗，不改后端接口。对话区头部提供历史、清空、新对话；输入区支持快捷操作、停止生成、重新生成、清空输入与文本附件。
+- 交互：对话是唯一的写操作入口；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。
+- SSE：`POST /api/sessions/{sid}/chat` 用 `fetch` + `ReadableStream` 解析；`ui` 事件按 id upsert 卡片（work 卡步骤实时更新）；`token` 逐字追加；`error` 显示错误条+重试。停止生成通过 `AbortController` 取消请求。
+- 首次进入自动创建会话；刷新后调用 `/state` 恢复右侧上下文，从 `/messages` 恢复聊天文本与富卡片（`blocks`）；历史对话通过 `GET /api/sessions` 归档列表切换。
+- 视觉：**Professional Financial SaaS / Light Mode**，参考 Linear + Bloomberg Terminal + Stripe Dashboard。Token：背景 `#F8FAFC`、卡片 `#FFFFFF`、品牌 Navy `#1E3A5F`、交互蓝 `#2563EB`、边框 `#E2E8F0`；卡片 1px 边框 / 10px 圆角 / 默认无阴影，按钮 6px 圆角，输入框 8px 圆角；正文 14px、辅助 12px、卡片标题 16px。**不使用动态渐变背景、玻璃拟态与大阴影**。
+- 状态与金融语义：成功绿 / 警告琥珀 / 危险红 / 信息蓝；A 股涨跌沿用大陆习惯红色上涨、绿色下跌；收益、回撤、夏普等指标统一标注「历史回测数据，不代表未来实际表现」。
 - 禁止：mock 数据、独立页签、页面内直接调 selection/tune/profile 接口、伪造进度。
 
 ## 8. 文件与分工

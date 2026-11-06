@@ -1,5 +1,5 @@
 /* =========================================================================
- * 智投罗盘 · AI 选股助手（单对话页 + AI 工作台）
+ * 智投罗盘 · AI 投资顾问（单对话页 + AI 工作台）
  * 全部操作通过聊天完成：SSE 流式回复 + 富卡片按 id upsert + 右侧工作台自动更新
  * ========================================================================= */
 (function () {
@@ -10,11 +10,11 @@
   var MAX_ACTIVITY = 12;
 
   var METRIC_META = {
-    cagr: { label: '年化收益', note: '过去几年平均每年涨多少', type: 'pct', tone: 'up' },
-    sharpe: { label: '夏普比率', note: '同样的波动下，赚得多不多', type: 'num', tone: 'blue' },
-    mdd: { label: '最大回撤', note: '最难受的时候从高点亏多少', type: 'pct', tone: 'down' },
-    ir: { label: '信息比率', note: '相对大盘的超额收益稳不稳', type: 'num', tone: 'violet' },
-    win_rate: { label: '胜率', note: '持有期间赚钱的时间占比', type: 'pct', tone: 'blue' }
+    cagr: { label: '年化收益', note: '历史回测：平均每年涨多少', type: 'pct', tone: 'up' },
+    sharpe: { label: '夏普比率', note: '每承担一份波动获得的收益', type: 'num', tone: 'info' },
+    mdd: { label: '最大回撤', note: '历史回测：从高点最大亏损幅度', type: 'pct', tone: 'down' },
+    ir: { label: '信息比率', note: '相对基准的超额收益稳定性', type: 'num', tone: 'neutral' },
+    win_rate: { label: '胜率', note: '持有期间取得正收益的占比', type: 'pct', tone: 'info' }
   };
   var METRIC_ORDER = ['cagr', 'sharpe', 'mdd', 'ir', 'win_rate'];
 
@@ -228,9 +228,28 @@
     dom.model = $('#wb-model');
     dom.result = $('#wb-result');
     dom.chatModelChip = $('#chat-model-chip');
+    dom.chatSessionName = $('#chat-session-name');
+    dom.chatRunStatus = $('#chat-run-status');
     dom.footerMeta = $('#footer-meta');
     dom.newChat = $('#new-chat');
+    dom.sidebarToggle = $('#sidebar-toggle');
+    dom.contextToggle = $('#context-toggle');
     dom.historyBtn = $('#history-btn');
+    dom.clearChat = $('#clear-chat');
+    dom.clearInput = $('#clear-input');
+    dom.stopBtn = $('#stop-btn');
+    dom.regenerateBtn = $('#regenerate-btn');
+    dom.attachBtn = $('#attach-btn');
+    dom.attachInput = $('#attach-input');
+    dom.sidebar = $('#sidebar');
+    dom.helpBtn = $('#help-btn');
+    dom.settingsBtn = $('#settings-btn');
+    dom.infoOverlay = $('#info-overlay');
+    dom.infoTitle = $('#info-title');
+    dom.infoKicker = $('#info-kicker');
+    dom.infoSubtitle = $('#info-subtitle');
+    dom.infoBody = $('#info-body');
+    dom.infoClose = $('#info-close');
     dom.historyOverlay = $('#history-overlay');
     dom.historyList = $('#history-list');
     dom.historyClose = $('#history-close');
@@ -467,9 +486,9 @@
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-ai msg-welcome';
     wrap.innerHTML = '<div class="msg-avatar">' + icon('spark') + '</div>'
-      + '<div class="msg-main"><div class="msg-meta"><strong>AI 选股助手</strong><time>刚刚</time></div>'
+      + '<div class="msg-main"><div class="msg-meta"><strong>AI 投资顾问</strong><time>刚刚</time></div>'
       + '<div class="card card-welcome"><div class="card-body">'
-      + '<h2 class="welcome-title">你好，我是你的 AI 选股助手</h2>'
+      + '<h2 class="welcome-title">你好，我是你的 AI 投资顾问</h2>'
       + '<p class="welcome-text">先用几句话说说你的投资想法就行——打算投多久、能接受亏多少、有没有不想碰的行业。我会边聊边把投资画像整理给你看，确认后直接帮你选股、解释结果，也能和你一起优化模型。</p>'
       + '<div class="starter-list">' + STARTERS.map(function (item) {
         return '<button class="starter" type="button" data-action="quick" data-message="' + esc(item.message) + '">' + esc(item.label) + '</button>';
@@ -484,7 +503,7 @@
     var isUser = role === 'user';
     wrap.className = 'msg ' + (isUser ? 'msg-user' : 'msg-ai');
     dom.stream.classList.remove('is-welcome');
-    var meta = '<div class="msg-meta"><strong>' + (isUser ? '你' : 'AI 选股助手') + '</strong><time>' + esc(formatClock(createdAt)) + '</time></div>';
+    var meta = '<div class="msg-meta"><strong>' + (isUser ? '你' : 'AI 投资顾问') + '</strong><time>' + esc(formatClock(createdAt)) + '</time></div>';
     var bubble = '<div class="bubble">' + esc(content) + '</div>';
     wrap.innerHTML = isUser
       ? '<div class="msg-main">' + meta + bubble + '</div>'
@@ -529,7 +548,7 @@
     wrap.className = 'msg msg-ai is-streaming';
     dom.stream.classList.remove('is-welcome');
     wrap.innerHTML = '<div class="msg-avatar">' + icon('spark') + '</div>'
-      + '<div class="msg-main"><div class="msg-meta"><strong>AI 选股助手</strong><time>' + esc(nowClock()) + '</time></div>'
+      + '<div class="msg-main"><div class="msg-meta"><strong>AI 投资顾问</strong><time>' + esc(nowClock()) + '</time></div>'
       + '<div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>'
       + '<div class="cards"></div></div>';
     dom.stream.appendChild(wrap);
@@ -679,7 +698,8 @@
         + '<span class="metric-value">' + esc(formatMetric(key, selection.metrics[key])) + '</span>'
         + (note ? '<span class="metric-note">' + esc(note) + '</span>' : '')
         + '</div>';
-    }).join('') + '</div>';
+    }).join('') + '</div>'
+      + '<p class="metric-disclaimer">以上为历史回测数据' + (selection.as_of ? '（截至 ' + esc(selection.as_of) + '）' : '') + '，不代表未来实际表现，不构成投资建议。</p>';
   }
 
   function stockRowsHtml(top) {
@@ -780,7 +800,7 @@
     var series = [{
       name: '策略净值',
       values: nav.map(function (point) { return num(point.value); }),
-      color: '#22D3EE'
+      color: '#2563EB'
     }];
     var benchmark = (selection.benchmark_nav || []).filter(function (point) {
       return point && point.date !== undefined && num(point.value) !== null;
@@ -792,12 +812,12 @@
         return byDate[label] !== undefined ? byDate[label] : null;
       });
       if (byDateValues.some(function (value) { return value !== null; })) {
-        series.push({ name: '基准', values: byDateValues, color: '#7C93AD', dashed: true });
+        series.push({ name: '基准', values: byDateValues, color: '#94A3B8', dashed: true });
       } else if (benchmark.length >= nav.length) {
         series.push({
           name: '基准',
           values: benchmark.slice(0, nav.length).map(function (point) { return num(point.value); }),
-          color: '#7C93AD',
+          color: '#94A3B8',
           dashed: true
         });
       }
@@ -834,7 +854,7 @@
     var navHtml = navData
       ? '<div class="sub-block"><div class="sub-title"><h4>策略净值 vs 基准</h4><span class="sub-meta">起点归一为 1.00</span></div>'
         + '<div class="chart-box" data-chart="nav"></div>'
-        + '<p class="chart-note">青色为策略净值，灰色虚线为基准；回测已计入交易成本与涨跌停约束。</p></div>'
+        + '<p class="chart-note">蓝色为策略净值，灰色虚线为基准；回测已计入交易成本与涨跌停约束。</p></div>'
       : '';
     var explanationHtml = selection.explanation
       ? '<div class="ai-note"><span class="ai-note-label">' + icon('spark') + 'AI 解读</span><p>' + esc(selection.explanation) + '</p></div>'
@@ -1273,9 +1293,10 @@
     var model = state.activeModel;
     if (model) {
       var chips = metricChipsHtml(model.metrics);
-      html += '<div class="wb-model-top"><strong>' + esc(model.name) + '</strong><span class="status-pill is-ok">启用中</span></div>'
+      html += '<div class="wb-model-top"><strong>' + esc(model.name) + '</strong><span class="status-pill is-ok">运行中</span></div>'
         + (model.description ? '<p class="wb-model-desc">' + esc(model.description) + '</p>' : '')
-        + (chips ? '<div class="wb-chips">' + chips + '</div>' : '');
+        + (chips ? '<div class="wb-chips">' + chips + '</div>' : '')
+        + '<p class="wb-note">年化收益、夏普比率、最大回撤等均为历史回测数据，不代表未来实际表现，不构成投资建议。</p>';
     } else {
       html += '<p class="wb-empty">还没有启用的自定义模型。跟 AI 说「帮我优化模型」，它会先给你方案，再等你确认。</p>';
     }
@@ -1291,7 +1312,7 @@
       }).join('') + '</ul>';
     }
     if (state.pendingProposal) {
-      html += '<div class="wb-pending"><strong>有一个待确认的改进方案</strong><br>AI 会在聊天里等你确认，不会自动启用。'
+      html += '<div class="wb-pending-box"><strong>有一个待确认的改进方案</strong><br>AI 会在聊天里等你确认，不会自动启用。'
         + '<br><button class="btn btn-sm" type="button" data-action="quick" data-message="展开说说待审批方案的细节">展开说说方案</button></div>';
     }
     dom.model.innerHTML = html;
@@ -1338,18 +1359,38 @@
       : 'AI · 助手';
   }
 
+  function setChatRunStatus(text) {
+    if (dom.chatRunStatus) dom.chatRunStatus.textContent = text;
+  }
+
+  function updateChatSessionLabel() {
+    if (!dom.chatSessionName) return;
+    var label = '';
+    if (state.lastUserMessage) {
+      label = String(state.lastUserMessage).replace(/\s+/g, ' ').trim();
+      if (label.length > 28) label = label.slice(0, 28) + '…';
+    }
+    if (!label) label = state.sessionId ? '会话 ' + shortId(state.sessionId) : '新会话';
+    dom.chatSessionName.textContent = label;
+  }
+
   function updateSessionChip() {
     if (!dom.sessionChip) return;
     dom.sessionChip.textContent = state.sessionId ? '会话 ' + shortId(state.sessionId) : '会话 —';
     dom.sessionChip.title = state.sessionId ? '会话 ID：' + state.sessionId : '浏览器本地会话';
+    updateChatSessionLabel();
   }
 
   /* ============================== SSE 发送与解析 ============================== */
   function updateComposerState() {
-    dom.sendBtn.disabled = state.streaming;
-    dom.input.placeholder = state.streaming
-      ? 'AI 正在回复，稍等片刻…'
-      : '说说你的投资想法，例如：我想稳健一点，能接受 10% 左右回撤……';
+    var busy = state.streaming;
+    dom.sendBtn.disabled = busy;
+    if (dom.stopBtn) dom.stopBtn.hidden = !busy;
+    if (dom.regenerateBtn) dom.regenerateBtn.disabled = busy || !state.lastUserMessage;
+    if (dom.clearInput) dom.clearInput.disabled = busy;
+    dom.input.placeholder = busy
+      ? 'AI 正在回复，可点击停止生成…'
+      : '输入投资问题或分析需求，例如：帮我看看现在适合什么模型……';
   }
 
   async function sendMessage(rawContent) {
@@ -1367,22 +1408,26 @@
       return;
     }
     state.streaming = true;
-    document.body.classList.add('ai-working');
-    if (window.FluidBackground && window.FluidBackground.refresh) window.FluidBackground.refresh();
+    setChatRunStatus('生成中…');
     updateComposerState();
     dom.input.value = '';
     resizeInput();
     state.following = true;
     appendTextMessage('user', content, null);
     state.lastUserMessage = content;
+    updateChatSessionLabel();
     var turn = beginAssistantTurn();
     pushActivity('turn', 'AI 正在处理你的请求…', 'running', 'ai');
     var failed = false;
+    var stopped = false;
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.abortController = controller;
     try {
       var response = await fetch('/api/sessions/' + encodeURIComponent(state.sessionId) + '/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-        body: JSON.stringify({ content: content })
+        body: JSON.stringify({ content: content }),
+        signal: controller ? controller.signal : undefined
       });
       if (!response.ok) {
         var detail = await readErrorDetail(response);
@@ -1399,14 +1444,23 @@
       }
     } catch (error) {
       failed = true;
-      showTurnError(turn, '网络异常', error && error.message ? error.message : '请检查后端服务后重试。', true);
+      if (error && error.name === 'AbortError') {
+        failed = false;
+        stopped = true;
+        appendTextMessage('ai', '已停止生成。你可以修改问题后重新发送，或点击输入区的「重新生成」。', null);
+        pushActivity('turn', '已停止生成', 'error', 'alert');
+      } else {
+        showTurnError(turn, '网络异常', error && error.message ? error.message : '请检查后端服务后重试。', true);
+      }
     } finally {
+      state.abortController = null;
       finalizeTurn(turn);
       state.streaming = false;
-      document.body.classList.remove('ai-working');
-      if (window.FluidBackground && window.FluidBackground.refresh) window.FluidBackground.refresh();
+      setChatRunStatus(stopped ? '已停止' : failed ? '处理出错' : '就绪');
       updateComposerState();
-      pushActivity('turn', failed ? '本次处理未完成' : '已完成回复', failed ? 'error' : 'done', failed ? 'alert' : 'check');
+      if (!stopped) {
+        pushActivity('turn', failed ? '本次处理未完成' : '已完成回复', failed ? 'error' : 'done', failed ? 'alert' : 'check');
+      }
       checkHealth();
       dom.input.focus();
     }
@@ -1538,6 +1592,11 @@
     } else {
       appendWelcome();
     }
+    updateChatSessionLabel();
+    setChatRunStatus('就绪');
+    updateComposerState();
+    setActiveNav('assistant');
+    closeInfo();
     if (history === null) {
       appendSystemError('历史消息加载失败', '聊天记录暂时没有拉到，你可以继续对话，或点一下重新连接。', 'retry-init');
     }
@@ -1592,6 +1651,8 @@
 
   async function openHistory() {
     if (!dom.historyOverlay || !dom.historyList) return;
+    if (dom.infoOverlay && !dom.infoOverlay.hidden) closeInfo();
+    setActiveNav('history');
     dom.historyOverlay.hidden = false;
     document.body.classList.add('history-open');
     dom.historyList.innerHTML = '<p class="history-empty">正在读取历史对话…</p>';
@@ -1606,6 +1667,7 @@
     if (!dom.historyOverlay) return;
     dom.historyOverlay.hidden = true;
     document.body.classList.remove('history-open');
+    if (dom.infoOverlay && dom.infoOverlay.hidden) setActiveNav('assistant');
   }
 
   async function activateSession(sessionId) {
@@ -1633,6 +1695,11 @@
     var history = fetched.ok ? (fetched.messages || []) : [];
     if (history.length) renderHistory(history);
     else appendWelcome();
+    updateChatSessionLabel();
+    setChatRunStatus('就绪');
+    updateComposerState();
+    setActiveNav('assistant');
+    closeInfo();
     await loadState();
     await loadVersions();
     renderAllWorkbench();
@@ -1657,7 +1724,7 @@
   }
 
   function toggleWorkbench() {
-    var wide = window.matchMedia('(min-width: 1280px)').matches;
+    var wide = window.matchMedia('(min-width: 1200px)').matches;
     if (wide) {
       document.body.classList.toggle('wb-collapsed');
     } else {
@@ -1667,10 +1734,122 @@
   }
 
   function syncWorkbenchToggle() {
-    var wide = window.matchMedia('(min-width: 1280px)').matches;
+    var wide = window.matchMedia('(min-width: 1200px)').matches;
     var expanded = wide ? !document.body.classList.contains('wb-collapsed') : document.body.classList.contains('wb-open');
     dom.wbToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-    dom.wbToggleLabel.textContent = expanded ? '收起工作台' : 'AI 工作台';
+    dom.wbToggleLabel.textContent = expanded ? '收起右侧面板' : '展开右侧面板';
+    dom.wbToggle.title = expanded ? '收起右侧面板' : '展开右侧面板';
+  }
+
+  /* ============================== 导航与详情 ============================== */
+  function setActiveNav(key) {
+    var items = document.querySelectorAll('.nav-item[data-nav]');
+    Array.prototype.forEach.call(items, function (item) {
+      item.classList.toggle('is-active', item.getAttribute('data-nav') === key);
+    });
+  }
+
+  function closeInfo() {
+    if (!dom.infoOverlay) return;
+    dom.infoOverlay.hidden = true;
+    document.body.classList.remove('info-open');
+    if (!dom.historyOverlay || dom.historyOverlay.hidden) setActiveNav('assistant');
+  }
+
+  function openInfo(kind) {
+    if (!dom.infoOverlay) return;
+    var meta = {
+      portfolio: { kicker: 'PORTFOLIO', title: '投资组合', subtitle: '最近一次选股生成的组合、权重与回测摘要。' },
+      strategy: { kicker: 'STRATEGY', title: '策略分析', subtitle: '历史回测指标与因子暴露，说明当前策略风格。' },
+      model: { kicker: 'MODEL', title: '模型管理', subtitle: '当前启用模型的版本、状态与历史回测指标。' },
+      settings: { kicker: 'SETTINGS', title: '系统设置', subtitle: '演示版运行环境与数据说明。' },
+      help: { kicker: 'HELP', title: '帮助中心', subtitle: '如何用自然语言完成投资画像、选股与模型优化。' }
+    }[kind] || { kicker: 'DETAILS', title: '详情', subtitle: '' };
+    dom.infoKicker.textContent = meta.kicker;
+    dom.infoTitle.textContent = meta.title;
+    dom.infoSubtitle.textContent = meta.subtitle;
+    dom.infoBody.innerHTML = infoHtml(kind);
+    dom.infoOverlay.hidden = false;
+    document.body.classList.add('info-open');
+    if (kind === 'settings') setActiveNav('settings');
+  }
+
+  function infoNote(text) {
+    return '<p class="info-note">' + esc(text) + '</p>';
+  }
+
+  function infoMetricCells(metrics) {
+    var keys = METRIC_ORDER.filter(function (key) { return metrics && num(metrics[key]) !== null; });
+    if (!keys.length) return '';
+    return '<div class="info-grid">' + keys.map(function (key) {
+      return '<div class="info-cell"><span>' + esc(metricMeta(key).label) + '</span><strong>' + esc(formatMetric(key, metrics[key])) + '</strong></div>';
+    }).join('') + '</div>';
+  }
+
+  function infoHtml(kind) {
+    var selection = state.lastSelection;
+    if (kind === 'portfolio') {
+      if (!selection || (!selection.top.length && !selection.hasMetrics)) {
+        return '<p>还没有生成投资组合。回到「AI 投资顾问」对话，先确认投资画像，再让 AI 帮你选股。</p>';
+      }
+      var top = selection.top.slice(0, 8);
+      var table = top.length
+        ? '<table class="info-table"><thead><tr><th>#</th><th>代码</th><th>行业</th><th>综合得分</th></tr></thead><tbody>'
+          + top.map(function (stock, index) {
+            return '<tr><td>' + (index + 1) + '</td><td>' + esc(stock.code || '—') + '</td><td>' + esc(stock.industry || '—') + '</td><td>' + (num(stock.score) === null ? '—' : fmtNum(stock.score, 2)) + '</td></tr>';
+          }).join('') + '</tbody></table>'
+        : '<p>组合暂无持仓明细。</p>';
+      return '<h3>组合摘要</h3>' + infoMetricCells(selection.metrics) + table
+        + infoNote('组合数据来自历史回测（' + (selection.as_of || '最新数据') + '），不代表未来实际表现，不构成投资建议。');
+    }
+    if (kind === 'strategy') {
+      if (!selection || !selection.hasMetrics) {
+        return '<p>还没有策略分析结果。完成一次选股后，这里会显示回测指标与因子暴露。</p>';
+      }
+      var factors = factorItems(selection);
+      var factorTable = factors.length
+        ? '<table class="info-table"><thead><tr><th>因子</th><th>组合平均暴露</th></tr></thead><tbody>'
+          + factors.map(function (item) {
+            return '<tr><td>' + esc(item.title || item.label) + '</td><td>' + fmtNum(item.current, 3) + '</td></tr>';
+          }).join('') + '</tbody></table>'
+        : '<p>暂无因子暴露数据。</p>';
+      return '<h3>回测指标</h3>' + infoMetricCells(selection.metrics)
+        + '<h3>因子暴露</h3>' + factorTable
+        + infoNote('以上指标均为历史回测统计，回测区间以数据服务为准；历史业绩不代表未来表现。');
+    }
+    if (kind === 'model') {
+      var model = state.activeModel;
+      var chips = model ? metricChipsHtml(model.metrics) : '';
+      var versions = state.versions.slice(0, 8);
+      var versionTable = versions.length
+        ? '<table class="info-table"><thead><tr><th>版本</th><th>状态</th><th>更新时间</th></tr></thead><tbody>'
+          + versions.map(function (version) {
+            return '<tr><td>' + esc(version.name) + '</td><td>' + esc(versionStatusText(version.status)) + '</td><td>' + esc(version.created_at ? shortDate(version.created_at) : '—') + '</td></tr>';
+          }).join('') + '</tbody></table>'
+        : '<p>还没有历史模型版本。</p>';
+      return (model ? '<h3>当前模型：' + esc(model.name) + '</h3>' + (chips ? '<div class="info-grid">' + chips + '</div>' : '') : '<h3>当前模型</h3><p>还没有启用自定义模型，可以让 AI 先给出优化方案。</p>')
+        + '<h3>模型版本</h3>' + versionTable
+        + infoNote('模型指标来自历史回测，不代表未来实际表现，也不构成投资建议。启用或回滚模型前请阅读风险提示并确认。');
+    }
+    if (kind === 'settings') {
+      var health = dom.healthText ? dom.healthText.textContent : '—';
+      return '<h3>运行环境</h3><div class="info-grid">'
+        + '<div class="info-cell"><span>数据服务</span><strong>' + esc(health) + '</strong></div>'
+        + '<div class="info-cell"><span>数据模式</span><strong>本地缓存 / 示例行情</strong></div>'
+        + '<div class="info-cell"><span>账户模式</span><strong>比赛演示 · 本地会话</strong></div>'
+        + '<div class="info-cell"><span>回测成本</span><strong>含交易成本与涨跌停约束</strong></div>'
+        + '</div><h3>风险与说明</h3><ul>'
+        + '<li>本系统为比赛演示原型，不接入真实资金账户，不执行真实交易。</li>'
+        + '<li>收益、回撤、夏普比率等指标均为历史回测结果，不代表未来实际表现。</li>'
+        + '<li>页面内容不构成投资建议；市场有风险，投资需谨慎。</li>'
+        + '</ul>' + infoNote('如需切换真实行情或模型服务，请在服务端配置中修改，界面不会直接调用选股或模型接口。');
+    }
+    return '<h3>如何开始</h3><ul>'
+      + '<li>在输入框用自然语言描述投资目标、期限和可接受回撤，AI 会逐步建立投资者画像。</li>'
+      + '<li>画像确认后，可以让 AI 选股、解读结果或优化模型；重要操作会先请您审批。</li>'
+      + '<li>右侧「投资上下文」会同步显示画像、AI 活动、当前模型和最近结果。</li>'
+      + '<li>顶栏可以打开历史记录，切换回之前的会话继续分析。</li>'
+      + '</ul>' + infoNote('AI 不会重复询问已确认的画像字段；所有收益与回撤指标均标注为历史回测数据。');
   }
 
   /* ============================== 事件绑定 ============================== */
@@ -1711,6 +1890,11 @@
       sendMessage(dom.input.value);
     });
 
+    dom.composer.addEventListener('click', function (event) {
+      var action = event.target.closest ? event.target.closest('[data-action]') : null;
+      if (action) handleActionClick(event);
+    });
+
     dom.input.addEventListener('keydown', function (event) {
       if (event.key !== 'Enter' || event.shiftKey || event.isComposing || composing) return;
       event.preventDefault();
@@ -1732,8 +1916,81 @@
     dom.wbToggle.addEventListener('click', toggleWorkbench);
     dom.stream.addEventListener('click', handleActionClick);
     dom.workbench.addEventListener('click', handleActionClick);
+
+    if (dom.sidebarToggle) dom.sidebarToggle.addEventListener('click', function () {
+      document.body.classList.toggle('nav-open');
+    });
+    if (dom.contextToggle) dom.contextToggle.addEventListener('click', toggleWorkbench);
     if (dom.newChat) dom.newChat.addEventListener('click', startNewChat);
     if (dom.historyBtn) dom.historyBtn.addEventListener('click', openHistory);
+    if (dom.clearChat) dom.clearChat.addEventListener('click', clearChatView);
+    if (dom.clearInput) dom.clearInput.addEventListener('click', function () {
+      dom.input.value = '';
+      resizeInput();
+      dom.input.focus();
+    });
+    if (dom.stopBtn) dom.stopBtn.addEventListener('click', function () {
+      if (state.abortController) state.abortController.abort();
+    });
+    if (dom.regenerateBtn) dom.regenerateBtn.addEventListener('click', function () {
+      if (!state.streaming && state.lastUserMessage) sendMessage(state.lastUserMessage);
+      else dom.input.focus();
+    });
+
+    if (dom.attachBtn) dom.attachBtn.addEventListener('click', function () { dom.attachInput.click(); });
+    if (dom.attachInput) {
+      dom.attachInput.addEventListener('change', function () {
+        var file = this.files && this.files[0] ? this.files[0] : null;
+        this.value = '';
+        if (!file) return;
+        if (file.size > 200 * 1024) {
+          appendSystemError('附件过大', '演示版只支持 200KB 以内的文本资料（txt / md / csv / json）。', null);
+          return;
+        }
+        var reader = new FileReader();
+        reader.onload = function () {
+          dom.input.value = '【附件：' + file.name + '】\n' + String(reader.result || '').slice(0, 20000) + '\n\n';
+          resizeInput();
+          dom.input.focus();
+        };
+        reader.onerror = function () {
+          appendSystemError('附件读取失败', '无法读取这个文件，请换一个文本文件再试。', null);
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    if (dom.helpBtn) dom.helpBtn.addEventListener('click', function () { openInfo('help'); });
+    if (dom.settingsBtn) dom.settingsBtn.addEventListener('click', function () { openInfo('settings'); });
+    if (dom.infoClose) dom.infoClose.addEventListener('click', closeInfo);
+    if (dom.infoOverlay) {
+      dom.infoOverlay.addEventListener('click', function (event) {
+        if (event.target === dom.infoOverlay) closeInfo();
+      });
+    }
+
+    if (dom.sidebar) {
+      dom.sidebar.addEventListener('click', function (event) {
+        var item = event.target.closest ? event.target.closest('[data-nav]') : null;
+        if (!item) return;
+        var key = item.getAttribute('data-nav');
+        document.body.classList.remove('nav-open');
+        setActiveNav(key);
+        if (key === 'assistant') {
+          closeHistory();
+          closeInfo();
+          dom.input.focus();
+          return;
+        }
+        if (key === 'history') {
+          openHistory();
+          return;
+        }
+        closeHistory();
+        openInfo(key);
+      });
+    }
+
     if (dom.historyClose) dom.historyClose.addEventListener('click', closeHistory);
     if (dom.historyOverlay) {
       dom.historyOverlay.addEventListener('click', function (event) {
@@ -1750,24 +2007,26 @@
       });
     }
     document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') closeHistory();
+      if (event.key !== 'Escape') return;
+      if (dom.infoOverlay && !dom.infoOverlay.hidden) closeInfo();
+      else closeHistory();
     });
-    var glassSelector = '.card, .wb-card, .composer-box, .topbar, .bubble';
-    document.addEventListener('pointermove', function (event) {
-      var target = event.target && event.target.closest ? event.target.closest(glassSelector) : null;
-      if (!target) return;
-      var rect = target.getBoundingClientRect();
-      if (!rect.width || !rect.height) return;
-      target.style.setProperty('--glass-x', ((event.clientX - rect.left) / rect.width * 100).toFixed(2) + '%');
-      target.style.setProperty('--glass-y', ((event.clientY - rect.top) / rect.height * 100).toFixed(2) + '%');
-    }, { passive: true });
 
-    var media = window.matchMedia('(min-width: 1280px)');
+    var media = window.matchMedia('(min-width: 1200px)');
     var onViewportChange = function () {
       syncWorkbenchToggle();
     };
     if (media.addEventListener) media.addEventListener('change', onViewportChange);
     else if (media.addListener) media.addListener(onViewportChange);
+  }
+
+  function clearChatView() {
+    if (state.streaming) return;
+    clearChat();
+    appendWelcome();
+    setChatRunStatus('新会话');
+    updateChatSessionLabel();
+    dom.input.focus();
   }
 
   /* ============================== 启动 ============================== */
