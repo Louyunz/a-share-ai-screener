@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FastAPI 入口：单页应用 + 对话 SSE。
+"""FastAPI 入口：登录保护的单页应用 + 对话 SSE。
 
 启动：``uvicorn backend.main:app --port 8000``
 """
@@ -8,18 +8,34 @@ from __future__ import annotations
 from typing import Any, Iterator
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import FRONTEND_DIR
+from .auth import AuthError, AuthManager
+from .config import DB_PATH, FRONTEND_DIR
 from .data import DataError
 from .events import sse_format
 from .llm import LLMError
 from .schemas import ValidationError
 from .service import AppService, ConflictError, NotFoundError, ServiceError
+from .store import Store
 
 _service: AppService | None = None
+_auth: AuthManager | None = None
+
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+        "img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; connect-src 'self'"
+    ),
+}
 
 
 def get_service() -> AppService:
@@ -29,8 +45,17 @@ def get_service() -> AppService:
     return _service
 
 
+def get_auth() -> AuthManager:
+    global _auth
+    if _auth is None:
+        _auth = AuthManager(Store(DB_PATH))
+    return _auth
+
+
 def _error(exc: Exception) -> JSONResponse:
-    if isinstance(exc, NotFoundError):
+    if isinstance(exc, AuthError):
+        status = exc.status
+    elif isinstance(exc, NotFoundError):
         status = 404
     elif isinstance(exc, ConflictError):
         status = 409
@@ -71,12 +96,82 @@ async def _json_body(request: Request) -> dict[str, Any]:
 
 
 def create_app(service: AppService | None = None) -> FastAPI:
-    global _service
+    global _service, _auth
     _service = service
-    app = FastAPI(title="智投罗盘 · AI 选股助手", version="2.0.0")
-    app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                       allow_methods=["*"], allow_headers=["*"])
+    _auth = AuthManager(service.store) if service is not None else None
+    app = FastAPI(title="智投罗盘 · AI 选股助手", version="2.1.0")
 
+    @app.middleware("http")
+    async def protect_api(request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/api/") and request.method in UNSAFE_METHODS:
+            origin = request.headers.get("origin")
+            if origin:
+                expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+                if origin.rstrip("/") != expected:
+                    return JSONResponse({"error": "跨站请求被拒绝"}, status_code=403)
+        if path.startswith("/api/") and not path.startswith("/api/auth/"):
+            if get_auth().authenticated(request) is None:
+                return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+        response = await call_next(request)
+        for name, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
+        if path.startswith("/api/") or path in {"/", "/login"}:
+            response.headers.setdefault("Cache-Control", "no-store")
+        if request.url.scheme == "https":
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
+    # ------------------------------------------------------------------
+    # 认证
+    # ------------------------------------------------------------------
+    @app.get("/api/auth/status")
+    def auth_status(request: Request) -> Any:
+        return get_auth().status_payload(request)
+
+    @app.get("/api/auth/session")
+    def auth_session(request: Request) -> Any:
+        user = get_auth().authenticated(request)
+        if user is None:
+            return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+        return {"authenticated": True, "username": str(user.get("username") or "")}
+
+    @app.post("/api/auth/setup")
+    async def auth_setup(request: Request) -> Any:
+        try:
+            body = await _json_body(request)
+            token = get_auth().setup(
+                request, str(body.get("username", "")), str(body.get("password", "")))
+            response = JSONResponse({"ok": True, "username": str(body.get("username", "")).strip()})
+            get_auth().set_cookie(response, token)
+            return response
+        except AuthError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+
+    @app.post("/api/auth/login")
+    async def auth_login(request: Request) -> Any:
+        try:
+            body = await _json_body(request)
+            token = get_auth().login(
+                request, str(body.get("username", "")), str(body.get("password", "")))
+            response = JSONResponse({"ok": True, "username": str(body.get("username", "")).strip()})
+            get_auth().set_cookie(response, token)
+            return response
+        except AuthError as exc:
+            headers = {"Retry-After": "60"} if exc.status == 429 else None
+            return JSONResponse({"error": str(exc)}, status_code=exc.status, headers=headers)
+
+    @app.post("/api/auth/logout")
+    def auth_logout(request: Request) -> Any:
+        get_auth().logout(request)
+        response = JSONResponse({"ok": True})
+        get_auth().clear_cookie(response)
+        return response
+
+    # ------------------------------------------------------------------
+    # 业务 API（全部需要登录）
+    # ------------------------------------------------------------------
     @app.get("/api/health")
     def health() -> Any:
         try:
@@ -131,8 +226,29 @@ def create_app(service: AppService | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
+    # ------------------------------------------------------------------
+    # 页面
+    # ------------------------------------------------------------------
+    @app.get("/")
+    def index(request: Request):
+        if get_auth().authenticated(request) is None:
+            return RedirectResponse(url="/login", status_code=303)
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
+
+    @app.get("/login")
+    def login_page():
+        return FileResponse(str(FRONTEND_DIR / "login.html"))
+
     if FRONTEND_DIR.exists() and (FRONTEND_DIR / "index.html").exists():
         app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
+    @app.on_event("shutdown")
+    def _close_auth_store() -> None:
+        global _auth
+        if _auth is not None:
+            _auth.store.close()
+            _auth = None
+
     return app
 
 

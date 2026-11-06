@@ -48,6 +48,14 @@ REBALANCE_DAYS = int(os.environ.get("REBALANCE_DAYS", "20"))
 COST_BUY = float(os.environ.get("COST_BUY", "0.0003"))
 COST_SELL = float(os.environ.get("COST_SELL", "0.0013"))
 
+# 管理员登录（单用户）
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "").strip()
+AUTH_PASSWORD_HASH = os.environ.get("AUTH_PASSWORD_HASH", "").strip()
+AUTH_SESSION_HOURS = float(os.environ.get("AUTH_SESSION_HOURS", "12"))
+AUTH_COOKIE_NAME = os.environ.get("AUTH_COOKIE_NAME", "zhitou_admin_session")
+AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "0").strip().lower() in ("1", "true", "yes")
+AUTH_ALLOW_SETUP = os.environ.get("AUTH_ALLOW_SETUP", "1").strip().lower() not in ("0", "false", "no")
+
 # 演示账户（单用户）
 DEMO_USER = "demo"
 

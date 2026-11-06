@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#F8FAFC">
+  <meta name="description" content="智投罗盘 · 登录">
+  <title>登录 · 智投罗盘</title>
+  <link rel="stylesheet" href="style.css?v=18">
+  <link rel="stylesheet" href="login.css?v=18">
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-brand">
+        <span class="login-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16.5" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".45"/><circle cx="20" cy="20" r="11.5" fill="none" stroke="currentColor" stroke-width=".8" opacity=".24"/><path d="m25.6 14.4-3 8.2-8.2 3 3-8.2 8.2-3Z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="20" cy="20" r="1.8" fill="currentColor"/></svg>
+        </span>
+        <div>
+          <h1 id="login-title">智投罗盘</h1>
+          <p>AI 投资顾问 · 本地数据</p>
+        </div>
+      </div>
+
+      <div id="auth-message" class="auth-message" role="alert" hidden></div>
+
+      <form id="login-form" class="auth-form" hidden>
+        <div class="auth-heading">
+          <h2>管理员登录</h2>
+          <p>仅限授权用户访问，请使用管理员账号登录。</p>
+        </div>
+        <label class="auth-field">
+          <span>用户名</span>
+          <input id="login-username" name="username" type="text" autocomplete="username"
+                 maxlength="32" required autofocus>
+        </label>
+        <label class="auth-field">
+          <span>密码</span>
+          <input id="login-password" name="password" type="password" autocomplete="current-password"
+                 maxlength="128" required>
+        </label>
+        <button id="login-submit" class="auth-submit" type="submit">登录</button>
+      </form>
+
+      <form id="setup-form" class="auth-form" hidden>
+        <div class="auth-heading">
+          <h2>首次使用，创建管理员账号</h2>
+          <p>账号只保存在本机。密码至少 10 位，并同时包含字母和数字。</p>
+        </div>
+        <label class="auth-field">
+          <span>管理员用户名</span>
+          <input id="setup-username" name="username" type="text" autocomplete="username"
+                 maxlength="32" required autofocus>
+        </label>
+        <label class="auth-field">
+          <span>设置密码</span>
+          <input id="setup-password" name="password" type="password" autocomplete="new-password"
+                 maxlength="128" required>
+        </label>
+        <label class="auth-field">
+          <span>确认密码</span>
+          <input id="setup-confirm" name="confirm" type="password" autocomplete="new-password"
+                 maxlength="128" required>
+        </label>
+        <button id="setup-submit" class="auth-submit" type="submit">创建并进入</button>
+      </form>
+
+      <p id="auth-hint" class="auth-hint" hidden></p>
+      <p class="auth-foot">会话默认 12 小时有效 · 所有接口均需登录</p>
+    </section>
+  </main>
+  <script src="login.js?v=18"></script>
+</body>
+</html>

@@ -20,6 +20,8 @@ $env:LLM_MODEL = "deepseek-chat"
 & $py -m uvicorn backend.main:app --port 8000
 ```
 
+打开 `http://127.0.0.1:8000` 会进入登录页：首次使用在本机创建管理员账号；也可以在 `.env` 配置 `AUTH_USERNAME` / `AUTH_PASSWORD_HASH`（用 `scripts/set_password.py` 生成）。所有业务 API 都需要登录；详细安全边界见 `docs/SECURITY.md`。
+
 ## 2. 演示脚本（3 分钟）
 
 1. 输入“我想为养老攒点钱”，AI 会先问一个缺失的信息；

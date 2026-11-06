@@ -29,9 +29,16 @@
 
 ## 2. 后端 API（精简）
 
+所有 `/api/**` 默认需要管理员登录 Cookie（`/api/auth/*` 除外）；未登录返回 401，前端跳转 `/login`。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | `{ok, source, as_of, universe, llm}` |
+| GET | `/api/auth/status` | 登录/初始化状态 `{configured, setup_required, setup_allowed, authenticated, username}` |
+| POST | `/api/auth/setup` | 首次初始化（仅本机、仅未配置时）；成功后写入 HttpOnly Cookie |
+| POST | `/api/auth/login` | 管理员登录；连续失败 5 次锁定 5 分钟 |
+| POST | `/api/auth/logout` | 注销当前会话 |
+| GET | `/api/auth/session` | 当前登录用户；未登录 401 |
+| GET | `/api/health` | `{ok, source, as_of, universe, llm}`（需登录） |
 | GET | `/api/sessions` | 历史对话归档 `{sessions:[{id,title,created_at,updated_at,message_count,profile_summary,profile_confirmed}]}` |
 | POST | `/api/sessions` | `{session_id}` |
 | POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
@@ -41,7 +48,7 @@
 
 不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
 
-**状态单一来源（SCHEMA_VERSION=5）**：会话当前模型 = `session.active_version_id` 指向的 `version` 行（为空则默认「均衡多因子」）；`session_state` 只保存 pending/待执行意图/最近结果，不再保存 active_model/metrics/version_id。旧的全局 `store.active_version/activate/parent_version` 接口已删除，版本链按 `session_id` 隔离。
+**状态单一来源（SCHEMA_VERSION=6）**：会话当前模型 = `session.active_version_id` 指向的 `version` 行（为空则默认「均衡多因子」）；`session_state` 只保存 pending/待执行意图/最近结果，不再保存 active_model/metrics/version_id。旧的全局 `store.active_version/activate/parent_version` 接口已删除，版本链按 `session_id` 隔离。`auth_user` / `auth_session` 两张表只保存管理员密码哈希与会话令牌哈希。
 
 ## 3. 聊天 SSE 事件
 
@@ -281,7 +288,8 @@ def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 
 ## 7. 前端（Professional Financial SaaS 三栏）
 
-- 文件：`frontend/index.html`、`app.js`、`style.css`、`charts.js`（纯原生 JS + SVG，无构建链/无 CDN）。
+- 文件：`frontend/index.html`、`app.js`、`style.css`、`charts.js`（纯原生 JS + SVG，无构建链/无 CDN）；登录页为 `login.html`、`login.css`、`login.js`。
+- 登录：所有业务 API 需要管理员会话 Cookie；未登录访问 `/` 跳转 `/login`；首次使用在本机创建管理员账号；登出入口在顶部工具栏。
 - 布局：**顶部工具栏 56px + 左侧导航 224px + 中间 AI 对话工作区（最小 560px）+ 右侧投资上下文 320px**；页面边距 24px、栏间距 16px。小于 1024px 时导航收为图标，移动端为抽屉；小于 1200px 时右侧上下文改为可开合抽屉。
 - 导航：左侧为 AI 投资顾问 / 投资组合 / 策略分析 / 历史记录 / 模型管理 / 系统设置；投资组合、策略分析、模型管理、设置使用当前会话状态渲染只读弹窗，不改后端接口。对话区头部提供历史、清空、新对话；输入区支持快捷操作、停止生成、重新生成、清空输入与文本附件。
 - 交互：对话是唯一的写操作入口；卡片里的「快捷回复」按钮只是把一句话发进聊天，不直接调接口；审批、启用、回滚都必须经过聊天消息。

@@ -246,6 +246,7 @@
     dom.attachInput = $('#attach-input');
     dom.sidebar = $('#sidebar');
     dom.helpBtn = $('#help-btn');
+    dom.logoutBtn = $('#logout-btn');
     dom.settingsBtn = $('#settings-btn');
     dom.infoOverlay = $('#info-overlay');
     dom.infoTitle = $('#info-title');
@@ -259,10 +260,17 @@
   }
 
   /* ============================== 网络请求 ============================== */
+  function redirectToLogin() {
+    if (window.location.pathname !== '/login') {
+      window.location.replace('/login?expired=1');
+    }
+  }
+
   async function api(path, options) {
     var opts = options || {};
     var response = await fetch(path, {
       method: opts.method || 'GET',
+      credentials: 'same-origin',
       headers: Object.assign({ Accept: 'application/json', 'Content-Type': 'application/json' }, opts.headers || {}),
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
     });
@@ -276,6 +284,7 @@
       }
     }
     if (!response.ok) {
+      if (response.status === 401) redirectToLogin();
       var detail = data && (data.detail || data.message || data.error);
       if (Array.isArray(detail)) {
         detail = detail.map(function (item) {
@@ -1875,10 +1884,15 @@
     try {
       var response = await fetch('/api/sessions/' + encodeURIComponent(state.sessionId) + '/chat', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify({ content: content }),
         signal: controller ? controller.signal : undefined
       });
+      if (response.status === 401) {
+        redirectToLogin();
+        throw new Error('登录已过期，请重新登录。');
+      }
       if (!response.ok) {
         var detail = await readErrorDetail(response);
         throw new Error(detail || '对话请求失败（HTTP ' + response.status + '）');
@@ -2418,6 +2432,20 @@
     }
 
     if (dom.helpBtn) dom.helpBtn.addEventListener('click', function () { openInfo('help'); });
+    if (dom.logoutBtn) dom.logoutBtn.addEventListener('click', async function () {
+      dom.logoutBtn.disabled = true;
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { Accept: 'application/json' }
+        });
+      } catch (error) {
+        // 即使网络失败也离开页面，避免继续使用旧会话
+      } finally {
+        window.location.replace('/login');
+      }
+    });
     if (dom.settingsBtn) dom.settingsBtn.addEventListener('click', function () { openInfo('settings'); });
     if (dom.infoClose) dom.infoClose.addEventListener('click', closeInfo);
     if (dom.infoOverlay) {
@@ -2486,12 +2514,25 @@
     dom.input.focus();
   }
 
+  async function loadIdentity() {
+    try {
+      var data = await api('/api/auth/status');
+      var name = document.querySelector('.sidebar-user strong');
+      var note = document.querySelector('.sidebar-user small');
+      if (name && data.username) name.textContent = data.username;
+      if (note) note.textContent = '管理员 · 本地数据';
+    } catch (error) {
+      // 登录态失效会由 api() 统一跳转登录页
+    }
+  }
+
   /* ============================== 启动 ============================== */
   function boot() {
     cacheDom();
     bindEvents();
     syncWorkbenchToggle();
     renderAllWorkbench();
+    loadIdentity();
     bootstrap();
   }
 

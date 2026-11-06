@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -138,10 +139,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_error(exc)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        # 只支持同源访问，不再返回 CORS 通配符。
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Allow", "GET, POST, OPTIONS")
         self.end_headers()
 
     # ------------------------------------------------------------------
@@ -171,6 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
+
+    if os.environ.get("DEV_SERVER_ALLOW_INSECURE", "").strip().lower() not in ("1", "true", "yes"):
+        print("[dev_server] 该预览服务器不带登录认证，出于安全考虑默认禁用。")
+        print("[dev_server] 请使用：uvicorn backend.main:app --port 8000（带登录页）")
+        print("[dev_server] 仅本机临时预览可显式设置 DEV_SERVER_ALLOW_INSECURE=1。")
+        return 2
 
     print("[dev_server] 初始化服务（加载数据缓存与模型配置）...")
     try:

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _now() -> str:
@@ -89,6 +89,19 @@ class Store:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS auth_user (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                username TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS auth_session (
+                token_hash TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_session_expiry
+                ON auth_session(expires_at);
             """
         )
         columns = [row[1] for row in self._conn.execute("PRAGMA table_info(message)")]
@@ -328,6 +341,50 @@ class Store:
                 item["payload"] = {}
             items.append(item)
         return items
+
+    # ------------------------------------------------------------------
+    # 管理员认证
+    # ------------------------------------------------------------------
+    def auth_user(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT username, password_hash, created_at FROM auth_user WHERE id = 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_auth_user(self, username: str, password_hash: str) -> bool:
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM auth_user WHERE id = 1").fetchone():
+                return False
+            self._conn.execute(
+                "INSERT INTO auth_user(id, username, password_hash, created_at) "
+                "VALUES (1, ?, ?, ?)", (username, password_hash, _now()))
+            self._conn.commit()
+        return True
+
+    def create_auth_session(self, token_hash: str, expires_at: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO auth_session(token_hash, created_at, expires_at) "
+                "VALUES (?, ?, ?)", (token_hash, int(datetime.now().timestamp()), expires_at))
+            self._conn.commit()
+
+    def auth_session_expiry(self, token_hash: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT expires_at FROM auth_session WHERE token_hash = ?",
+                (token_hash,)).fetchone()
+        return int(row["expires_at"]) if row else None
+
+    def delete_auth_session(self, token_hash: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM auth_session WHERE token_hash = ?", (token_hash,))
+            self._conn.commit()
+
+    def purge_expired_auth_sessions(self, before: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM auth_session WHERE expires_at <= ?", (int(before),))
+            self._conn.commit()
 
     @staticmethod
     def _version_row(row: sqlite3.Row) -> dict[str, Any]:

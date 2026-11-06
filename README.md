@@ -15,6 +15,7 @@
 - 代码改动卡也逐行流式输出，且**先于网格寻优卡**出现；效果对比独立成卡，**排在网格寻优结果之后**；寻优期间代码窗口保持可见，新卡片延迟平滑聚焦，不会在弹出瞬间把页面强行拉到底部。
 - 执行模型优化时，对话里会说明**具体怎么改**（重写引擎/切换模型/搜索哪些因子或参数/目标指标），不只是“已开始优化”。
 - 模型版本按会话隔离：候选模型需确认后才在当前会话启用，也可以回滚；新建对话回到默认「均衡多因子」。
+- **登录保护**：所有业务接口需要管理员登录；密码 PBKDF2 哈希、HttpOnly 会话 Cookie、CSRF 同源校验与登录限速。
 - 前端是原生 JavaScript 和 SVG，无前端构建步骤。
 
 ## 快速开始
@@ -35,11 +36,23 @@ python -m backend.data.build_cache --source sample
 # 配置模型密钥；也可以复制 .env.example 为 .env 后填写
 $env:DEEPSEEK_API_KEY = "sk-..."
 
-# 启动 FastAPI 应用
+# 启动带登录页的 FastAPI 应用
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-打开 <http://127.0.0.1:8000/>。首次启动必须先生成数据缓存；没有模型密钥时可以打开页面，但无法进行 AI 对话。
+打开 <http://127.0.0.1:8000/>，首次使用会进入登录页并引导创建管理员账号；之后所有 API 都需要登录。首次启动必须先生成数据缓存；没有模型密钥时可以登录页面，但无法进行 AI 对话。
+
+### 管理员账号
+
+- **首次使用**：在服务器本机打开页面，设置管理员用户名和密码（至少 10 位，含字母和数字）；
+- 也可以通过 `.env` 固定账号：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\set_password.py
+# 将输出的 AUTH_USERNAME / AUTH_PASSWORD_HASH 写入 .env 后重启
+```
+
+初始化只允许从服务器本机完成；设置完成后初始化入口自动关闭。详细安全边界与 HTTPS 部署要求见 [docs/SECURITY.md](docs/SECURITY.md)。
 
 ### 使用 `.env`
 
@@ -58,6 +71,13 @@ LLM_MODEL=deepseek-chat
 ```
 
 也可以使用其他 OpenAI 兼容接口，修改 `LLM_BASE_URL` 和 `LLM_MODEL` 即可。不要把密钥提交到 Git。
+
+## 安全
+
+- 所有业务 API 默认需要管理员登录；未登录访问会跳转 `/login`。
+- 密码使用 PBKDF2-HMAC-SHA256 哈希；会话 Cookie 为 HttpOnly + SameSite=Strict；登录失败有限速；写请求有同源校验。
+- 首次初始化只允许从服务器本机完成；设置完成后入口关闭。
+- 当前是单机单管理员演示，**不承诺“绝对安全”**。公网部署必须使用 HTTPS 反向代理、设置 `AUTH_COOKIE_SECURE=1`，并做好主机与数据文件保护。详见 [docs/SECURITY.md](docs/SECURITY.md)。
 
 ## 构建真实行情缓存
 
@@ -116,7 +136,7 @@ backend/
   data/              数据源适配器和缓存 CLI
   engine/            因子、选股、组合、回测和服务端网格寻优
   models/            模型注册、代码校验、调参方案生成
-frontend/             页面、对话和图表
+frontend/             页面、登录页、对话和图表
 tests/                Python 测试（含动作契约与“禁止关键词路由”回归）
 scripts/              本地开发、E2E 冒烟、真实 LLM 语义矩阵
 ```
@@ -145,5 +165,5 @@ $env:DEEPSEEK_API_KEY = "sk-..."
 ## 说明
 
 - 回测结果依赖数据范围、缓存内容和参数，不能代表未来收益。
-- `backend.dev_server` 只用于不安装 FastAPI 时的本地预览；完整功能请使用 `backend.main:app`。
+- `backend.dev_server` 无登录保护，出于安全考虑默认拒绝启动；仅供本机临时预览，需显式设置 `DEV_SERVER_ALLOW_INSECURE=1`。完整功能与登录保护请使用 `backend.main:app`。
 - 项目没有认证、权限管理、任务队列和生产级数据库配置，不建议直接暴露到公网。
