@@ -255,10 +255,12 @@ class AppService:
 
         # 2) 执行工具调用，并把服务端动作结果作为备注追加
         notes: list[str] = []
+        narration: list[str] = []
         try:
             for action in plan.actions:
-                events, note, should_stop = yield from self._run_action(
-                    session_id, action, request_text)
+                relay = self._relay_action(
+                    self._run_action(session_id, action, request_text), narration)
+                events, note, should_stop = yield from relay
                 for block in events or []:
                     if isinstance(block, dict) and block.get("id"):
                         saved_blocks[str(block["id"])] = block
@@ -270,18 +272,36 @@ class AppService:
                 if should_stop:
                     break
         except (ServiceError, AgentError, ValidationError) as exc:
-            self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
+            self._remember_assistant(session_id, plan.reply, notes,
+                                     list(saved_blocks.values()), "".join(narration))
             yield "error", {"message": str(exc), "retryable": False}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
         except Exception as exc:  # noqa: BLE001
-            self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
+            self._remember_assistant(session_id, plan.reply, notes,
+                                     list(saved_blocks.values()), "".join(narration))
             yield "error", {"message": f"处理这句时出了点问题：{exc}", "retryable": True}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
 
-        self._remember_assistant(session_id, plan.reply, notes, list(saved_blocks.values()))
+        self._remember_assistant(session_id, plan.reply, notes,
+                                 list(saved_blocks.values()), "".join(narration))
         yield "done", {"message_id": uuid.uuid4().hex[:8]}
+
+    @staticmethod
+    def _relay_action(generator, narration: list[str]):
+        """转发动作事件；顺手收集动作中插入的对话旁白，供消息持久化。"""
+        while True:
+            try:
+                item = next(generator)
+            except StopIteration as stop:
+                return stop.value
+            if (isinstance(item, tuple) and item
+                    and item[0] == "token" and isinstance(item[1], dict)):
+                text = str(item[1].get("text") or "")
+                if text:
+                    narration.append(text)
+            yield item
 
     def _run_action(self, session_id: str, action: dict[str, Any], request_text: str = ""):
         name = action.get("name")
@@ -587,6 +607,10 @@ class AppService:
                          "model_type": plan.get("model_type"),
                          "repair_attempts": plan.get("repair_attempts", 0)},
             })
+        narration = self._plan_narration(plan, directive, target_model, objective_label)
+        yield "token", {"text": "\n\n"}
+        for piece in chunk_text(narration, 16):
+            yield "token", {"text": piece}
         if aggressive:
             add_step("升级优化策略",
                      ("上一版未达预期，本轮不再微调，改为直接更换基础模型并由服务端重新寻优。"
@@ -1004,6 +1028,39 @@ class AppService:
             "previous_metrics": previous.get("metrics") or {},
             "market": {"as_of": self.data.as_of, "universe": len(self.data.universe)},
         }
+
+    @staticmethod
+    def _plan_narration(plan: dict[str, Any], directive: Any,
+                        target_model: dict[str, Any], objective_label: str) -> str:
+        from .models import registry
+
+        approach = str(plan.get("approach") or "")
+        lead = ("上一版没有达到您的预期，这轮我会做结构性调整，不再只微调参数："
+                if getattr(directive, "escalate", False) else "这轮的调整思路是：")
+        if approach == "code":
+            params = [str(item.get("key")) for item in (plan.get("param_space") or [])
+                      if isinstance(item, dict) and item.get("key")]
+            if not params:
+                params = [str(key) for key in (plan.get("search_space") or {})]
+            focus = "、".join(params[:4]) or "打分权重与风险控制参数"
+            summary = str(plan.get("summary") or "").strip().rstrip("。")
+            detail = f"重写底层打分引擎（{summary}）" if summary else "重写底层打分引擎"
+            return (f"{lead}{detail}，重点调整{focus}；写完先给您看代码改动，"
+                    f"再由服务端逐组回测、按{objective_label}选最优，确认前不会启用。")
+        if approach == "model_type":
+            info = registry.get_model(str(plan.get("model_type")))
+            name = str(info.get("name") or plan.get("model_type"))
+            if plan.get("switch_only"):
+                return (f"{lead}我会切换到「{name}」模型，直接使用它的预设权重回测，"
+                        "不做参数寻优；结果出来先给您对比，确认后才启用。")
+            keys = [str(key) for key in (plan.get("search_space") or {})]
+            focus = "、".join(FACTOR_PLAIN.get(key, key) for key in keys[:4]) or "核心因子权重"
+            return (f"{lead}我会切换到「{name}」作为基础模型，再让服务端在 {len(keys) or 10} 个"
+                    f"因子权重上寻优（重点 {focus}），按{objective_label}选最优，确认后才启用。")
+        keys = [str(key) for key in (plan.get("search_space") or {})]
+        focus = "、".join(FACTOR_PLAIN.get(key, key) for key in keys[:4]) or "核心因子"
+        return (f"{lead}我会重新调整因子权重，重点在 {focus} 等 {len(keys) or 10} 个因子上让服务端"
+                f"逐组回测，按{objective_label}选最优，确认前不会启用。")
 
     @staticmethod
     def _plan_detail(plan: dict[str, Any]) -> str:
@@ -1503,13 +1560,16 @@ class AppService:
         return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
     @staticmethod
-    def _assistant_text(reply: str, notes: list[str]) -> str:
+    @staticmethod
+    def _assistant_text(reply: str, notes: list[str], extra_text: str = "") -> str:
         clean_notes = [note for note in notes if note]
-        return reply + ("\n\n" + "\n".join(clean_notes) if clean_notes else "")
+        text = reply + (("\n\n" + extra_text.strip()) if extra_text.strip() else "")
+        return text + ("\n\n" + "\n".join(clean_notes) if clean_notes else "")
 
     def _remember_assistant(self, session_id: str, reply: str, notes: list[str],
-                            blocks: list[dict[str, Any]] | None = None) -> None:
-        text = self._assistant_text(reply, notes)
+                            blocks: list[dict[str, Any]] | None = None,
+                            extra_text: str = "") -> None:
+        text = self._assistant_text(reply, notes, extra_text)
         if text.strip():
             self.store.add_message(session_id, "assistant", text, blocks or [])
 

@@ -116,7 +116,8 @@
     lastMessageId: null,
     activity: [],
     stateError: null,
-    following: true
+    following: true,
+    pinnedOptimization: null
   };
 
   var dom = {};
@@ -590,6 +591,7 @@
     };
     state.activeTurn = turn;
     state.following = true;
+    state.pinnedOptimization = null;
     scrollToBottom(true);
     return turn;
   }
@@ -1463,9 +1465,21 @@
     node.innerHTML = html;
     mountCardCharts(node, block);
     syncFromBlock(block);
+    var codeBox = node.querySelector('.code-box');
+    if (codeBox) codeBox.scrollTop = codeBox.scrollHeight;
+    var hasCode = block.type === 'work'
+      && String((block.code_change || {}).diff || '').length > 0;
+    if (hasCode) state.pinnedOptimization = node;
+    if (block.status === 'done' || block.status === 'error') {
+      if (block.type === 'tuning' || state.pinnedOptimization === node) {
+        state.pinnedOptimization = null;
+      }
+    }
     if (isNew) {
-      scheduleCardReveal(node);
-    } else if (state.following && !isCardHeld(node)) {
+      if (!(state.pinnedOptimization && block.type === 'tuning')) {
+        scheduleCardReveal(node);
+      }
+    } else if (!state.pinnedOptimization && state.following && !isCardHeld(node)) {
       scrollToBottom(true);
     }
   }

@@ -104,6 +104,12 @@ class ChatFlowTest(unittest.TestCase):
                            "效果对比必须晚于网格寻优结果出现")
         step_titles = [step.get("title") for step in works[-1].get("steps", [])]
         self.assertIn("运行参数网格寻优", step_titles)
+        self.assertIn("逐组回测", text, "对话里应说明具体如何调整模型（旁白）")
+        history_after_plan = self.service.messages(self.sid)["messages"]
+        self.assertTrue(any("逐组回测" in (message.get("content") or "")
+                            for message in history_after_plan
+                            if message.get("role") == "assistant"),
+                        "计划旁白应随消息持久化")
         self.assertGreaterEqual(len(works[-1]["steps"]), 6)
         self.assertEqual(works[-1]["status"], "done")
         # 寻优进度：同一 id 多次推送，trial 单调增长，最终 100%
