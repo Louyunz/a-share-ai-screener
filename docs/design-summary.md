@@ -17,7 +17,7 @@
 - 轻量前后端分离：FastAPI 单进程同时托管静态页面与 API；聊天用 `fetch + ReadableStream` 解析 SSE（POST 不能使用 EventSource）。
 - 无构建链、无 CDN、纯 SVG 图表，保证比赛现场一键启动、弱网可演示。
 - SQLite 存会话/画像/模型版本/审计；版本表带 `session_id`，服务层用会话运行态维护 active_model/active_version_id。
-- 真实模型路径走 OpenAI 兼容接口；`LLM_PROVIDER=fake` 仅为本地测试/演示，不是线上降级方案；AI 不可用时直接报错。
+- 真实模型路径走 OpenAI 兼容接口；未配置 API Key 或 AI 不可用时直接报错，不提供降级模型。
 
 ## 合规与边界
 - AI 不承诺收益、不荐股、不说“稳赚”；回复有违禁词拦截，解读基于真实回测事实。

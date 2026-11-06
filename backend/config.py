@@ -34,7 +34,6 @@ A_SHARE_DIR = DATA_DIR / "a_share"
 DB_PATH = DATA_DIR / "app.db"
 
 # LLM（OpenAI 兼容接口）
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").lower()  # openai | fake(仅测试/本地联调)
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
 LLM_API_KEY_ENV = "DEEPSEEK_API_KEY"

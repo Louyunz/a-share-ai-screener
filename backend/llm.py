@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LLM 客户端（OpenAI 兼容接口）与测试/构建用确定性模型。
-
-生产路径只使用真实模型；``LLM_PROVIDER=fake`` 仅用于本地无 Key 测试与自动化验收。
-"""
+"""LLM 客户端（OpenAI 兼容接口）。"""
 from __future__ import annotations
 
 import json
@@ -12,7 +9,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Iterator, Protocol
 
-from .config import LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
+from .config import LLM_BASE_URL, LLM_MODEL
 
 
 class LLMError(RuntimeError):
@@ -388,11 +385,8 @@ class FakeLLM:
         return "".join(parts)
 
 
-def build_llm(provider: str | None = None) -> LLMClient:
-    selected = (provider or LLM_PROVIDER or "openai").strip().lower()
-    if selected == "fake":
-        return FakeLLM()
+def build_llm() -> LLMClient:
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
-        raise LLMError("未配置 DEEPSEEK_API_KEY；请设置环境变量后重启，或仅在本地测试时设置 LLM_PROVIDER=fake")
+        raise LLMError("未配置 DEEPSEEK_API_KEY；请设置环境变量后重启")
     return OpenAICompatClient(api_key=api_key, base_url=LLM_BASE_URL, model=LLM_MODEL)

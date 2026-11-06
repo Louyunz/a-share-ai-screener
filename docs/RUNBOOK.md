@@ -7,7 +7,7 @@ cd a-share-ai-screener
 $py = "C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 
 & $py -m backend.data.build_cache --source sample
-$env:LLM_PROVIDER = "fake"          # 本地无 Key 演示；正式使用请配真实 Key
+$env:DEEPSEEK_API_KEY = "sk-..."
 & $py -m backend.dev_server --port 8000
 # 浏览器打开 http://127.0.0.1:8000
 ```
@@ -54,7 +54,7 @@ $env:LLM_MODEL = "deepseek-chat"
 
 | 现象 | 处理 |
 |---|---|
-| 启动报缺少 LLM Key | 设置 `DEEPSEEK_API_KEY`；本地仅演示可 `LLM_PROVIDER=fake` |
+| 启动报缺少 LLM Key | 设置 `DEEPSEEK_API_KEY` 后重启服务 |
 | 启动报数据缓存缺失 | `python -m backend.data.build_cache --source sample` |
 | AkShare 拉取慢 | 加 `--limit 200`，或先用示例数据演示 |
 | AI 生成的代码被拒绝 | 代码安全检查/冒烟/回测拦截属于预期；可再说一次“重新给个方案” |

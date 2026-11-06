@@ -28,10 +28,10 @@ $py = "C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 # 1) 数据缓存（示例数据，离线可用；真实数据用 --source akshare / tushare）
 & $py -m backend.data.build_cache --source sample
 
-# 2) 无 Key 本地体验（FakeLLM，仅用于演示与测试）
-$env:LLM_PROVIDER = "fake"
+# 2) 配置真实模型后启动
+$env:DEEPSEEK_API_KEY = "sk-..."
 & $py -m backend.dev_server --port 8000
-# 或正式入口：
+# 或：
 # & $py -m uvicorn backend.main:app --port 8000
 
 # 3) 浏览器打开 http://127.0.0.1:8000
@@ -82,7 +82,7 @@ $env:LLM_MODEL = "deepseek-chat"
 
 ![移动端上下文](docs/screenshots/09_mobile_context.png)
 
-截图来自真实浏览器联调（示例数据 + FakeLLM / 真实 DeepSeek）；真实模型下文字与解读由所选模型生成。
+截图来自真实浏览器联调（示例数据 + 真实 DeepSeek）。
 
 **流式输出**：AI 回复通过 SSE `token` 事件逐字渲染（前端打字机队列）；模型优化时，`tuning` 卡片按同一 id 实时 upsert，进度条、当前最优指标、搜索范围与得分走势随每次回测更新；AI 修改代码/权重/模型类型时，改动框在 `work` 卡片内按行流式写入，`提出调参方案 → 服务端网格寻优 → 写入改动 → 对比 → 审批` 步骤同步推进：
 
@@ -132,7 +132,7 @@ backend/
   dev_server.py      标准库 HTTP 服务（无 fastapi 时本地预览）
   service.py         对话编排：理解 → 回复 → 执行动作 → 生成卡片
   agent.py           Planner 提示词、动作白名单、合规校验
-  llm.py             OpenAI 兼容客户端 + FakeLLM（测试/演示）
+  llm.py             OpenAI 兼容客户端
   schemas.py         画像槽位、计划、白话文案
   store.py           SQLite：会话/消息/画像/模型版本/运行态
   events.py          SSE 格式化
@@ -156,7 +156,7 @@ $node --check frontend/charts.js
 ```
 
 - 全量测试：引擎、网格寻优（范围校验/预算/目标/回撤约束）、模型安全校验（含拒绝危险代码/死循环超时）、调参方案自动修复、Agent 计划、对话全流程、SQLite、HTTP/SSE
-- 浏览器 E2E：真实 Edge 驱动“说话 → AI 追问 → 确认 → 选股 → 优化（观察寻优进度）→ 同意 → 当前会话模型更新 → 新对话回到默认模型 → 回滚”全流程；另验证三栏尺寸（56/224/320）、卡片 Token、FakeLLM 对话→画像→选股→刷新恢复、清空对话与移动端抽屉。
+- 浏览器 E2E：真实 Edge 驱动“说话 → AI 追问 → 确认 → 选股 → 优化（观察寻优进度）→ 同意 → 当前会话模型更新 → 新对话回到默认模型 → 回滚”全流程；另验证三栏尺寸（56/224/320）、卡片 Token、对话→画像→选股→刷新恢复、清空对话与移动端抽屉。
 - 风险提示：本项目为比赛演示原型，历史回测不代表未来收益，不构成投资建议。
 
 ## 参考话术来源（提示词依据）

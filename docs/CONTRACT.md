@@ -263,5 +263,5 @@ def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 
 - Lead：`backend/agent.py`、`backend/service.py`、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`backend/engine/tuning.py`（服务端网格寻优）、`tests/` 集成测试、`scripts/e2e_smoke.py`、文档。
 - **chat-ui-dev**：只写 `frontend/` 下 `index.html`、`app.js`、`style.css`、`charts.js`（含 tuning 卡与实时进度）。
-- **model-pipeline-dev**：只写 `backend/models/*.py`、`backend/llm.py`（FakeLLM）、`tests/test_models.py`。
+- **model-pipeline-dev**：只写 `backend/models/*.py`、`backend/llm.py`、`tests/test_models.py`。
 - 完成标准：`node --check` 通过；后端 `unittest discover` 通过；E2E 通过；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘帮我优化模型’→观察网格寻优进度→审批→当前会话模型更新→新对话回到默认模型→回滚”全流程。

@@ -178,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"[dev_server] 启动失败：{exc}")
         print("[dev_server] 提示：先运行 python -m backend.data.build_cache --source sample；"
-              "本地测试可设置 LLM_PROVIDER=fake。")
+              "并配置 DEEPSEEK_API_KEY。")
         return 2
 
     ApiHandler.service = service
