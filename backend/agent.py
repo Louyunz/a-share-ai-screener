@@ -65,6 +65,11 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - 一次只确认一个信息点；信息足够时先做简明摘要，再请客户确认，不要反复追问；已经确认或已经回答过的画像字段不得再次询问。
 - 不重复客户原话，不做机械式分点罗列；能用两句话说清就不用五点。
 
+## 客户追问与解释规范（重点）
+- 当客户问“这是什么意思 / 为什么问这个 / 怎么理解 / 没看懂 / 这些都是什么意思”时，先明确说出具体字段或概念（例如“亏损反应”“最大可接受回撤”），用一两句话解释它是什么、为什么影响适当性匹配，再邀请客户用自己的话回答。
+- 禁止使用“您指的是刚才那个问题”这类空泛指代；禁止使用“请选择一项”“一是……二是……三是……”“回复对应选项即可”等问卷/表单式表达；不得强迫客户从固定选项中选。
+- 可以给 1-2 个生活化例子帮助客户理解，但最后只问一个开放式问题，或直接请客户按实际情况描述；保持持牌投资顾问的解释口吻，而不是选项提示。
+
 ## 服务流程
 1. 了解客户：投资目标、期限、资金用途、风险承受与亏损反应、经验与偏好。
 2. 适当性匹配：根据客户信息推导风险等级，并说明该等级与后续策略的匹配关系。
@@ -150,6 +155,77 @@ def asks_clarifying_question(reply: str) -> bool:
     return "？" in reply or "?" in reply
 
 
+def is_explanation_question(message: str) -> bool:
+    text = str(message or "").strip()
+    return any(term in text for term in (
+        "什么意思", "是什么意思", "这些是什么", "都是什么", "解释", "为什么问",
+        "为什么需要", "怎么理解", "不太懂", "没看懂", "看不懂", "干嘛问",
+    ))
+
+
+def _last_assistant_text(history: list[dict[str, str]] | None) -> str:
+    for item in reversed(history or []):
+        if str(item.get("role")) == "assistant" and str(item.get("content") or "").strip():
+            return str(item.get("content"))
+    return ""
+
+
+def _slot_from_context(state: dict[str, Any], history: list[dict[str, str]] | None) -> str:
+    text = _last_assistant_text(history)
+    mappings = (
+        ("loss_reaction", ("亏损反应", "真亏了", "下跌时", "继续持有", "补仓", "止损", "怎么处理")),
+        ("drawdown_tolerance", ("回撤", "最大亏损", "能接受亏", "亏损承受", "跌多少")),
+        ("horizon", ("投资期限", "多久", "不用这笔钱", "什么时候用")),
+        ("goal", ("投资目标", "资金用途", "用来做什么", "做什么用")),
+        ("income_stability", ("收入稳定",)),
+        ("experience", ("投资经验", "基金", "股票")),
+        ("liquidity_need", ("用钱计划", "大额支出")),
+    )
+    for slot, keywords in mappings:
+        if any(word in text for word in keywords):
+            return slot
+    profile = state.get("profile") or {}
+    missing = profile.get("missing") or []
+    for slot, _keywords in mappings:
+        label = {"loss_reaction": "亏损反应", "drawdown_tolerance": "最大亏损",
+                 "horizon": "投资期限", "goal": "投资目标"}.get(slot, "")
+        if label and label in missing:
+            return slot
+    return ""
+
+
+def _explanation_reply(state: dict[str, Any], history: list[dict[str, str]] | None) -> str:
+    slot = _slot_from_context(state, history)
+    if slot == "loss_reaction":
+        return ("刚才问的是您的「亏损反应」，也就是市场下跌、持仓出现浮亏时，您通常会怎么处理。"
+                "它没有标准答案，目的是了解您对波动的真实承受方式，并和最大回撤上限一起做适当性匹配。"
+                "继续持有、分批补仓、减仓或止损都只是常见例子，您可以直接用自己的话描述，不必按固定选项回答。")
+    if slot == "drawdown_tolerance":
+        return ("刚才问的是「最大可接受回撤」，也就是持仓从高点回落时，您最多能接受亏多少。"
+                "它用于适当性匹配和策略风险控制，给一个大致百分比区间即可，没有对错。")
+    if slot == "horizon":
+        return ("刚才问的是「投资期限」，指这笔钱大概多久可以不动用。"
+                "期限越短，越需要控制波动和流动性风险；您按实际情况说一个大致年限即可，不必精确到某一天。")
+    if slot == "goal":
+        return ("刚才问的是「资金用途」，也就是这笔钱主要想解决什么问题。不同用途对应的期限和风险差异很大，"
+                "您按真实想法说即可，没有标准答案。")
+    return ("刚才那一项是在了解您的资金安排和风险承受情况，用于做适当性匹配。没有标准答案，"
+            "您按自己的实际情况和直观感受说就可以，不需要按固定选项回答。")
+
+
+def repair_mechanical_reply(reply: str, state: dict[str, Any],
+                            history: list[dict[str, str]] | None,
+                            message: str) -> str:
+    """客户追问概念时，替换明显的问卷式/空泛指代回复。"""
+    value = str(reply or "").strip()
+    if not is_explanation_question(message):
+        return value
+    banned = ("请选择一项", "回复对应选项即可", "您指的是刚才那个问题", "一是继续持有", "二是分批补仓")
+    if any(item in value for item in banned):
+        return _explanation_reply(state, history)
+    return value
+
+
 def has_confirmation_request(text: str) -> bool:
     return any(marker in text for marker in CONFIRMATION_MARKERS)
 
@@ -223,6 +299,8 @@ class Agent:
             reply = "在继续之前，需要向您确认当前的投资目标与资金安排，以便为您做适当性匹配。"
         ensure_compliance(reply)
         actions = self._parse_actions(raw.get("actions"))
+        if not actions:
+            reply = repair_mechanical_reply(reply, state, history, message)
         delta = raw.get("profile_delta")
         if not isinstance(delta, dict):
             delta = {}

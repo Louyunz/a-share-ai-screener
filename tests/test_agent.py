@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from backend.agent import (Agent, AgentError, ComplianceError, ensure_compliance,
+                          is_explanation_question, repair_mechanical_reply,
                           strip_confirmation_tail, trim_duplicate_confirmation)
 from backend.llm import FakeLLM
 from backend.schemas import profile_payload
@@ -17,6 +18,25 @@ def _state(slots: dict | None = None, confirmed: bool = False, **extra) -> dict:
     return state
 
 
+
+class ExplanationStyleTest(unittest.TestCase):
+    def test_mechanical_option_reply_is_repaired(self) -> None:
+        reply = ("您指的是刚才那个问题。它用于判断您在市场下跌时的真实反应，直接影响适当性匹配结果。"
+                 "请选择一项：一是继续持有等待修复，二是分批补仓摊低成本，三是止损离场。回复对应选项即可。")
+        state = {"profile": {"missing": ["亏损反应"]}}
+        history = [{"role": "assistant", "content": "真亏了会怎么做？例如继续持有等待修复，或者分批补仓摊低成本。"}]
+        repaired = repair_mechanical_reply(reply, state, history, "这些都是什么意思")
+        self.assertIn("亏损反应", repaired)
+        self.assertNotIn("请选择一项", repaired)
+        self.assertNotIn("回复对应选项即可", repaired)
+        self.assertNotIn("您指的是刚才那个问题", repaired)
+        self.assertIn("不必按固定选项回答", repaired)
+
+    def test_normal_reply_is_kept(self) -> None:
+        reply = "这笔钱大概多久可以不用？您按实际情况说一个大致年限即可。"
+        self.assertEqual(repair_mechanical_reply(reply, {}, [], "这个是什么意思"), reply)
+        self.assertTrue(is_explanation_question("这些都是什么意思"))
+        self.assertFalse(is_explanation_question("帮我选股"))
 
 class ConfirmationDedupTest(unittest.TestCase):
     def test_duplicate_confirmation_is_removed(self) -> None:
