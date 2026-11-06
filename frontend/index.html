@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B1220">
   <meta name="description" content="智投罗盘 · AI 选股助手：在一个对话框里完成投资画像、因子选股、结果解读与模型优化。">
   <title>智投罗盘 · AI 选股助手</title>
-  <link rel="stylesheet" href="style.css?v=4">
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
   <!-- 内联图标库：无字体、无 CDN、无第三方资源 -->
@@ -33,9 +33,8 @@
   </svg>
 
   <div class="ambient" aria-hidden="true">
-    <span class="ambient-glow ambient-glow-a"></span>
-    <span class="ambient-glow ambient-glow-b"></span>
-    <span class="ambient-grid"></span>
+    <canvas id="fluid-canvas" class="fluid-canvas"></canvas>
+    <span class="ambient-grain"></span>
   </div>
 
   <header class="topbar">
@@ -158,7 +157,8 @@
     <span class="footer-meta" id="footer-meta">数据加载中…</span>
   </footer>
 
-  <script src="charts.js?v=4"></script>
-  <script src="app.js?v=4"></script>
+  <script src="fluid.js?v=5"></script>
+  <script src="charts.js?v=5"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

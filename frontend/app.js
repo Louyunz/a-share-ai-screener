@@ -10,11 +10,11 @@
   var MAX_ACTIVITY = 12;
 
   var METRIC_META = {
-    cagr: { label: '年化收益', note: '过去几年平均每年涨多少', type: 'pct', tone: 'green' },
-    sharpe: { label: '夏普比率', note: '同样的波动下，赚得多不多', type: 'num', tone: 'cyan' },
-    mdd: { label: '最大回撤', note: '最难受的时候从高点亏多少', type: 'pct', tone: 'red' },
-    ir: { label: '信息比率', note: '相对大盘的超额收益稳不稳', type: 'num', tone: 'orange' },
-    win_rate: { label: '胜率', note: '持有期间赚钱的时间占比', type: 'pct', tone: 'cyan' }
+    cagr: { label: '年化收益', note: '过去几年平均每年涨多少', type: 'pct', tone: 'up' },
+    sharpe: { label: '夏普比率', note: '同样的波动下，赚得多不多', type: 'num', tone: 'blue' },
+    mdd: { label: '最大回撤', note: '最难受的时候从高点亏多少', type: 'pct', tone: 'down' },
+    ir: { label: '信息比率', note: '相对大盘的超额收益稳不稳', type: 'num', tone: 'violet' },
+    win_rate: { label: '胜率', note: '持有期间赚钱的时间占比', type: 'pct', tone: 'blue' }
   };
   var METRIC_ORDER = ['cagr', 'sharpe', 'mdd', 'ir', 'win_rate'];
 
@@ -655,7 +655,7 @@
     var progressHtml = pct === null ? '' : '<div class="completeness"><div class="completeness-head"><span>资料完整度</span><b>' + pct + '%</b></div>'
       + '<div class="progress-line"><i style="width:' + pct + '%"></i></div>' + missingHtml + '</div>';
     return '<article class="card card-profile">'
-      + '<header class="card-head"><span class="card-icon tone-cyan">' + icon('user') + '</span>'
+      + '<header class="card-head"><span class="card-icon tone-blue">' + icon('user') + '</span>'
       + '<div class="card-title"><span class="card-kicker">INVESTOR PROFILE</span><h3>你的投资画像</h3></div>'
       + '<span class="status-pill ' + (profile.confirmed ? 'is-ok' : 'is-warn') + '">' + (profile.confirmed ? '已确认' : '待确认') + '</span></header>'
       + '<div class="card-body">'
@@ -843,7 +843,7 @@
       ? '<div class="selection-split">' + factorsHtml + weightsHtml + '</div>'
       : '';
     return '<article class="card card-selection">'
-      + '<header class="card-head"><span class="card-icon tone-cyan">' + icon('target') + '</span>'
+      + '<header class="card-head"><span class="card-icon tone-blue">' + icon('target') + '</span>'
       + '<div class="card-title"><span class="card-kicker">AI SELECTION</span><h3>本次选股结果</h3></div>'
       + '<span class="status-pill is-run">已完成</span></header>'
       + '<div class="card-body">'
@@ -1043,7 +1043,7 @@
       }).join('') + '</ul>'
       : '';
     return '<article class="card card-version">'
-      + '<header class="card-head"><span class="card-icon tone-green">' + icon('layers') + '</span>'
+      + '<header class="card-head"><span class="card-icon tone-blue">' + icon('layers') + '</span>'
       + '<div class="card-title"><span class="card-kicker">MODEL VERSION</span><h3>模型版本已更新</h3></div>'
       + '<span class="status-pill is-ok">已生效</span></header>'
       + '<div class="card-body">' + activeHtml + listHtml + '</div></article>';
@@ -1367,6 +1367,8 @@
       return;
     }
     state.streaming = true;
+    document.body.classList.add('ai-working');
+    if (window.FluidBackground && window.FluidBackground.refresh) window.FluidBackground.refresh();
     updateComposerState();
     dom.input.value = '';
     resizeInput();
@@ -1401,6 +1403,8 @@
     } finally {
       finalizeTurn(turn);
       state.streaming = false;
+      document.body.classList.remove('ai-working');
+      if (window.FluidBackground && window.FluidBackground.refresh) window.FluidBackground.refresh();
       updateComposerState();
       pushActivity('turn', failed ? '本次处理未完成' : '已完成回复', failed ? 'error' : 'done', failed ? 'alert' : 'check');
       checkHealth();
@@ -1748,6 +1752,15 @@
     document.addEventListener('keydown', function (event) {
       if (event.key === 'Escape') closeHistory();
     });
+    var glassSelector = '.card, .wb-card, .composer-box, .topbar, .bubble';
+    document.addEventListener('pointermove', function (event) {
+      var target = event.target && event.target.closest ? event.target.closest(glassSelector) : null;
+      if (!target) return;
+      var rect = target.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      target.style.setProperty('--glass-x', ((event.clientX - rect.left) / rect.width * 100).toFixed(2) + '%');
+      target.style.setProperty('--glass-y', ((event.clientY - rect.top) / rect.height * 100).toFixed(2) + '%');
+    }, { passive: true });
 
     var media = window.matchMedia('(min-width: 1280px)');
     var onViewportChange = function () {
