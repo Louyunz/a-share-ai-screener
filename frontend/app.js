@@ -117,7 +117,10 @@
     activity: [],
     stateError: null,
     following: true,
-    pinnedOptimization: null
+    pinnedOptimization: null,
+    authRole: '',
+    authUsername: '',
+    resetUserId: null
   };
 
   var dom = {};
@@ -257,6 +260,22 @@
     dom.historyOverlay = $('#history-overlay');
     dom.historyList = $('#history-list');
     dom.historyClose = $('#history-close');
+    dom.navUsers = $('#nav-users');
+    dom.usersOverlay = $('#users-overlay');
+    dom.usersList = $('#users-list');
+    dom.usersClose = $('#users-close');
+    dom.userCreateForm = $('#user-create-form');
+    dom.userCreateName = $('#user-create-name');
+    dom.userCreatePassword = $('#user-create-password');
+    dom.userCreateRole = $('#user-create-role');
+    dom.userCreateSubmit = $('#user-create-submit');
+    dom.userCreateMsg = $('#user-create-msg');
+    dom.userResetForm = $('#user-reset-form');
+    dom.userResetLabel = $('#user-reset-label');
+    dom.userResetPassword = $('#user-reset-password');
+    dom.userResetSubmit = $('#user-reset-submit');
+    dom.userResetMsg = $('#user-reset-msg');
+    dom.userResetCancel = $('#user-reset-cancel');
   }
 
   /* ============================== 网络请求 ============================== */
@@ -2131,7 +2150,164 @@
     if (!dom.historyOverlay) return;
     dom.historyOverlay.hidden = true;
     document.body.classList.remove('history-open');
-    if (dom.infoOverlay && dom.infoOverlay.hidden) setActiveNav('assistant');
+    if (dom.infoOverlay && dom.infoOverlay.hidden && (!dom.usersOverlay || dom.usersOverlay.hidden)) setActiveNav('assistant');
+  }
+
+  /* ============================== 用户管理 ============================== */
+  function showUserMsg(element, text, ok) {
+    if (!element) return;
+    element.textContent = text || '';
+    element.hidden = !text;
+    element.classList.toggle('is-ok', !!ok);
+  }
+
+  function renderUsers(users) {
+    if (!dom.usersList) return;
+    if (!users.length) {
+      dom.usersList.innerHTML = '<p class="user-empty">还没有用户账号。</p>';
+      return;
+    }
+    dom.usersList.innerHTML = users.map(function (user) {
+      var current = user.username === state.authUsername;
+      var actions = current
+        ? '<span class="user-row-meta">当前账号</span>'
+        : '<button class="btn btn-ghost" type="button" data-user-action="toggle" data-active="' + (user.active ? '1' : '0') + '">'
+          + (user.active ? '停用' : '启用') + '</button>'
+          + '<button class="btn btn-ghost" type="button" data-user-action="reset">重置密码</button>'
+          + '<button class="btn btn-ghost" type="button" data-user-action="delete">删除</button>';
+      return '<div class="user-row" data-user-id="' + esc(String(user.id)) + '" data-username="' + esc(user.username) + '">'
+        + '<div class="user-row-main">'
+        + '<span class="user-row-name">' + esc(user.username) + '</span>'
+        + '<span class="tag">' + (user.role === 'admin' ? '管理员' : '普通用户') + '</span>'
+        + '<span class="status-pill ' + (user.active ? 'is-ok' : 'is-warn') + '">'
+        + (user.active ? '已启用' : '已停用') + '</span>'
+        + (current ? '<span class="tag">当前账号</span>' : '')
+        + '<span class="user-row-meta">创建 ' + esc(formatHistoryTime(user.created_at))
+        + ' · 最近登录 ' + esc(user.last_login_at || '从未登录') + '</span>'
+        + '</div><div class="user-row-actions">' + actions + '</div></div>';
+    }).join('');
+  }
+
+  async function refreshUsers() {
+    var data = await api('/api/admin/users');
+    renderUsers(data.users || []);
+  }
+
+  async function openUsers() {
+    if (state.authRole !== 'admin' || !dom.usersOverlay) return;
+    if (dom.historyOverlay && !dom.historyOverlay.hidden) closeHistory();
+    if (dom.infoOverlay && !dom.infoOverlay.hidden) closeInfo();
+    setActiveNav('users');
+    dom.usersOverlay.hidden = false;
+    document.body.classList.add('history-open');
+    showUserMsg(dom.userCreateMsg, '');
+    showUserMsg(dom.userResetMsg, '');
+    if (dom.userResetForm) dom.userResetForm.hidden = true;
+    dom.usersList.innerHTML = '<p class="user-empty">正在读取用户…</p>';
+    try {
+      await refreshUsers();
+    } catch (error) {
+      dom.usersList.innerHTML = '<p class="user-empty">用户列表读取失败：' + esc(error.message || '请稍后重试') + '</p>';
+    }
+  }
+
+  function closeUsers() {
+    if (!dom.usersOverlay) return;
+    dom.usersOverlay.hidden = true;
+    document.body.classList.remove('history-open');
+    if (dom.historyOverlay && dom.historyOverlay.hidden
+        && (!dom.infoOverlay || dom.infoOverlay.hidden)) {
+      setActiveNav('assistant');
+    }
+  }
+
+  async function createUser(event) {
+    event.preventDefault();
+    showUserMsg(dom.userCreateMsg, '');
+    var username = dom.userCreateName.value.trim();
+    var password = dom.userCreatePassword.value;
+    var role = dom.userCreateRole.value;
+    if (!username || !password) {
+      showUserMsg(dom.userCreateMsg, '请填写用户名和初始密码。');
+      return;
+    }
+    dom.userCreateSubmit.disabled = true;
+    try {
+      await api('/api/admin/users', { method: 'POST', body: {
+        username: username, password: password, role: role
+      }});
+      dom.userCreateForm.reset();
+      showUserMsg(dom.userCreateMsg, '用户已创建。', true);
+      await refreshUsers();
+    } catch (error) {
+      showUserMsg(dom.userCreateMsg, error.message || '创建失败。');
+    } finally {
+      dom.userCreateSubmit.disabled = false;
+    }
+  }
+
+  function openResetForm(userId, username) {
+    state.resetUserId = userId;
+    dom.userResetLabel.textContent = '为用户「' + username + '」重置密码；保存后该用户需要重新登录。';
+    dom.userResetForm.hidden = false;
+    dom.userResetPassword.value = '';
+    showUserMsg(dom.userResetMsg, '');
+    dom.userResetPassword.focus();
+  }
+
+  async function resetUserPassword(event) {
+    event.preventDefault();
+    var password = dom.userResetPassword.value;
+    if (!password) {
+      showUserMsg(dom.userResetMsg, '请输入新密码。');
+      return;
+    }
+    try {
+      await api('/api/admin/users/' + encodeURIComponent(String(state.resetUserId)), {
+        method: 'PATCH', body: { password: password }
+      });
+      dom.userResetForm.hidden = true;
+      showUserMsg(dom.userCreateMsg, '密码已重置。', true);
+      await refreshUsers();
+    } catch (error) {
+      showUserMsg(dom.userResetMsg, error.message || '重置失败。');
+    }
+  }
+
+  async function handleUserAction(event) {
+    var button = event.target.closest ? event.target.closest('[data-user-action]') : null;
+    if (!button) return;
+    var row = button.closest('[data-user-id]');
+    if (!row) return;
+    var userId = row.getAttribute('data-user-id');
+    var username = row.getAttribute('data-username') || '';
+    var action = button.getAttribute('data-user-action');
+    if (action === 'reset') {
+      openResetForm(userId, username);
+      return;
+    }
+    if (action === 'toggle') {
+      var active = button.getAttribute('data-active') === '1';
+      if (!window.confirm((active ? '停用' : '启用') + '用户「' + username + '」？')) return;
+      try {
+        await api('/api/admin/users/' + encodeURIComponent(userId), {
+          method: 'PATCH', body: { active: !active }
+        });
+        await refreshUsers();
+      } catch (error) {
+        showUserMsg(dom.userCreateMsg, error.message || '操作失败。');
+      }
+      return;
+    }
+    if (action === 'delete') {
+      if (!window.confirm('删除用户「' + username + '」？该操作不可恢复。')) return;
+      try {
+        await api('/api/admin/users/' + encodeURIComponent(userId), { method: 'DELETE' });
+        await refreshUsers();
+      } catch (error) {
+        showUserMsg(dom.userCreateMsg, error.message || '删除失败。');
+      }
+    }
   }
 
   async function activateSession(sessionId) {
@@ -2471,6 +2647,10 @@
           openHistory();
           return;
         }
+        if (key === 'users') {
+          openUsers();
+          return;
+        }
         closeHistory();
         openInfo(key);
       });
@@ -2482,6 +2662,19 @@
         if (event.target === dom.historyOverlay) closeHistory();
       });
     }
+    if (dom.usersClose) dom.usersClose.addEventListener('click', closeUsers);
+    if (dom.usersOverlay) {
+      dom.usersOverlay.addEventListener('click', function (event) {
+        if (event.target === dom.usersOverlay) closeUsers();
+      });
+    }
+    if (dom.userCreateForm) dom.userCreateForm.addEventListener('submit', createUser);
+    if (dom.usersList) dom.usersList.addEventListener('click', handleUserAction);
+    if (dom.userResetForm) dom.userResetForm.addEventListener('submit', resetUserPassword);
+    if (dom.userResetCancel) dom.userResetCancel.addEventListener('click', function () {
+      dom.userResetForm.hidden = true;
+      state.resetUserId = null;
+    });
     if (dom.historyList) {
       dom.historyList.addEventListener('click', function (event) {
         var item = event.target.closest ? event.target.closest('[data-session-id]') : null;
@@ -2517,10 +2710,13 @@
   async function loadIdentity() {
     try {
       var data = await api('/api/auth/status');
+      state.authUsername = data.username || '';
+      state.authRole = data.role || '';
       var name = document.querySelector('.sidebar-user strong');
       var note = document.querySelector('.sidebar-user small');
       if (name && data.username) name.textContent = data.username;
-      if (note) note.textContent = '管理员 · 本地数据';
+      if (note) note.textContent = (data.role === 'admin' ? '管理员' : '普通用户') + ' · 本地数据';
+      if (dom.navUsers) dom.navUsers.hidden = data.role !== 'admin';
     } catch (error) {
       // 登录态失效会由 api() 统一跳转登录页
     }

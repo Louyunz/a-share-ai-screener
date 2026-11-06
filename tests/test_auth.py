@@ -55,6 +55,37 @@ class AuthTests(unittest.TestCase):
         with self.assertRaises(Exception):
             self.auth.login(self._request(), "admin", "Safe-pass-2026")
 
+    def test_admin_user_management_and_session_owner(self) -> None:
+        token = self.auth.setup(self._request(), "admin", "Safe-pass-2026")
+        admin = self.auth.authenticated(
+            self._request(cookies={"zhitou_admin_session": token}))
+        self.assertEqual(admin["role"], "admin")
+
+        user = self.auth.create_user(admin, "alice", "User-pass-2026", "user")
+        self.assertEqual(user["role"], "user")
+        self.assertEqual(len(self.auth.list_users(admin)), 2)
+        with self.assertRaises(Exception):
+            self.auth.create_user(admin, "alice", "Other-pass-2026", "user")
+
+        user_token = self.auth.login(self._request(), "alice", "User-pass-2026")
+        alice = self.auth.authenticated(
+            self._request(cookies={"zhitou_admin_session": user_token}))
+        self.assertEqual(alice["id"], user["id"])
+
+        self.auth.update_user(admin, user["id"], active=False)
+        with self.assertRaises(Exception):
+            self.auth.login(self._request(), "alice", "User-pass-2026")
+
+        self.auth.update_user(admin, user["id"], active=True)
+        self.auth.delete_user(admin, user["id"])
+        self.assertEqual(len(self.auth.list_users(admin)), 1)
+
+        admin_session = self.store.create_session(admin["id"])
+        other_session = self.store.create_session(999)
+        listed = self.store.list_sessions(owner_id=admin["id"])
+        self.assertTrue(any(item["id"] == admin_session for item in listed))
+        self.assertTrue(all(item["id"] != other_session for item in listed))
+
 
 if __name__ == "__main__":
     unittest.main()

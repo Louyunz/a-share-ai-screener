@@ -111,8 +111,10 @@ def create_app(service: AppService | None = None) -> FastAPI:
                 if origin.rstrip("/") != expected:
                     return JSONResponse({"error": "跨站请求被拒绝"}, status_code=403)
         if path.startswith("/api/") and not path.startswith("/api/auth/"):
-            if get_auth().authenticated(request) is None:
+            user = get_auth().authenticated(request)
+            if user is None:
                 return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+            request.state.user = user
         response = await call_next(request)
         for name, value in SECURITY_HEADERS.items():
             response.headers.setdefault(name, value)
@@ -135,7 +137,8 @@ def create_app(service: AppService | None = None) -> FastAPI:
         user = get_auth().authenticated(request)
         if user is None:
             return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
-        return {"authenticated": True, "username": str(user.get("username") or "")}
+        return {"authenticated": True, "username": str(user.get("username") or ""),
+                "role": str(user.get("role") or "")}
 
     @app.post("/api/auth/setup")
     async def auth_setup(request: Request) -> Any:
@@ -180,16 +183,18 @@ def create_app(service: AppService | None = None) -> FastAPI:
             return _error(exc)
 
     @app.get("/api/sessions")
-    def list_sessions() -> Any:
+    def list_sessions(request: Request) -> Any:
         try:
-            return get_service().list_sessions()
+            user = getattr(request.state, "user", {})
+            return get_service().list_sessions(owner_id=int(user["id"]))
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
     @app.post("/api/sessions")
-    def create_session() -> Any:
+    def create_session(request: Request) -> Any:
         try:
-            return get_service().create_session()
+            user = getattr(request.state, "user", {})
+            return get_service().create_session(owner_id=int(user["id"]))
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
@@ -198,23 +203,26 @@ def create_app(service: AppService | None = None) -> FastAPI:
         try:
             body = await _json_body(request)
             content = str(body.get("content", ""))
+            user = getattr(request.state, "user", {})
             service = get_service()
-            service._require_session(sid)  # noqa: SLF001 - 提前校验，避免 SSE 已开始才报错
-            return _sse(service.chat_stream(sid, content))
+            service._require_session(sid, int(user["id"]))  # noqa: SLF001
+            return _sse(service.chat_stream(sid, content, int(user["id"])))
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
     @app.get("/api/sessions/{sid}/messages")
-    def messages(sid: str) -> Any:
+    def messages(sid: str, request: Request) -> Any:
         try:
-            return get_service().messages(sid)
+            user = getattr(request.state, "user", {})
+            return get_service().messages(sid, owner_id=int(user["id"]))
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
     @app.get("/api/sessions/{sid}/state")
-    def state(sid: str) -> Any:
+    def state(sid: str, request: Request) -> Any:
         try:
-            return get_service().get_state(sid)
+            user = getattr(request.state, "user", {})
+            return get_service().get_state(sid, owner_id=int(user["id"]))
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
@@ -222,7 +230,77 @@ def create_app(service: AppService | None = None) -> FastAPI:
     def versions(request: Request) -> Any:
         try:
             session_id = request.query_params.get("session") or None
-            return get_service().versions(session_id)
+            user = getattr(request.state, "user", {})
+            return get_service().versions(session_id, owner_id=int(user["id"]))
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    # ------------------------------------------------------------------
+    # 管理员：用户管理
+    # ------------------------------------------------------------------
+    def _admin(request: Request) -> dict[str, Any]:
+        user = getattr(request.state, "user", None)
+        if not user:
+            raise AuthError("未登录或登录已过期", 401)
+        get_auth().require_admin(user)
+        return user
+
+    @app.get("/api/admin/users")
+    def admin_users(request: Request) -> Any:
+        try:
+            return {"users": get_auth().list_users(_admin(request))}
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @app.post("/api/admin/users")
+    async def admin_create_user(request: Request) -> Any:
+        try:
+            actor = _admin(request)
+            body = await _json_body(request)
+            user = get_auth().create_user(
+                actor, str(body.get("username", "")), str(body.get("password", "")),
+                str(body.get("role", "user")))
+            get_auth().store.audit(
+                "user_create", reason="admin", payload={
+                    "actor": actor.get("username"), "target": user.get("username"),
+                    "role": user.get("role"),
+                })
+            return user
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @app.patch("/api/admin/users/{user_id}")
+    async def admin_update_user(user_id: int, request: Request) -> Any:
+        try:
+            actor = _admin(request)
+            body = await _json_body(request)
+            active = body.get("active")
+            user = get_auth().update_user(
+                actor, int(user_id),
+                password=str(body["password"]) if "password" in body else None,
+                role=str(body["role"]) if "role" in body else None,
+                active=None if active is None else bool(active))
+            get_auth().store.audit(
+                "user_update", reason="admin", payload={
+                    "actor": actor.get("username"), "target": user.get("username"),
+                    "active": user.get("active"), "role": user.get("role"),
+                })
+            return user
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @app.delete("/api/admin/users/{user_id}")
+    def admin_delete_user(user_id: int, request: Request) -> Any:
+        try:
+            actor = _admin(request)
+            target = get_auth().store.auth_user_by_id(int(user_id))
+            get_auth().delete_user(actor, int(user_id))
+            get_auth().store.audit(
+                "user_delete", reason="admin", payload={
+                    "actor": actor.get("username"),
+                    "target": (target or {}).get("username", ""),
+                })
+            return {"ok": True}
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 

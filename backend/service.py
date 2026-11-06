@@ -125,13 +125,13 @@ class AppService:
             "llm": type(self.llm).__name__,
         }
 
-    def create_session(self) -> dict[str, Any]:
-        session_id = self.store.create_session()
+    def create_session(self, owner_id: int | None = None) -> dict[str, Any]:
+        session_id = self.store.create_session(owner_id)
         return {"session_id": session_id}
 
-    def list_sessions(self) -> dict[str, Any]:
+    def list_sessions(self, owner_id: int | None = None) -> dict[str, Any]:
         sessions = []
-        for item in self.store.list_sessions():
+        for item in self.store.list_sessions(owner_id=owner_id):
             title = str(item.get("title") or "").strip().replace("\n", " ")
             if len(title) > 28:
                 title = title[:28] + "…"
@@ -146,16 +146,21 @@ class AppService:
             })
         return {"sessions": sessions, "current": None}
 
-    def messages(self, session_id: str) -> dict[str, Any]:
-        self._require_session(session_id)
+    def messages(self, session_id: str, owner_id: int | None = None) -> dict[str, Any]:
+        self._require_session(session_id, owner_id)
         return {"messages": self.store.get_messages(session_id)}
 
-    def versions(self, session_id: str | None = None) -> dict[str, Any]:
+    def versions(self, session_id: str | None = None,
+                 owner_id: int | None = None) -> dict[str, Any]:
         """模型版本清单：带 session 时只返回该会话的版本链。"""
         if not session_id:
-            return {"versions": [self._version_public(item) for item in self.store.list_versions()],
+            if owner_id is not None:
+                items = self.store.list_versions_for_owner(owner_id)
+            else:
+                items = self.store.list_versions()
+            return {"versions": [self._version_public(item) for item in items],
                     "active_id": None, "model_scope": "session"}
-        self._require_session(session_id)
+        self._require_session(session_id, owner_id)
         active_id = self.store.session_active_version_id(session_id)
         return {
             "versions": [self._version_public(item, active_id)
@@ -164,8 +169,8 @@ class AppService:
             "model_scope": "session",
         }
 
-    def get_state(self, session_id: str) -> dict[str, Any]:
-        self._require_session(session_id)
+    def get_state(self, session_id: str, owner_id: int | None = None) -> dict[str, Any]:
+        self._require_session(session_id, owner_id)
         profile = self._profile(session_id)
         runtime = self.store.get_state(session_id)
         active_version = self.store.session_active_version(session_id)
@@ -188,8 +193,9 @@ class AppService:
     # ------------------------------------------------------------------
     # 对话主流程
     # ------------------------------------------------------------------
-    def chat_stream(self, session_id: str, content: str) -> Iterator[tuple[str, dict[str, Any]]]:
-        self._require_session(session_id)
+    def chat_stream(self, session_id: str, content: str,
+                    owner_id: int | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
+        self._require_session(session_id, owner_id)
         content = (content or "").strip()
         if not content:
             raise ValidationError("说点什么吧")
@@ -1548,8 +1554,10 @@ class AppService:
     # ------------------------------------------------------------------
     # 工具
     # ------------------------------------------------------------------
-    def _require_session(self, session_id: str) -> None:
+    def _require_session(self, session_id: str, owner_id: int | None = None) -> None:
         if not self.store.session_exists(session_id):
+            raise NotFoundError(f"会话不存在：{session_id}")
+        if owner_id is not None and self.store.session_owner(session_id) != int(owner_id):
             raise NotFoundError(f"会话不存在：{session_id}")
 
     def _backtest_window(self) -> tuple[str, str]:

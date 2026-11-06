@@ -29,15 +29,19 @@
 
 ## 2. 后端 API（精简）
 
-所有 `/api/**` 默认需要管理员登录 Cookie（`/api/auth/*` 除外）；未登录返回 401，前端跳转 `/login`。
+所有 `/api/**` 默认需要登录 Cookie（`/api/auth/*` 除外）；未登录返回 401，前端跳转 `/login`。会话按用户隔离：普通用户只能看到自己的会话，管理员也只能看到自己的会话；管理员可额外管理账号。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/auth/status` | 登录/初始化状态 `{configured, setup_required, setup_allowed, authenticated, username}` |
-| POST | `/api/auth/setup` | 首次初始化（仅本机、仅未配置时）；成功后写入 HttpOnly Cookie |
-| POST | `/api/auth/login` | 管理员登录；连续失败 5 次锁定 5 分钟 |
+| GET | `/api/auth/status` | 登录/初始化状态 `{configured, setup_required, setup_allowed, authenticated, username, role}` |
+| POST | `/api/auth/setup` | 首次初始化管理员（仅本机、仅未配置时）；成功后写入 HttpOnly Cookie |
+| POST | `/api/auth/login` | 登录；连续失败 5 次锁定 5 分钟 |
 | POST | `/api/auth/logout` | 注销当前会话 |
-| GET | `/api/auth/session` | 当前登录用户；未登录 401 |
+| GET | `/api/auth/session` | 当前登录用户与角色；未登录 401 |
+| GET | `/api/admin/users` | 管理员：用户列表 |
+| POST | `/api/admin/users` | 管理员：创建用户 `{username,password,role:admin|user}` |
+| PATCH | `/api/admin/users/{id}` | 管理员：启用/停用、重置密码、调整角色 |
+| DELETE | `/api/admin/users/{id}` | 管理员：删除无数据用户；有会话数据时返回 409 |
 | GET | `/api/health` | `{ok, source, as_of, universe, llm}`（需登录） |
 | GET | `/api/sessions` | 历史对话归档 `{sessions:[{id,title,created_at,updated_at,message_count,profile_summary,profile_confirmed}]}` |
 | POST | `/api/sessions` | `{session_id}` |
@@ -48,7 +52,7 @@
 
 不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
 
-**状态单一来源（SCHEMA_VERSION=6）**：会话当前模型 = `session.active_version_id` 指向的 `version` 行（为空则默认「均衡多因子」）；`session_state` 只保存 pending/待执行意图/最近结果，不再保存 active_model/metrics/version_id。旧的全局 `store.active_version/activate/parent_version` 接口已删除，版本链按 `session_id` 隔离。`auth_user` / `auth_session` 两张表只保存管理员密码哈希与会话令牌哈希。
+**状态单一来源（SCHEMA_VERSION=7）**：会话当前模型 = `session.active_version_id` 指向的 `version` 行（为空则默认「均衡多因子」）；`session_state` 只保存 pending/待执行意图/最近结果，不再保存 active_model/metrics/version_id。旧的全局 `store.active_version/activate/parent_version` 接口已删除，版本链按 `session_id` 隔离。`auth_account` / `auth_session` 保存多用户账号与会话令牌哈希；`session.owner_id` 用于用户数据隔离，第一次初始化管理员时接管历史无主会话。
 
 ## 3. 聊天 SSE 事件
 

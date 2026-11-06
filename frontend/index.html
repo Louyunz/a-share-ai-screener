@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -7,6 +7,7 @@
   <meta name="description" content="智投罗盘 · AI 投资助手：投资者画像、智能顾问、策略分析、组合与模型管理。">
   <title>智投罗盘 · AI 投资助手</title>
   <link rel="stylesheet" href="style.css?v=18">
+  <link rel="stylesheet" href="user-admin.css?v=19">
 </head>
 <body>
   <svg class="icon-sprite" aria-hidden="true" focusable="false">
@@ -87,6 +88,12 @@
         </div>
         <div class="nav-section">
 
+        </div>
+        <div class="nav-section">
+          <span class="nav-label">管理</span>
+          <button class="nav-item" type="button" data-nav="users" id="nav-users" hidden>
+            <svg class="icon"><use href="#i-shield"></use></svg><span>用户管理</span>
+          </button>
         </div>
       </nav>
       <div class="sidebar-footer">
@@ -226,7 +233,59 @@
     </div>
   </div>
 
-  <script src="charts.js?v=18"></script>
-  <script src="app.js?v=18"></script>
+  <div class="history-overlay" id="users-overlay" hidden>
+    <div class="history-panel user-panel" role="dialog" aria-modal="true" aria-labelledby="users-title">
+      <header class="history-head">
+        <div>
+          <span class="context-kicker">ADMIN</span>
+          <h2 id="users-title">用户管理</h2>
+          <p class="history-note">管理员可以创建、停用或重置用户账号。每个用户只看到自己的会话与画像。</p>
+        </div>
+        <button class="icon-btn" id="users-close" type="button" aria-label="关闭用户管理">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </header>
+      <div class="users-body">
+        <form class="user-create-form" id="user-create-form">
+          <div class="user-form-grid">
+            <label class="user-field"><span>用户名</span>
+              <input id="user-create-name" type="text" maxlength="32" autocomplete="off" required>
+            </label>
+            <label class="user-field"><span>初始密码</span>
+              <input id="user-create-password" type="password" maxlength="128" autocomplete="new-password" required>
+            </label>
+            <label class="user-field"><span>角色</span>
+              <select id="user-create-role">
+                <option value="user">普通用户</option>
+                <option value="admin">管理员</option>
+              </select>
+            </label>
+          </div>
+          <p class="user-hint">密码至少 10 位，需包含字母和数字。</p>
+          <div class="user-create-actions">
+            <button class="btn btn-primary" id="user-create-submit" type="submit">创建用户</button>
+            <span class="user-create-msg" id="user-create-msg" role="alert" hidden></span>
+          </div>
+        </form>
+        <form class="user-create-form" id="user-reset-form" hidden>
+          <p class="user-hint" id="user-reset-label">重置密码</p>
+          <div class="user-form-grid">
+            <label class="user-field"><span>新密码</span>
+              <input id="user-reset-password" type="password" maxlength="128" autocomplete="new-password" required>
+            </label>
+          </div>
+          <div class="user-create-actions">
+            <button class="btn btn-primary" id="user-reset-submit" type="submit">确认重置</button>
+            <button class="btn btn-ghost" id="user-reset-cancel" type="button">取消</button>
+            <span class="user-create-msg" id="user-reset-msg" role="alert" hidden></span>
+          </div>
+        </form>
+        <div class="user-list" id="users-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="charts.js?v=19"></script>
+  <script src="app.js?v=19"></script>
 </body>
 </html>

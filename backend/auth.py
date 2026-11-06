@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-"""单管理员认证：PBKDF2 密码哈希、服务端会话、登录限速。
+"""多用户认证：PBKDF2 密码哈希、服务端会话、登录限速、管理员用户管理。
 
-设计目标：
-- 密码只存 PBKDF2-HMAC-SHA256 哈希，绝不明文落库；
-- 浏览器只持有随机 256bit 会话令牌，服务端只存令牌的 SHA-256；
+- 第一个账号由首次初始化创建，角色固定为 admin；
+- 后续由管理员创建普通用户或管理员；
+- 密码只存 PBKDF2-HMAC-SHA256 哈希，会话只存令牌 SHA-256；
 - Cookie 为 HttpOnly + SameSite=Strict；HTTPS 下可开 Secure；
-- 首次初始化只允许本机访问，之后设置关闭；
-- 连续登录失败触发短时锁定，避免在线暴力猜密码。
+- 连续登录失败触发短时锁定。
 """
 from __future__ import annotations
 
@@ -37,10 +36,11 @@ PBKDF2_ITERATIONS = 390_000
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_FAILURES = 5
 MIN_PASSWORD_LENGTH = 10
+ROLES = {"admin", "user"}
 
 
 class AuthError(RuntimeError):
-    """认证/初始化失败；status 直接映射为 HTTP 状态码。"""
+    """认证/用户管理失败；status 直接映射为 HTTP 状态码。"""
 
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -95,25 +95,40 @@ def validate_password(value: str) -> str:
     return password
 
 
+def _public_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(user["id"]),
+        "username": str(user["username"]),
+        "role": str(user["role"]),
+        "active": bool(user["active"]),
+        "created_at": str(user.get("created_at") or ""),
+        "updated_at": str(user.get("updated_at") or ""),
+        "last_login_at": str(user.get("last_login_at") or ""),
+    }
+
+
 class AuthManager:
     def __init__(self, store: Store) -> None:
         self.store = store
         self._failures: dict[str, list[float]] = {}
         self._lock = threading.Lock()
+        self._bootstrap_env_admin()
+
+    def _bootstrap_env_admin(self) -> None:
+        if not (AUTH_USERNAME and AUTH_PASSWORD_HASH):
+            return
+        if self.store.list_auth_users():
+            return
+        user_id = self.store.create_auth_user(
+            AUTH_USERNAME, AUTH_PASSWORD_HASH, role="admin", active=1)
+        if user_id is not None:
+            self.store.claim_orphan_sessions(user_id)
 
     # ------------------------------------------------------------------
     # 账号状态
     # ------------------------------------------------------------------
-    def _env_user(self) -> dict[str, str] | None:
-        if AUTH_USERNAME and AUTH_PASSWORD_HASH:
-            return {"username": AUTH_USERNAME, "password_hash": AUTH_PASSWORD_HASH}
-        return None
-
-    def current_user(self) -> dict[str, Any] | None:
-        return self._env_user() or self.store.auth_user()
-
     def configured(self) -> bool:
-        return self.current_user() is not None
+        return bool(self.store.list_auth_users())
 
     def setup_required(self) -> bool:
         return not self.configured() and AUTH_ALLOW_SETUP
@@ -152,16 +167,16 @@ class AuthManager:
         with self._lock:
             self._failures.pop(client_key, None)
 
-    def _issue_session(self) -> str:
-        token = secrets.token_urlsafe(32)
-        expires_at = int(time.time() + AUTH_SESSION_HOURS * 3600)
-        self.store.purge_expired_auth_sessions(int(time.time()))
-        self.store.create_auth_session(self._token_hash(token), expires_at)
-        return token
-
     @staticmethod
     def _token_hash(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _issue_session(self, user_id: int) -> str:
+        token = secrets.token_urlsafe(32)
+        expires_at = int(time.time() + AUTH_SESSION_HOURS * 3600)
+        self.store.purge_expired_auth_sessions(int(time.time()))
+        self.store.create_auth_session(self._token_hash(token), expires_at, user_id)
+        return token
 
     def setup(self, request: Request, username: str, password: str) -> str:
         if self.configured():
@@ -170,36 +185,44 @@ class AuthManager:
             raise AuthError("初始化只允许在服务器本机完成", 403)
         username = validate_username(username)
         password = validate_password(password)
-        if not self.store.create_auth_user(username, hash_password(password)):
+        user_id = self.store.create_auth_user(
+            username, hash_password(password), role="admin", active=1)
+        if user_id is None:
             raise AuthError("管理员账号已初始化，不能重复设置", 409)
-        return self._issue_session()
+        self.store.claim_orphan_sessions(user_id)
+        return self._issue_session(user_id)
 
     def login(self, request: Request, username: str, password: str) -> str:
         client_key = self._client_host(request) or "unknown"
         self._check_rate(client_key)
-        user = self.current_user()
+        user = self.store.auth_user_by_username(username)
         if user is None:
-            raise AuthError("管理员账号尚未初始化", 409)
-        if not hmac.compare_digest(str(user.get("username") or ""), str(username or "").strip()):
             self._record_failure(client_key)
             raise AuthError("账号或密码不正确", 401)
         if not verify_password(str(password or ""), str(user.get("password_hash") or "")):
             self._record_failure(client_key)
             raise AuthError("账号或密码不正确", 401)
+        if not bool(user.get("active")):
+            raise AuthError("该账号已停用，请联系管理员", 403)
         self._clear_failures(client_key)
-        return self._issue_session()
+        self.store.update_auth_user(int(user["id"]), last_login=True)
+        return self._issue_session(int(user["id"]))
 
     def authenticated(self, request: Request) -> dict[str, Any] | None:
         token = request.cookies.get(AUTH_COOKIE_NAME)
         if not token:
             return None
         token_hash = self._token_hash(token)
-        expires_at = self.store.auth_session_expiry(token_hash)
-        if not expires_at or expires_at <= int(time.time()):
-            if expires_at:
+        session = self.store.auth_session(token_hash)
+        if not session or int(session["expires_at"]) <= int(time.time()):
+            if session:
                 self.store.delete_auth_session(token_hash)
             return None
-        return self.current_user()
+        user = self.store.auth_user_by_id(int(session["user_id"]))
+        if user is None or not bool(user.get("active")):
+            self.store.delete_auth_session(token_hash)
+            return None
+        return _public_user(user)
 
     def logout(self, request: Request) -> None:
         token = request.cookies.get(AUTH_COOKIE_NAME)
@@ -207,7 +230,72 @@ class AuthManager:
             self.store.delete_auth_session(self._token_hash(token))
 
     # ------------------------------------------------------------------
-    # Cookie
+    # 管理员：用户管理
+    # ------------------------------------------------------------------
+    @staticmethod
+    def require_admin(user: dict[str, Any]) -> None:
+        if str(user.get("role") or "") != "admin":
+            raise AuthError("需要管理员权限", 403)
+
+    def list_users(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        self.require_admin(actor)
+        return [_public_user(user) for user in self.store.list_auth_users()]
+
+    def create_user(self, actor: dict[str, Any], username: str, password: str,
+                    role: str = "user") -> dict[str, Any]:
+        self.require_admin(actor)
+        role = str(role or "user")
+        if role not in ROLES:
+            raise AuthError("角色只能是 admin 或 user")
+        username = validate_username(username)
+        password = validate_password(password)
+        user_id = self.store.create_auth_user(
+            username, hash_password(password), role=role, active=1)
+        if user_id is None:
+            raise AuthError("用户名已存在", 409)
+        user = self.store.auth_user_by_id(user_id)
+        return _public_user(user or {})
+
+    def update_user(self, actor: dict[str, Any], user_id: int, *,
+                    password: str | None = None, role: str | None = None,
+                    active: bool | None = None) -> dict[str, Any]:
+        self.require_admin(actor)
+        target = self.store.auth_user_by_id(user_id)
+        if target is None:
+            raise AuthError("用户不存在", 404)
+        target_id = int(target["id"])
+        if role is not None and role not in ROLES:
+            raise AuthError("角色只能是 admin 或 user")
+        demoting = role is not None and role != "admin" and target["role"] == "admin"
+        disabling = active is False and target["role"] == "admin"
+        if (demoting or disabling) and self.store.count_active_admins(exclude_id=target_id) == 0:
+            raise AuthError("不能停用或降级最后一个管理员", 400)
+        password_hash = hash_password(validate_password(password)) if password else None
+        self.store.update_auth_user(
+            target_id, password_hash=password_hash, role=role,
+            active=None if active is None else int(active))
+        if password_hash is not None or active is False:
+            self.store.delete_auth_sessions_for_user(target_id)
+        updated = self.store.auth_user_by_id(target_id)
+        return _public_user(updated or {})
+
+    def delete_user(self, actor: dict[str, Any], user_id: int) -> None:
+        self.require_admin(actor)
+        target = self.store.auth_user_by_id(user_id)
+        if target is None:
+            raise AuthError("用户不存在", 404)
+        target_id = int(target["id"])
+        if target_id == int(actor["id"]):
+            raise AuthError("不能删除当前登录账号", 400)
+        if target["role"] == "admin" and self.store.count_active_admins(exclude_id=target_id) == 0:
+            raise AuthError("不能删除最后一个管理员", 400)
+        if self.store.count_sessions(target_id):
+            raise AuthError("该用户仍有关联会话数据，请先停用账号，不要直接删除", 409)
+        self.store.delete_auth_sessions_for_user(target_id)
+        self.store.delete_auth_user(target_id)
+
+    # ------------------------------------------------------------------
+    # Cookie / 状态
     # ------------------------------------------------------------------
     def set_cookie(self, response: Response, token: str) -> None:
         response.set_cookie(
@@ -228,4 +316,5 @@ class AuthManager:
             "setup_allowed": self.setup_allowed(request),
             "authenticated": user is not None,
             "username": str(user.get("username") or "") if user else "",
+            "role": str(user.get("role") or "") if user else "",
         }

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _now() -> str:
@@ -89,14 +89,19 @@ class Store:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS auth_user (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                username TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS auth_account (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
             );
             CREATE TABLE IF NOT EXISTS auth_session (
                 token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
             );
@@ -122,8 +127,42 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE audit_log ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'")
         self._backfill_active_version()
+        self._migrate_auth()
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _migrate_auth(self) -> None:
+        """多用户迁移：旧单管理员 auth_user → auth_account，并给旧会话补 owner。"""
+        session_columns = [row[1] for row in self._conn.execute("PRAGMA table_info(session)")]
+        if "owner_id" not in session_columns:
+            self._conn.execute("ALTER TABLE session ADD COLUMN owner_id INTEGER")
+        auth_session_columns = [
+            row[1] for row in self._conn.execute("PRAGMA table_info(auth_session)")]
+        if "user_id" not in auth_session_columns:
+            self._conn.execute(
+                "ALTER TABLE auth_session ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+        legacy_tables = {
+            row[0] for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "auth_user" in legacy_tables:
+            row = self._conn.execute(
+                "SELECT username, password_hash, created_at FROM auth_user WHERE id = 1"
+            ).fetchone()
+            if row and not self._conn.execute(
+                    "SELECT 1 FROM auth_account WHERE username = ?",
+                    (row["username"],)).fetchone():
+                self._conn.execute(
+                    "INSERT INTO auth_account(username, password_hash, role, active, "
+                    "created_at, updated_at) VALUES (?, ?, 'admin', 1, ?, ?)",
+                    (row["username"], row["password_hash"], row["created_at"], row["created_at"]))
+            self._conn.execute("DROP TABLE auth_user")
+        admin = self._conn.execute(
+            "SELECT id FROM auth_account WHERE role = 'admin' ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if admin:
+            self._conn.execute(
+                "UPDATE session SET owner_id = ? WHERE owner_id IS NULL", (int(admin["id"]),))
 
     def _backfill_active_version(self) -> None:
         """把旧版 session_state 里的 active_version_id 迁移到 session 表（单一状态源）。"""
@@ -156,11 +195,12 @@ class Store:
     # ------------------------------------------------------------------
     # 会话与消息
     # ------------------------------------------------------------------
-    def create_session(self) -> str:
+    def create_session(self, owner_id: int | None = None) -> str:
         session_id = uuid.uuid4().hex[:16]
         with self._lock:
             self._conn.execute(
-                "INSERT INTO session(id, created_at) VALUES (?, ?)", (session_id, _now()))
+                "INSERT INTO session(id, created_at, owner_id) VALUES (?, ?, ?)",
+                (session_id, _now(), owner_id))
             self._conn.commit()
         return session_id
 
@@ -169,6 +209,27 @@ class Store:
             row = self._conn.execute(
                 "SELECT 1 FROM session WHERE id = ?", (session_id,)).fetchone()
         return row is not None
+
+    def session_owner(self, session_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT owner_id FROM session WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"会话不存在：{session_id}")
+        return int(row["owner_id"]) if row["owner_id"] is not None else None
+
+    def claim_orphan_sessions(self, owner_id: int) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE session SET owner_id = ? WHERE owner_id IS NULL", (int(owner_id),))
+            self._conn.commit()
+        return cur.rowcount
+
+    def count_sessions(self, owner_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM session WHERE owner_id = ?", (int(owner_id),)).fetchone()
+        return int(row["n"]) if row else 0
 
     def add_message(self, session_id: str, role: str, content: str,
                     blocks: list[dict[str, Any]] | None = None) -> None:
@@ -180,11 +241,13 @@ class Store:
                  json.dumps(blocks or [], ensure_ascii=False), _now()))
             self._conn.commit()
 
-    def list_sessions(self, limit: int = 80) -> list[dict[str, Any]]:
+    def list_sessions(self, limit: int = 80, owner_id: int | None = None) -> list[dict[str, Any]]:
         """历史对话归档列表：按最近消息时间倒序。"""
+        where = "WHERE s.owner_id = ?" if owner_id is not None else ""
+        params: tuple[Any, ...] = (int(owner_id), int(limit)) if owner_id is not None else (int(limit),)
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT s.id AS id,
                        s.created_at AS created_at,
                        (SELECT content FROM message WHERE session_id = s.id AND role = 'user'
@@ -195,10 +258,11 @@ class Store:
                        COALESCE(p.confirmed, 0) AS profile_confirmed
                 FROM session s
                 LEFT JOIN profile p ON p.session_id = s.id
+                {where}
                 ORDER BY COALESCE(last_at, s.created_at) DESC, s.rowid DESC
                 LIMIT ?
                 """,
-                (int(limit),)).fetchall()
+                params).fetchall()
         return [dict(row) for row in rows]
 
     def get_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -296,6 +360,14 @@ class Store:
                     "ORDER BY created_at ASC, id ASC", (session_id,)).fetchall()
         return [self._version_row(row) for row in rows]
 
+    def list_versions_for_owner(self, owner_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT v.* FROM version v JOIN session s ON s.id = v.session_id "
+                "WHERE s.owner_id = ? ORDER BY v.created_at ASC, v.id ASC",
+                (int(owner_id),)).fetchall()
+        return [self._version_row(row) for row in rows]
+
     def session_active_version_id(self, session_id: str) -> str | None:
         with self._lock:
             row = self._conn.execute(
@@ -343,42 +415,120 @@ class Store:
         return items
 
     # ------------------------------------------------------------------
-    # 管理员认证
+    # 用户与登录会话
     # ------------------------------------------------------------------
-    def auth_user(self) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT username, password_hash, created_at FROM auth_user WHERE id = 1"
-            ).fetchone()
+    @staticmethod
+    def _auth_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(row) if row else None
 
-    def create_auth_user(self, username: str, password_hash: str) -> bool:
-        with self._lock:
-            if self._conn.execute("SELECT 1 FROM auth_user WHERE id = 1").fetchone():
-                return False
-            self._conn.execute(
-                "INSERT INTO auth_user(id, username, password_hash, created_at) "
-                "VALUES (1, ?, ?, ?)", (username, password_hash, _now()))
-            self._conn.commit()
-        return True
-
-    def create_auth_session(self, token_hash: str, expires_at: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO auth_session(token_hash, created_at, expires_at) "
-                "VALUES (?, ?, ?)", (token_hash, int(datetime.now().timestamp()), expires_at))
-            self._conn.commit()
-
-    def auth_session_expiry(self, token_hash: str) -> int | None:
+    def auth_user_by_username(self, username: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT expires_at FROM auth_session WHERE token_hash = ?",
+                "SELECT id, username, password_hash, role, active, created_at, "
+                "updated_at, last_login_at FROM auth_account WHERE username = ?",
+                (str(username).strip(),)).fetchone()
+        return self._auth_row(row)
+
+    def auth_user_by_id(self, user_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, username, password_hash, role, active, created_at, "
+                "updated_at, last_login_at FROM auth_account WHERE id = ?",
+                (int(user_id),)).fetchone()
+        return self._auth_row(row)
+
+    def list_auth_users(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, username, role, active, created_at, updated_at, last_login_at "
+                "FROM auth_account ORDER BY id ASC").fetchall()
+        return [dict(row) for row in rows]
+
+    def create_auth_user(self, username: str, password_hash: str,
+                         role: str = "user", active: int = 1) -> int | None:
+        now = _now()
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO auth_account(username, password_hash, role, active, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (username, password_hash, role, int(active), now, now))
+                self._conn.commit()
+                return int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                return None
+
+    def update_auth_user(self, user_id: int, *, password_hash: str | None = None,
+                         role: str | None = None, active: int | None = None,
+                         last_login: bool = False) -> bool:
+        fields: list[str] = []
+        values: list[Any] = []
+        if password_hash is not None:
+            fields.append("password_hash = ?")
+            values.append(password_hash)
+        if role is not None:
+            fields.append("role = ?")
+            values.append(role)
+        if active is not None:
+            fields.append("active = ?")
+            values.append(int(active))
+        if last_login:
+            fields.append("last_login_at = ?")
+            values.append(_now())
+        if not fields:
+            return True
+        fields.append("updated_at = ?")
+        values.append(_now())
+        values.append(int(user_id))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE auth_account SET {', '.join(fields)} WHERE id = ?", values)
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_auth_user(self, user_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM auth_account WHERE id = ?", (int(user_id),))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def count_active_admins(self, exclude_id: int | None = None) -> int:
+        with self._lock:
+            if exclude_id is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM auth_account "
+                    "WHERE role = 'admin' AND active = 1").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM auth_account "
+                    "WHERE role = 'admin' AND active = 1 AND id <> ?",
+                    (int(exclude_id),)).fetchone()
+        return int(row["n"]) if row else 0
+
+    def create_auth_session(self, token_hash: str, expires_at: int, user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO auth_session(token_hash, user_id, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (token_hash, int(user_id), int(datetime.now().timestamp()), expires_at))
+            self._conn.commit()
+
+    def auth_session(self, token_hash: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id, expires_at FROM auth_session WHERE token_hash = ?",
                 (token_hash,)).fetchone()
-        return int(row["expires_at"]) if row else None
+        return dict(row) if row else None
 
     def delete_auth_session(self, token_hash: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM auth_session WHERE token_hash = ?", (token_hash,))
+            self._conn.commit()
+
+    def delete_auth_sessions_for_user(self, user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM auth_session WHERE user_id = ?", (int(user_id),))
             self._conn.commit()
 
     def purge_expired_auth_sessions(self, before: int) -> None:
