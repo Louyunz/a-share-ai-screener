@@ -113,10 +113,11 @@ FORBIDDEN_ATTRS = frozenset(
     }
 )
 
-# 冒烟子进程驱动脚本：读取同目录下 candidate.py / payload.json，写出 result.json
+# 冒烟子进程驱动脚本：读取同目录下 <token>payload.json / <token>candidate.py，写出 <token>result.json
 _SMOKE_DRIVER = '''# -*- coding: utf-8 -*-
 import builtins
 import json
+import sys
 import traceback
 from pathlib import Path
 
@@ -124,10 +125,15 @@ import numpy as np
 import pandas as pd
 
 BASE = Path(__file__).resolve().parent
+TOKEN = sys.argv[1] if len(sys.argv) > 1 else ""
+
+
+def _path(name):
+    return BASE / (TOKEN + name)
 
 
 def _load_payload():
-    with (BASE / "payload.json").open("r", encoding="utf-8") as handle:
+    with _path("payload.json").open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -150,7 +156,7 @@ def _restricted_builtins(payload):
 
 
 def _run(payload, result):
-    code = (BASE / "candidate.py").read_text(encoding="utf-8")
+    code = _path("candidate.py").read_text(encoding="utf-8")
     namespace = {
         "__builtins__": _restricted_builtins(payload),
         "__name__": "ai_candidate",
@@ -193,7 +199,7 @@ def main():
     except Exception:
         result["ok"] = False
         result["detail"] = "冒烟测试失败：\\n" + traceback.format_exc(limit=6)[-1500:]
-    (BASE / "result.json").write_text(
+    _path("result.json").write_text(
         json.dumps(result, ensure_ascii=False), encoding="utf-8"
     )
 
@@ -511,33 +517,50 @@ def _smoke_payload(
     }
 
 
+def _smoke_base_dir() -> Path:
+    """冒烟文件放在已有可写目录（不新建目录，避免沙箱对新建目录的 ACL 限制）。"""
+    for base in (Path.cwd(), Path(__file__).resolve().parents[2],
+                 Path(tempfile.gettempdir())):
+        try:
+            probe = base / (".dsh_write_probe_" + str(os.getpid()))
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return base
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir())
+
+
 def _run_smoke_test(
     source: str,
     *,
     takes_params: bool = False,
     params: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """在临时目录的独立子进程中执行冒烟，返回 ``(是否通过, 说明)``。"""
-    temp_dir = tempfile.mkdtemp(prefix="dsh_model_smoke_")
+    """在独立子进程中执行冒烟，返回 ``(是否通过, 说明)``。"""
+    base = _smoke_base_dir()
+    token = ".dsh_smoke_" + os.urandom(6).hex() + "_"
+    candidate_path = base / (token + "candidate.py")
+    payload_path = base / (token + "payload.json")
+    driver_path = base / (token + "driver.py")
+    result_path = base / (token + "result.json")
     try:
-        base = Path(temp_dir)
-        (base / "candidate.py").write_text(source, encoding="utf-8")
-        (base / "payload.json").write_text(
+        candidate_path.write_text(source, encoding="utf-8")
+        payload_path.write_text(
             json.dumps(
                 _smoke_payload(takes_params=takes_params, params=params),
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
-        driver = base / "smoke_driver.py"
-        driver.write_text(_SMOKE_DRIVER, encoding="utf-8")
+        driver_path.write_text(_SMOKE_DRIVER, encoding="utf-8")
 
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         try:
             completed = subprocess.run(
-                [sys.executable, str(driver)],
-                cwd=temp_dir,
+                [sys.executable, str(driver_path), token],
+                cwd=str(base),
                 capture_output=True,
                 timeout=SMOKE_TIMEOUT_SECONDS,
                 env=env,
@@ -547,7 +570,6 @@ def _run_smoke_test(
         except OSError as exc:
             return False, f"无法启动冒烟测试子进程：{exc}"
 
-        result_path = base / "result.json"
         if result_path.exists():
             try:
                 result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -566,7 +588,11 @@ def _run_smoke_test(
             f"{output or '无输出'}"
         )
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        for path in (candidate_path, payload_path, driver_path, result_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

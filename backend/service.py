@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""对话式业务服务：所有操作通过聊天流完成，AI 决定动作，服务负责执行与展示。
+"""对话式业务服务：所有操作通过聊天流完成。
 
-没有模块页签、没有独立动作接口；一次聊天 = 理解 → 回复 → 执行动作 → 富卡片。
+- 意图由 Planner 的原生 function calling 决定，服务端不解析自然语言；
+- 服务端只做动作校验、策略执行、回测/寻优与卡片展示。
 """
 from __future__ import annotations
 
 import difflib
-import re
 import time
 import uuid
 from pathlib import Path
@@ -17,6 +17,7 @@ import pandas as pd
 from .agent import (Agent, AgentError, CONFIRM_PROFILE_HINT,
                      asks_clarifying_question, chunk_text, has_confirmation_request, safe_question,
                      strip_confirmation_tail, trim_duplicate_confirmation)
+from .chat.directives import EngineDirective, build_expectation, resolve_directive
 from .config import (
     A_SHARE_DIR,
     BACKTEST_YEARS,
@@ -63,22 +64,6 @@ WORK_STEP_TEMPLATES = {
 
 TUNING_NOTE = ("网格寻优基于历史回测逐组评估，最优参数可能存在过拟合；"
                "历史业绩不代表未来实际表现，候选方案需要您确认后才会启用。")
-
-
-MODEL_REQUEST_ALIASES: dict[str, tuple[str, ...]] = {
-    "low_vol_quality": ("低波质量", "低波稳健"),
-    "multi_factor": ("均衡多因子", "均衡配置"),
-    "momentum_growth": ("趋势成长", "动量成长"),
-    "value_dividend": ("价值红利", "红利策略"),
-    "contrarian": ("反转策略", "反转模型"),
-}
-
-
-CUSTOM_MODEL_KEYWORDS = (
-    "svm", "支持向量机", "随机森林", "randomforest", "xgboost", "lightgbm",
-    "梯度提升", "gbdt", "神经网络", "机器学习", "sklearn", "kmeans", "pca",
-    "聚类", "降维", "孤立森林", "isolationforest", "lasso", "ridge",
-)
 
 
 class ServiceError(RuntimeError):
@@ -173,8 +158,7 @@ class AppService:
             return {"versions": [self._version_public(item) for item in self.store.list_versions()],
                     "active_id": None, "model_scope": "session"}
         self._require_session(session_id)
-        runtime = self.store.get_state(session_id)
-        active_id = runtime.get("active_version_id")
+        active_id = self.store.session_active_version_id(session_id)
         return {
             "versions": [self._version_public(item, active_id)
                          for item in self._session_versions(session_id)],
@@ -186,15 +170,16 @@ class AppService:
         self._require_session(session_id)
         profile = self._profile(session_id)
         runtime = self.store.get_state(session_id)
+        active_version = self.store.session_active_version(session_id)
         model = self._session_active_model(session_id)
-        active_version_id = runtime.get("active_version_id")
+        active_version_id = active_version["id"] if active_version else None
         versions = self._session_versions(session_id)
         return {
             "profile": profile_payload(profile["slots"] if profile else {},
                                        profile["confirmed"] if profile else False),
             "active_model": self._model_public(
                 model, version_id=active_version_id,
-                metrics=runtime.get("active_metrics") or {}),
+                metrics=(active_version or {}).get("metrics") or {}),
             "versions": [self._version_public(item, active_version_id) for item in versions],
             "pending_proposal": self._pending_public(runtime.get("pending")),
             "last_selection": runtime.get("last_selection"),
@@ -228,15 +213,19 @@ class AppService:
             plan.actions = [{"name": str(pending_intent), "args": {}}]
             plan.deferred_intent = ""
 
-        # 审批卡「继续优化」是产品级明确指令：若模型误判成回滚/一般提问，服务端纠正为
-        # analyze_model（结构性升级），避免演示时“继续优化”被反问或走错动作。
-        if self._wants_aggressive_retry(content) and not plan.has_action("analyze_model"):
-            if "apply_pending_change" not in plan.action_names():
-                plan.actions = [{"name": "analyze_model", "args": {}}]
-                plan.deferred_intent = ""
-                if any(word in plan.reply for word in ("回滚", "上一版", "是否", "确认")):
-                    plan.reply = ("收到。我会在现有模型基础上做结构性升级：更换基础引擎或重写数学打分逻辑，"
-                                  "再由服务端在新的参数范围内重新寻优并回测；候选方案不会自动启用。")
+        # 动作前置校验：这里只校验“当前状态是否允许执行该动作”，不做任何语义判断。
+        # 不合法时把结构化错误回传 LLM，让它依据状态重新调用工具（最多一次）。
+        state_errors = self._action_state_errors(session_id, plan)
+        if state_errors:
+            try:
+                plan = self.agent.replan(public_state, history[:-1], content, state_errors)
+            except Exception as exc:  # noqa: BLE001
+                yield "error", {"message": f"AI 重新规划失败：{exc}", "retryable": True}
+                yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                return
+            state_errors = self._action_state_errors(session_id, plan)
+            if state_errors:
+                raise ServiceError("AI 的动作与当前会话状态不一致：" + "；".join(state_errors))
 
         # 澄清与执行分离：提问轮只记录待执行意图与客户原始诉求，等客户回答后再执行
         runtime_before = self.store.get_state(session_id)
@@ -274,34 +263,6 @@ class AppService:
                 plan.reply = ("我已根据你提供的信息整理出投资画像："
                               + profile_summary(updated_profile["slots"])
                               + "\n\n" + CONFIRM_PROFILE_HINT)
-
-        # 1.5) 动作前置校验：没有 pending 时不能让模型直接假设已审批，
-        #       自动转为重新分析，避免“回复说已启用、随后报错”的不一致。
-        runtime_pre = self.store.get_state(session_id)
-        action_names = plan.action_names()
-        fallback_analyze = False
-        if "apply_pending_change" in action_names and not runtime_pre.get("pending"):
-            plan.actions = [item for item in plan.actions
-                            if str(item.get("name")) != "apply_pending_change"]
-            if not any(str(item.get("name")) == "analyze_model" for item in plan.actions):
-                plan.actions.append({"name": "analyze_model", "args": {}})
-            plan.reply = ("当前没有等待您确认的模型改进方案。我会按最新模型重新分析，"
-                          "生成候选方案并完成回测，结果仍需要您确认后才会启用。")
-            fallback_analyze = True
-        if "rollback_version" in action_names and not self._can_rollback(session_id):
-            plan.actions = [item for item in plan.actions
-                            if str(item.get("name")) != "rollback_version"]
-            if not plan.actions:
-                plan.reply = ("当前会话没有可以回滚的历史模型版本。您可以先让我分析当前模型，"
-                              "生成新的改进方案。")
-        if (not plan.actions and not runtime_pre.get("pending")
-                and "模型改进方案" in plan.reply and "同意启用" in plan.reply):
-            plan.actions = [{"name": "analyze_model", "args": {}}]
-            plan.reply = ("我先对当前模型做一次完整分析与回测，生成候选方案；"
-                          "方案不会自动启用，仍需您确认。")
-            fallback_analyze = True
-        if fallback_analyze:
-            request_text = "根据当前对话重新分析模型并生成候选方案"
 
         # 2) 流式回复（去掉模型自行重复的确认段落）
         plan.reply = trim_duplicate_confirmation(plan.reply)
@@ -351,7 +312,8 @@ class AppService:
             question = str(action.get("args", {}).get("question", ""))
             return (yield from self._explain_results(session_id, question))
         if name == "analyze_model":
-            return (yield from self._analyze_model(session_id, request_text))
+            return (yield from self._analyze_model(session_id, request_text,
+                                                   action.get("args") or {}))
         if name == "apply_pending_change":
             return (yield from self._apply_pending(session_id))
         if name == "rollback_version":
@@ -454,43 +416,68 @@ class AppService:
             yield "token", {"text": piece}
         return [], "", False
 
+    def _action_state_errors(self, session_id: str, plan) -> list[str]:
+        """校验动作与当前会话状态是否匹配（不判断语义，只判断状态）。"""
+        runtime = self.store.get_state(session_id)
+        profile = self.store.get_profile(session_id)
+        names = plan.action_names()
+        planned_confirm = "confirm_profile" in names and bool(
+            profile and profile_complete(profile["slots"]))
+        will_be_confirmed = bool(profile and profile["confirmed"]) or planned_confirm
+        planned_selection = "run_selection" in names
+        errors: list[str] = []
+        for name in names:
+            if name == "apply_pending_change" and not runtime.get("pending"):
+                errors.append("当前会话没有待审批模型方案，不能调用 apply_pending_change")
+            elif name == "rollback_version" and not self._can_rollback(session_id):
+                errors.append("当前会话没有可回滚的历史模型版本，不能调用 rollback_version")
+            elif name == "confirm_profile" and not (
+                    profile and profile_complete(profile["slots"])):
+                errors.append("画像必填信息未齐全，不能调用 confirm_profile")
+            elif name == "run_selection" and not will_be_confirmed:
+                errors.append("画像尚未确认，不能调用 run_selection")
+            elif name == "explain_results" and not (
+                    runtime.get("last_selection") or planned_selection):
+                errors.append("当前会话还没有选股结果，不能调用 explain_results")
+        return errors
+
     # ------------------------------------------------------------------
     # 动作：AI 定引擎与调参范围 + 服务端执行网格寻优
     # ------------------------------------------------------------------
-    def _analyze_model(self, session_id: str, request_text: str = ""):
-        """AI 只负责写引擎、定搜索范围；具体参数由服务端网格寻优选出。"""
+    def _analyze_model(self, session_id: str, request_text: str = "",
+                       intent: dict[str, Any] | None = None):
+        """AI 通过 analyze_model 的 tool 参数决定引擎方向；服务端只执行指令。"""
         from .engine import selection, tuning
         from .models import custom, pipeline, registry
 
+        intent = intent if isinstance(intent, dict) else {}
         model = self._session_active_model(session_id)
         base_weights, base_transform = self._model_engine(model)
         base_metrics = self._current_metrics(session_id)
-        expectation = self._expectation(request_text, session_id)
-        objective = expectation.get("objective") or "sharpe"
-        objective_label = tuning.OBJECTIVE_LABELS.get(objective, objective)
-        tolerance = expectation.get("tolerance")
 
         runtime_before = self.store.get_state(session_id)
         previous_pending = runtime_before.get("pending") or {}
         previous_approach = self._previous_approach(previous_pending)
-        aggressive = self._wants_aggressive_retry(request_text, previous_pending)
-        requested_model = self._requested_model_type(request_text)
-        custom_model = self._requested_custom_model(request_text)
-        force_approach = ""
-        force_model_type = ""
-        if custom_model or self._wants_code_change(request_text):
-            force_approach = "code"
-        elif requested_model:
-            force_approach = "model_type"
-            force_model_type = requested_model
-        if aggressive:
-            if previous_approach == "weights":
-                force_approach = "model_type"
-                force_model_type = self._different_builtin_model(
-                    model, previous_pending.get("model") or {})
-            else:
-                force_approach = "code"
-                force_model_type = ""
+        directive = resolve_directive(intent, previous_approach=previous_approach)
+        if directive.engine == "model_type" and not directive.model_type:
+            directive = EngineDirective(
+                engine="model_type",
+                model_type=self._different_builtin_model(
+                    model, previous_pending.get("model") or {}),
+                objective=directive.objective,
+                escalate=directive.escalate,
+                reason=directive.reason,
+            )
+        objective = directive.objective
+        objective_label = tuning.OBJECTIVE_LABELS.get(objective, objective)
+        profile = self._profile(session_id)
+        expectation = build_expectation(
+            directive, profile["slots"] if profile else {})
+        tolerance = expectation.get("tolerance")
+        aggressive = directive.escalate
+        force_approach = directive.engine if directive.engine in (
+            "weights", "model_type", "code") else ""
+        force_model_type = directive.model_type
 
         work_id = "work-" + uuid.uuid4().hex[:8]
         tune_id = "tune-" + uuid.uuid4().hex[:8]
@@ -578,15 +565,29 @@ class AppService:
         try:
             plan = pipeline.build_tuning_plan(self.llm, self._tuning_state(
                 model, base_metrics, factor_stats, recent_metrics, request_text,
-                force_approach=force_approach, force_model_type=force_model_type,
-                custom_model=custom_model, aggressive=aggressive,
-                previous=previous_pending, objective=objective, tolerance=tolerance))
+                directive=directive, previous=previous_pending))
         except Exception as exc:  # noqa: BLE001
             raise AgentError(f"AI 没能给出调参方案：{exc}") from exc
         if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
             plan = plan["plan"]
         if not isinstance(plan, dict) or not plan.get("approach"):
             raise AgentError("AI 返回的调参方案格式不对")
+        self.store.audit(
+            "analyze_model", reason="llm_tool",
+            payload={
+                "tool_args": _json_safe(intent),
+                "directive": {
+                    "engine": directive.engine,
+                    "model_type": directive.model_type,
+                    "objective": directive.objective,
+                    "escalate": directive.escalate,
+                    "previous_approach": previous_approach,
+                },
+                "plan": {"approach": plan.get("approach"),
+                         "objective": plan.get("objective"),
+                         "model_type": plan.get("model_type"),
+                         "repair_attempts": plan.get("repair_attempts", 0)},
+            })
         if aggressive:
             add_step("升级优化策略",
                      ("上一版未达预期，本轮不再微调，改为直接更换基础模型并由服务端重新寻优。"
@@ -884,12 +885,9 @@ class AppService:
 
     def _tuning_state(self, model: dict[str, Any], base_metrics: dict[str, Any],
                       factor_stats: dict[str, Any], recent_metrics: dict[str, Any],
-                      request_text: str, *, force_approach: str = "",
-                      force_model_type: str = "", custom_model: str = "",
-                      aggressive: bool = False, previous: dict[str, Any] | None = None,
-                      objective: str = "sharpe",
-                      tolerance: float | None = None) -> dict[str, Any]:
-        """构造给 AI 的调参状态：AI 只依据它决定引擎与搜索范围。"""
+                      request_text: str, *, directive: EngineDirective,
+                      previous: dict[str, Any] | None = None) -> dict[str, Any]:
+        """构造给 AI 的调参状态：引擎方向由 directive（来自 tool args）决定。"""
         previous = previous or {}
         current_model = {
             "name": model.get("name"),
@@ -902,23 +900,20 @@ class AppService:
         }
         return {
             "tuning_request": True,
+            "directive": {
+                "engine": directive.engine,
+                "model_type": directive.model_type,
+                "objective": directive.objective,
+                "escalate": directive.escalate,
+                "previous_approach": self._previous_approach(previous),
+                "reason": directive.reason,
+            },
             "current_model": current_model,
             "current_metrics": _json_safe(base_metrics),
             "weights": normalize_weights(model.get("weights") or {}),
             "factor_stats": factor_stats,
             "recent_metrics": recent_metrics,
             "user_request": request_text,
-            "force_approach": force_approach,
-            "force_model_type": force_model_type,
-            "requested_custom_model": custom_model,
-            "objective": objective,
-            "target_drawdown": tolerance,
-            "escalation": {
-                "active": bool(aggressive),
-                "previous_approach": self._previous_approach(previous),
-                "previous_model": ((previous.get("model") or {}).get("model_id") or ""),
-                "previous_name": ((previous.get("model") or {}).get("name") or ""),
-            },
             "previous_proposal": previous.get("proposal") or {},
             "previous_metrics": previous.get("metrics") or {},
             "market": {"as_of": self.data.as_of, "universe": len(self.data.universe)},
@@ -975,56 +970,6 @@ class AppService:
             "weights": plan.get("weights") or {},
             "summary": str(plan.get("summary") or ""),
         }
-
-    @staticmethod
-    def _requested_model_type(request_text: str) -> str:
-        text = str(request_text or "").lower().replace(" ", "").replace("-", "")
-        if not text:
-            return ""
-        for model_id, aliases in MODEL_REQUEST_ALIASES.items():
-            for alias in aliases:
-                if alias.lower().replace(" ", "") in text:
-                    return model_id
-        return ""
-
-    @staticmethod
-    def _requested_custom_model(request_text: str) -> str:
-        text = str(request_text or "").lower().replace(" ", "")
-        for keyword in CUSTOM_MODEL_KEYWORDS:
-            if keyword.lower() in text:
-                return keyword
-        return ""
-
-    def _target_drawdown(self, request_text: str, session_id: str) -> float | None:
-        text = str(request_text or "")
-        match = re.search(r"回撤[^0-9]{0,10}([0-9]+(?:\.[0-9]+)?)\s*%", text)
-        if not match:
-            match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%[。；;\s]{0,4}回撤", text)
-        if match:
-            try:
-                return abs(float(match.group(1))) / 100.0
-            except ValueError:
-                return None
-        profile = self.store.get_profile(session_id) or {}
-        value = str((profile.get("slots") or {}).get("drawdown_tolerance") or "")
-        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", value)
-        if match:
-            try:
-                return abs(float(match.group(1))) / 100.0
-            except ValueError:
-                return None
-        return None
-
-    def _expectation(self, request_text: str, session_id: str) -> dict[str, Any]:
-        text = str(request_text or "")
-        if any(word in text for word in ("收益", "回报", "赚钱", "涨幅")):
-            objective = "cagr"
-        elif any(word in text for word in ("回撤", "风险", "波动")):
-            objective = "mdd"
-        else:
-            objective = "sharpe"
-        return {"objective": objective,
-                "tolerance": self._target_drawdown(request_text, session_id)}
 
     @staticmethod
     def _meets_expectation(expectation: dict[str, Any], base: dict[str, Any],
@@ -1165,27 +1110,28 @@ class AppService:
         pending = runtime.get("pending")
         if not pending:
             raise ConflictError("没有等你确认的改进方案")
-        active_version_id = runtime.get("active_version_id")
+        active_version_id = self.store.session_active_version_id(session_id)
         previous = self.store.get_version(active_version_id) if active_version_id else None
         if previous is None:
             # 第一次应用 AI 改动前，先登记当前默认模型为基线，保证随时可以回滚
             baseline_id = self.store.create_version(
                 model=self._default_model(),
                 metrics=pending.get("base_metrics") or {},
-                status="candidate", parent_id=None, source="baseline",
+                status="baseline", parent_id=None, source="baseline",
                 summary="初始模型", session_id=session_id)
             previous = self.store.get_version(baseline_id)
         version_id = self.store.create_version(
             model=pending["model"], metrics=pending["metrics"],
-            status="candidate", parent_id=previous["id"] if previous else None,
+            status="applied", parent_id=previous["id"] if previous else None,
             source="ai_optimize", summary=pending["proposal"].get("summary", ""),
             session_id=session_id)
-        self.store.audit("ai_apply", from_version=previous["id"] if previous else None,
-                         to_version=version_id, reason="user_approved_in_chat")
-        self._save_runtime(session_id, pending=None,
-                           active_model=pending["model"],
-                           active_metrics=pending.get("metrics") or {},
-                           active_version_id=version_id)
+        self.store.set_session_active_version(session_id, version_id)
+        self.store.audit(
+            "ai_apply", from_version=previous["id"] if previous else None,
+            to_version=version_id, reason="user_approved_in_chat",
+            payload={"model_id": pending["model"].get("model_id"),
+                     "tuning": (pending.get("tuning") or {}).get("method", "")})
+        self._save_runtime(session_id, pending=None)
         version_block = self._version_block(session_id)
         yield "ui", {"block": version_block}
         metrics = pending.get("metrics") or {}
@@ -1194,8 +1140,7 @@ class AppService:
                     "（新建对话将回到默认模型）。"), False
 
     def _rollback(self, session_id: str):
-        runtime = self.store.get_state(session_id)
-        active_version_id = runtime.get("active_version_id")
+        active_version_id = self.store.session_active_version_id(session_id)
         if not active_version_id:
             raise ConflictError("当前会话还没有可回滚的模型版本")
         current = self.store.get_version(active_version_id)
@@ -1205,15 +1150,15 @@ class AppService:
         if parent is not None:
             model = dict(parent.get("model") or self._default_model())
             metrics = parent.get("metrics") or {}
-            previous_id = parent["id"]
+            previous_id: str | None = parent["id"]
         else:
             model = self._default_model()
             metrics = {}
             previous_id = None
+        self.store.set_session_active_version(session_id, previous_id)
         self.store.audit("rollback", from_version=active_version_id,
-                         to_version=previous_id, reason="user_rollback")
-        self._save_runtime(session_id, active_model=model, active_metrics=metrics,
-                           active_version_id=previous_id)
+                         to_version=previous_id, reason="user_rollback",
+                         payload={"model_id": model.get("model_id")})
         version_block = self._version_block(session_id)
         yield "ui", {"block": version_block}
         return [version_block], f"已切回{self._model_name_from_model(model)}（仅当前会话生效）。", False
@@ -1232,8 +1177,8 @@ class AppService:
 
     def _session_active_model(self, session_id: str) -> dict[str, Any]:
         """当前会话生效的模型：没有则使用默认数学模型（模型仅会话内生效）。"""
-        runtime = self.store.get_state(session_id)
-        model = runtime.get("active_model")
+        active = self.store.session_active_version(session_id)
+        model = (active or {}).get("model")
         if isinstance(model, dict) and model.get("weights"):
             payload = dict(model)
             payload.setdefault("kind", "builtin")
@@ -1245,8 +1190,7 @@ class AppService:
 
     def _can_rollback(self, session_id: str) -> bool:
         """当前会话是否存在可回滚的上一版模型。"""
-        runtime = self.store.get_state(session_id)
-        version_id = runtime.get("active_version_id")
+        version_id = self.store.session_active_version_id(session_id)
         if not version_id:
             return False
         current = self.store.get_version(version_id)
@@ -1296,14 +1240,6 @@ class AppService:
         return weights, transform
 
     @staticmethod
-    def _wants_aggressive_retry(text: str, pending: dict[str, Any] | None = None) -> bool:
-        value = str(text or "")
-        return any(word in value for word in (
-            "继续优化", "上一版未达", "未达到我的预期", "没达到预期", "未达预期",
-            "再试一版", "换个方向", "更激进", "直接换", "重新优化模型",
-        )) or bool(pending and any(word in value for word in ("继续", "再试", "不满意")))
-
-    @staticmethod
     def _previous_approach(pending: dict[str, Any] | None) -> str:
         model = (pending or {}).get("model") or {}
         if model.get("kind") == "code":
@@ -1325,23 +1261,14 @@ class AppService:
                 return str(info["id"])
         return "multi_factor" if "multi_factor" not in excluded else "low_vol_quality"
 
-    @staticmethod
-    def _wants_code_change(text: str) -> bool:
-        raw = str(text or "")
-        negative = ("不要改代码", "不用改代码", "别改代码", "不需要改代码")
-        if any(word in raw for word in negative):
-            return False
-        return any(word in raw for word in (
-            "修改代码", "改代码", "源代码", "build_transform", "自定义代码", "代码方案"))
-
     def _current_metrics(self, session_id: str) -> dict[str, Any]:
         """当前会话生效模型在同一回测窗口下的指标（用于寻优前后对比）。"""
         from .engine import selection
 
-        runtime = self.store.get_state(session_id)
         model = self._session_active_model(session_id)
-        if runtime.get("active_version_id") and runtime.get("active_metrics"):
-            return _json_safe(runtime["active_metrics"])
+        active = self.store.session_active_version(session_id)
+        if active and active.get("metrics"):
+            return _json_safe(active["metrics"])
         weights, transform = self._model_engine(model)
         start, end = self._backtest_window()
         backtest = selection.run_backtest(
@@ -1396,7 +1323,8 @@ class AppService:
         profile = self._profile(session_id)
         runtime = self.store.get_state(session_id)
         model = self._session_active_model(session_id)
-        active_version_id = runtime.get("active_version_id")
+        active_version = self.store.session_active_version(session_id)
+        active_version_id = active_version["id"] if active_version else None
         versions = self._session_versions(session_id)
         last = runtime.get("last_selection")
         pending = runtime.get("pending")
@@ -1406,7 +1334,7 @@ class AppService:
                                        profile["confirmed"] if profile else False),
             "model": self._model_public(
                 model, version_id=active_version_id,
-                metrics=runtime.get("active_metrics") or {}),
+                metrics=(active_version or {}).get("metrics") or {}),
             "model_scope": "session",
             "versions": [{"id": item["id"], "name": self._model_name(item),
                           "status": ("active" if item["id"] == active_version_id
@@ -1443,15 +1371,15 @@ class AppService:
                 "summary": version.get("summary", "")}
 
     def _version_block(self, session_id: str) -> dict[str, Any]:
-        runtime = self.store.get_state(session_id)
         model = self._session_active_model(session_id)
-        active_version_id = runtime.get("active_version_id")
+        active_version = self.store.session_active_version(session_id)
+        active_version_id = active_version["id"] if active_version else None
         versions = [self._version_public(item, active_version_id)
                     for item in self._session_versions(session_id)]
         return {"id": "version-" + uuid.uuid4().hex[:8], "type": "version",
                 "active": self._model_public(
                     model, version_id=active_version_id,
-                    metrics=runtime.get("active_metrics") or {}),
+                    metrics=(active_version or {}).get("metrics") or {}),
                 "versions": versions[-6:]}
 
     @staticmethod

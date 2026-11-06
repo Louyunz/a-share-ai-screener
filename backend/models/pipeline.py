@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""AI 建模提案流水线：LLM 生成提案 + 结构化校验。
+"""AI 调参方案流水线：LLM 只产出「引擎 + 搜索范围」+ 结构化校验。
 
-职责边界：本模块只负责「生成提案」与「校验提案」，**不跑回测**；
-回测与版本编排由 service 层完成。
+职责边界：本模块只负责生成/校验调参方案，**不跑回测**；
+具体参数由 ``backend.engine.tuning`` 在服务端寻优，回测与版本由 service 编排。
 """
 
 from __future__ import annotations
@@ -38,154 +38,18 @@ __all__ = [
     "MAX_TUNING_PARAMS",
     "TUNING_SYSTEM",
     "TUNING_REPAIR_SYSTEM",
-    "normalize_proposal",
-    "build_candidate_proposal",
     "normalize_tuning_plan",
     "build_tuning_plan",
-    "describe_model",
 ]
 
-# 允许的提案方式
+# 允许的引擎类型
 APPROACHES = ("model_type", "weights", "code")
+OBJECTIVES = ("sharpe", "cagr", "mdd")
 
-# state 必须包含的字段（契约 6.2 / 分工约定）
-REQUIRED_STATE_KEYS = (
-    "current_model",
-    "current_metrics",
-    "weights",
-    "factor_stats",
-    "recent_metrics",
-)
-
-# state 序列化进提示词的长度上限，避免上下文爆炸
 MAX_STATE_CHARS = 12000
 
-_OUTPUT_SCHEMA = """{
-  "approach": "model_type | weights | code 三选一",
-  "summary": "一句普通人能看懂的话，说明为什么这样改（不要出现夏普、因子暴露等术语）",
-  "model_type": "切换到内置模型时必填，取下方清单里的 id；weights/code 方案可省略",
-  "weights": {"ep": 0.12, "bp": 0.10, "...": "共 10 项，总和为 1，每项 0~0.4"},
-  "code": "approach=code 时的完整 Python 源码；其他方案省略",
-  "why": "数据依据，必须引用用户状态里的真实指标数字，不要编造",
-  "expected_effect": "预期改善方向，一句话说清希望哪个指标变好",
-  "risks": ["2~3 条主要风险，用普通人能懂的话"]
-}"""
-
-_CODE_SAMPLE = """def build_transform():
-    def transform(z, weights):
-        score = pd.Series(0.0, index=z.index, dtype=float)
-        for factor, weight in weights.items():
-            column = "z_" + factor
-            if column in z.columns:
-                values = pd.to_numeric(z[column], errors="coerce").fillna(0.0)
-                score = score + float(weight) * values
-        return score
-    return transform"""
-
-_SKLEARN_SAMPLE = """import numpy as np
-import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
-
-def build_transform():
-    def transform(z, weights):
-        x = z.fillna(0.0)
-        base = np.zeros(len(x), dtype=float)
-        for factor, weight in weights.items():
-            column = "z_" + factor
-            if column in x.columns:
-                base = base + float(weight) * x[column].to_numpy(dtype=float)
-        model = RandomForestRegressor(n_estimators=60, max_depth=3, random_state=42)
-        model.fit(x.to_numpy(dtype=float), base)
-        return pd.Series(model.predict(x.to_numpy(dtype=float)), index=z.index)
-    return transform"""
-
-
-def _build_system_prompt() -> str:
-    """构造建模助手系统提示词（模型清单与因子说明从注册表动态生成）。"""
-    model_lines = "\n".join(
-        f"- {item['id']}（{item['name']}）：{item['description']}"
-        for item in list_models()
-    )
-    factor_lines = "、".join(
-        f"{factor}（{FACTOR_LABELS.get(factor, factor)}）"
-        for factor in FACTOR_LABELS
-    )
-    sections = [
-        "你是「智投罗盘」的量化建模助手，负责在用户现有选股模型基础上提出可落地的改进方案。",
-        "",
-        "## 你的任务",
-        "根据用户给出的当前模型、当前回测指标、10 因子暴露统计和近期表现，判断模型的主要短板，"
-        "提出一个改进方案。只能使用下方给出的内置模型、10 个因子或符合代码契约的自定义代码，"
-        "所有数字必须来自用户状态，禁止编造。",
-        "",
-        "## 输出格式",
-        "只输出一个 JSON 对象，不要输出 Markdown 代码块、前后缀说明或多余文字，字段如下：",
-        _OUTPUT_SCHEMA,
-        "",
-        "## 三种方案（approach 三选一）",
-        '1. "model_type"：切换到更合适的模型风格；weights 省略时使用该内置模型自带权重。',
-        '2. "weights"：保留当前模型风格，只调整 10 个因子的权重；weights 必填。',
-        '3. "code"：生成自定义打分代码，适合内置方案都解决不了的情况；weights 作为基底权重'
-        "（省略时沿用当前权重），code 必须通过静态安全检查和子进程冒烟测试。",
-        "若 state.user_request 明确要求修改策略代码（如“改代码/修改源代码/build_transform/自定义代码”），"
-        "必须使用 approach=\"code\"，不得用权重或内置模型替代；若 state.force_approach 非空，必须使用该 approach。",
-        "若 state.requested_custom_model 非空，或客户点名内置清单之外的模型（如 SVM、随机森林、梯度提升、聚类、PCA 等），"
-        "必须使用 approach=\"code\"，用 sklearn 在 transform 内实现该模型；不得拒绝、不得声称没有选项，也不得用内置模型替代。",
-        "优化模型时不要默认只微调因子权重。若当前模型存在明显短板、客户对收益/回撤不满意、"
-        "或 state.escalation.active 为 true，应优先考虑更换基础模型（approach=\"model_type\"）"
-        "或用 sklearn 重写数学打分逻辑（approach=\"code\"）。",
-        "当 state.escalation.active 为 true（客户点了继续优化/上一版未达预期）时，必须做结构性升级："
-        "禁止 only-weights 的微调；若 strict_requirement 要求 code，则必须重写数学打分逻辑，"
-        "并与 previous_proposal/previous_model 不同。",
-        "在没有明确要求且当前模型表现尚可时，优先选择改动小、能解释清楚的方案；不要为了写代码而写代码。",
-        "",
-        "## 内置模型清单",
-        model_lines,
-        "",
-        "",
-        "## 可用因子",
-        f"{factor_lines}。",
-        "因子值（z 列）已经做过方向对齐：数值越大代表该因子越优（例如 volatility_60 越大代表波动越低）。",
-        "",
-        "## 自定义代码契约（approach=\"code\" 时必须遵守）",
-        "- 必须定义顶层函数 def build_transform():，它返回可调用的 transform(z, weights)。",
-        "- z 是 pandas.DataFrame，含 10 列 z_ep、z_bp、...，index 是股票代码；weights 是 {因子名: 权重} 的 dict。",
-        "- transform 必须返回 pandas.Series，index 与 z 对齐、长度一致且不含 NaN/Inf。",
-        "- 允许 import math、numpy、pandas，以及 sklearn / scipy 的模型与预处理子模块；"
-        "禁止文件/网络/系统调用与动态执行（open/exec/eval/compile/__import__ 等）；"
-        "禁止访问下划线开头的属性（含 dunder）；源码不超过 6000 字符；不要打印、不要读写文件、不要定义类。",
-        "- sklearn 模型只能基于当前 z 截面做转导式/无监督拟合，或先用加权因子合成分构造伪标签再训练；"
-        "不得假设存在未来收益标签，不得使用 sklearn.datasets 或任何文件读写。"
-        "禁止导入 xgboost/lightgbm/torch/tensorflow 等未安装库；需要等价模型时用 sklearn 对应实现。",
-        "- 参考写法（简单因子组合，实际代码顶部必须补上 import numpy as np 与 import pandas as pd）：",
-        _CODE_SAMPLE,
-        "- sklearn 参考写法（伪标签蒸馏，演示如何让 AI 自写任意模型）：",
-        _SKLEARN_SAMPLE,
-        "",
-        "## 面向普通用户",
-        "summary、why、expected_effect、risks 会直接展示给用户：用生活化语言，避免英文术语和公式；"
-        "why 必须引用状态中的真实数字；risks 给 2~3 条。",
-    ]
-    return "\n".join(sections)
-
-
-CODE_REPAIR_SYSTEM = """你是智投罗盘的量化模型代码修复助手。
-给定原始提案、校验错误信息和客户诉求，请修复 Python 模型代码并重新输出完整提案 JSON。
-要求：
-1. 只输出一个 JSON 对象，字段与原始提案一致，approach 必须为 code；
-2. 修复必须针对错误信息，不得删除安全检查要求、不得引入文件/网络/系统调用；
-3. 代码必须定义 build_transform()，返回 transform(z, weights)，输出有限 pandas.Series；
-4. 只允许 math/numpy/pandas/sklearn（模型相关子模块）/scipy；
-5. 不要解释修改过程。
-"""
-
-# ---------------------------------------------------------------------------
-# 调参方案（AI 只产出「引擎 + 搜索范围」，最终参数由服务端网格寻优决定）
-# ---------------------------------------------------------------------------
-
-OBJECTIVES = ("sharpe", "cagr", "mdd")
-MIN_SEARCH_FACTORS = 3
 MAX_TUNING_PARAMS = 4
+MIN_SEARCH_FACTORS = 3
 DEFAULT_TUNING_MAX_TRIALS = 12
 MAX_TUNING_REPAIR_ATTEMPTS = 2
 _PARAM_TYPES = ("int", "float")
@@ -259,6 +123,18 @@ def _build_tuning_system_prompt() -> str:
         "code 方案不要给 search_space；weights 可选，作为基底权重（省略时用当前权重）。",
         "weights/model_type 方案不要给 param_space。",
         "",
+        "## 执行指令（最高优先级，违反视为不合格）",
+        "- state.directive 是 Planner 通过 tool_calls 明确给出的执行指令，必须遵守：",
+        '  - directive.engine="code" → 必须 approach="code"，写新的参数化引擎，禁止用 model_type/weights 替代；',
+        '  - directive.engine="model_type" → 必须 approach="model_type"，且 model_type 必须等于 directive.model_type；',
+        '  - directive.engine="weights" → 必须 approach="weights"；',
+        '  - directive.engine="auto" → 你可以根据数据选择 weights/model_type/code，但必须符合下面的升级规则。',
+        "- directive.escalate=true（客户说继续优化/上一版未达预期）时："
+        "若 directive.previous_approach=weights，必须使用 model_type 更换基础引擎；"
+        "若 previous_approach=model_type 或 code，必须使用 code 重写参数化打分引擎；"
+        "禁止 only-weights 的微调方案。",
+        "- directive.objective 非空时必须使用该 objective；为空时才可自行判断。",
+        "",
         "## 内置模型清单",
         model_lines,
         "",
@@ -297,7 +173,9 @@ TUNING_REPAIR_SYSTEM = """你是智投罗盘的调参方案修复助手。
 4. code 方案必须有 param_space（1~4 个合法标识符参数）和完整 code：
    def build_transform(params=None)，内部用 params.get(参数名, 默认值) 兜底；
    param_space 每个参数 {min,max,step,type,default}，范围与类型必须合法；
-5. 不得删除必需字段，不得引入文件/网络/系统调用；不要解释修改过程。
+5. 不得删除必需字段，不得引入文件/网络/系统调用；不要解释修改过程；
+6. repair_request.directive 是最高优先级执行指令：engine/model_type/objective/escalate
+   必须严格遵守；escalate=true 时禁止只调权重的 weights 方案。
 """
 
 
@@ -345,26 +223,6 @@ def _snippet(value: Any, limit: int = 400) -> str:
     return text
 
 
-def _validate_state(state: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(state, Mapping):
-        raise ModelValidationError("state 必须是 dict")
-    payload = dict(state)
-    missing = [key for key in REQUIRED_STATE_KEYS if key not in payload]
-    if missing:
-        raise ModelValidationError(
-            f"state 缺少必要字段: {', '.join(missing)}；"
-            f"需要包含: {', '.join(REQUIRED_STATE_KEYS)}"
-        )
-    return payload
-
-
-def _state_base_weights(state: Mapping[str, Any]) -> dict[str, float]:
-    try:
-        return validate_weights(state["weights"])
-    except (TypeError, ValueError) as exc:
-        raise ModelValidationError(f"state.weights 不合法：{exc}") from exc
-
-
 def _required_text(payload: Mapping[str, Any], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -405,214 +263,6 @@ def _normalized_weights(weights: Any, field: str = "weights") -> dict[str, float
         return validate_weights(weights)
     except (TypeError, ValueError) as exc:
         raise ModelValidationError(f"{field} 不合法：{exc}") from exc
-
-
-def _resolve_base_weights(
-    base_weights: Mapping[str, float] | None,
-    model_payload: Mapping[str, Any] | None,
-) -> dict[str, float]:
-    """代码方案的基底权重：调用方传入 > 指定模型自带 > 默认模型。"""
-    if base_weights is not None:
-        return _normalized_weights(base_weights, "base_weights")
-    if model_payload is not None:
-        return dict(model_payload["weights"])
-    return get_model(DEFAULT_MODEL_ID)["weights"]
-
-
-def normalize_proposal(
-    raw: dict[str, Any],
-    base_weights: Mapping[str, float] | None = None,
-) -> dict[str, Any]:
-    """校验并结构化 LLM 提案（契约 6.2）。
-
-    Parameters
-    ----------
-    raw:
-        LLM 返回的 JSON 对象，必须含 ``approach`` 与 ``summary``。
-    base_weights:
-        可选的当前基底权重；``approach="code"`` 且未提供 weights 时使用。
-
-    Returns
-    -------
-    dict
-        ``{approach, summary, model_type, weights, code, why,
-        expected_effect, risks}``，其中 ``weights`` 已补齐并归一化。
-
-    Raises
-    ------
-    ModelValidationError
-        字段缺失/类型错误/未知模型/权重非法。
-    ModelCodeError
-        ``approach="code"`` 时代码未通过静态校验或冒烟测试。
-    """
-    if not isinstance(raw, Mapping):
-        raise ModelValidationError("提案必须是 JSON 对象（dict）")
-    payload = dict(raw)
-
-    approach_raw = payload.get("approach")
-    approach = str(approach_raw).strip().lower() if approach_raw is not None else ""
-    if approach not in APPROACHES:
-        raise ModelValidationError(
-            f"approach 必须是 {' / '.join(APPROACHES)} 之一，当前为 {approach_raw!r}"
-        )
-
-    summary = _required_text(payload, "summary")
-
-    # 模型类型：只要出现就必须合法；model_type 方案必须出现
-    model_type: str | None = None
-    model_payload: dict[str, Any] | None = None
-    model_type_raw = payload.get("model_type")
-    if model_type_raw is not None and str(model_type_raw).strip():
-        if not isinstance(model_type_raw, str):
-            raise ModelValidationError("model_type 必须是字符串")
-        model_type = model_type_raw.strip()
-        if model_type not in MODEL_TYPES:
-            raise ModelValidationError(
-                f"未知模型类型 {model_type!r}；可选: {', '.join(MODEL_TYPES)}"
-            )
-        model_payload = get_model(model_type)
-    if approach == "model_type" and model_type is None:
-        raise ModelValidationError("approach=model_type 时必须提供 model_type")
-
-    # 代码方案：code 必填；其他方案不允许带 code
-    code: str | None = None
-    raw_code = payload.get("code")
-    if approach == "code":
-        if not isinstance(raw_code, str) or not raw_code.strip():
-            raise ModelValidationError("approach=code 时必须提供非空的 code 源码字符串")
-        code = raw_code.strip()
-    elif raw_code not in (None, ""):
-        raise ModelValidationError(f"approach={approach} 时不应提供 code 字段")
-
-    # 权重：三种方案最后都要有一份合法的 10 因子权重
-    raw_weights = payload.get("weights")
-    if approach == "code":
-        if raw_weights is not None:
-            weights = _normalized_weights(raw_weights)
-        else:
-            weights = _resolve_base_weights(base_weights, model_payload)
-    elif approach == "model_type":
-        if raw_weights is not None:
-            weights = _normalized_weights(raw_weights)
-        else:
-            weights = dict(model_payload["weights"])
-    else:  # approach == "weights"
-        if raw_weights is None:
-            raise ModelValidationError("approach=weights 时必须提供 weights")
-        weights = _normalized_weights(raw_weights)
-
-    # 代码方案最后做静态检查 + 子进程冒烟（耗时，放在权重校验之后）
-    if code is not None:
-        validate_code(code)
-
-    return {
-        "approach": approach,
-        "summary": summary,
-        "model_type": None if approach == "code" else model_type,
-        "weights": weights,
-        "code": code,
-        "why": _optional_text(payload, "why"),
-        "expected_effect": _optional_text(payload, "expected_effect"),
-        "risks": _optional_risks(payload),
-    }
-
-
-def build_candidate_proposal(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
-    """调用 LLM 生成候选模型提案，并用 :func:`normalize_proposal` 校验。
-
-    Parameters
-    ----------
-    llm:
-        任何提供 ``chat_json(system, messages) -> dict`` 的客户端。
-    state:
-        至少包含 ``current_model`` / ``current_metrics`` / ``weights`` /
-        ``factor_stats`` / ``recent_metrics``。
-
-    Raises
-    ------
-    ModelValidationError
-        state 不合法、LLM 调用失败、返回内容无法解析或提案校验不通过；
-        错误信息包含原始返回片段。
-    """
-    state_payload = _validate_state(state)
-    base_weights = _state_base_weights(state_payload)
-
-    system_prompt = _build_system_prompt()
-    state_text = _truncate(
-        json.dumps(_json_safe(state_payload), ensure_ascii=False), MAX_STATE_CHARS
-    )
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                "当前模型与近期表现（JSON）：\n"
-                f"{state_text}\n\n"
-                "请基于以上状态输出一个改进方案 JSON。"
-            ),
-        }
-    ]
-
-    try:
-        raw = llm.chat_json(system_prompt, messages)
-    except Exception as exc:
-        raise ModelValidationError(
-            f"LLM 未能返回可解析的提案（{type(exc).__name__}）：{exc}"
-        ) from exc
-
-    if not isinstance(raw, Mapping):
-        raise ModelValidationError(
-            f"LLM 返回的提案不是 JSON 对象：{_snippet(raw)}"
-        )
-
-    original_raw = dict(raw)
-    attempts = 0
-    while True:
-        try:
-            proposal = normalize_proposal(dict(raw), base_weights=base_weights)
-            if attempts:
-                proposal["repair_attempts"] = attempts
-            return proposal
-        except ModelCodeError as exc:
-            error = exc
-        except ModelValidationError as exc:
-            error = exc
-        if attempts >= 2 or str(original_raw.get("approach", "")) != "code":
-            if isinstance(error, ModelCodeError):
-                raise ModelValidationError(
-                    f"AI 生成的模型代码未通过校验（自动修复 {attempts} 次）：{error}；"
-                    f"原始返回：{_snippet(original_raw)}"
-                ) from error
-            raise ModelValidationError(
-                f"AI 返回的提案未通过校验（自动修复 {attempts} 次）：{error}；"
-                f"原始返回：{_snippet(original_raw)}"
-            ) from error
-        attempts += 1
-        repair_request = {
-            "error": str(error),
-            "original_proposal": _json_safe(raw),
-            "user_request": state_payload.get("user_request", ""),
-            "current_model": state_payload.get("current_model", {}),
-            "current_metrics": state_payload.get("current_metrics", {}),
-        }
-        try:
-            repaired = llm.chat_json(
-                CODE_REPAIR_SYSTEM,
-                [{"role": "user", "content": json.dumps(repair_request, ensure_ascii=False)}],
-            )
-        except Exception as exc:
-            raise ModelValidationError(
-                f"AI 代码修复调用失败：{type(exc).__name__}：{exc}"
-            ) from exc
-        if isinstance(repaired, Mapping) and "proposal" in repaired:
-            repaired = repaired["proposal"]
-        if not isinstance(repaired, Mapping):
-            raise ModelValidationError("AI 代码修复返回的不是 JSON 对象")
-        raw = dict(repaired)
-
-
-# ---------------------------------------------------------------------------
-# 调参方案校验 / 生成（AI 只产出「引擎 + 搜索范围」，寻优回测在 service 层）
-# ---------------------------------------------------------------------------
 
 
 def _as_real(value: Any, field: str) -> float:
@@ -994,6 +644,14 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
     if state_payload.get("weights") is not None:
         base_weights = _normalized_weights(state_payload["weights"], "state.weights")
     current_model = state_payload.get("current_model")
+    directive = state_payload.get("directive")
+    if not isinstance(directive, Mapping):
+        directive = {}
+    required_engine = str(directive.get("engine") or "auto").strip().lower()
+    required_model_type = str(directive.get("model_type") or "").strip()
+    required_objective = str(directive.get("objective") or "").strip().lower()
+    escalate = bool(directive.get("escalate"))
+    previous_approach = str(directive.get("previous_approach") or "").strip()
 
     request_payload = {**_json_safe(state_payload), "tuning_request": True}
     state_text = json.dumps(request_payload, ensure_ascii=False)
@@ -1023,6 +681,37 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
                 base_weights=base_weights,
                 current_model=current_model,
             )
+            if required_engine in APPROACHES and plan["approach"] != required_engine:
+                raise ModelValidationError(
+                    f"执行指令要求 approach={required_engine}，"
+                    f"当前方案为 approach={plan['approach']}；请按指令重新输出"
+                )
+            if required_engine == "model_type" and required_model_type:
+                if plan.get("model_type") != required_model_type:
+                    raise ModelValidationError(
+                        f"执行指令要求 model_type={required_model_type}，"
+                        f"当前为 {plan.get('model_type')!r}；请按指令重新输出"
+                    )
+            if required_objective in ("sharpe", "cagr", "mdd"):
+                if plan["objective"] != required_objective:
+                    raise ModelValidationError(
+                        f"执行指令要求 objective={required_objective}，"
+                        f"当前为 {plan['objective']!r}；请按指令重新输出"
+                    )
+            if escalate:
+                if plan["approach"] == "weights":
+                    raise ModelValidationError(
+                        "执行指令要求结构性升级，禁止只调权重的 weights 方案；"
+                        "请按 previous_approach 规则改用 model_type 或 code"
+                    )
+                if previous_approach == "weights" and plan["approach"] != "model_type":
+                    raise ModelValidationError(
+                        "上一版是权重模型，继续优化时必须使用 model_type 更换基础引擎"
+                    )
+                if previous_approach in ("model_type", "code") and plan["approach"] != "code":
+                    raise ModelValidationError(
+                        "上一版是内置模型/代码引擎，继续优化时必须使用 code 重写打分引擎"
+                    )
             plan["repair_attempts"] = attempts
             return plan
         except ModelCodeError as exc:
@@ -1042,6 +731,7 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
             "user_request": state_payload.get("user_request", ""),
             "current_model": state_payload.get("current_model", {}),
             "current_metrics": state_payload.get("current_metrics", {}),
+            "directive": _json_safe(directive),
         }
         try:
             repaired = llm.chat_json(
@@ -1060,33 +750,3 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(repaired, Mapping):
             raise ModelValidationError("AI 调参方案修复返回的不是 JSON 对象")
         current_raw = dict(_unwrap_plan(repaired))
-
-
-def describe_model(model: Mapping[str, Any] | str) -> str:
-    """把模型转成一句给普通用户看的中文描述。"""
-    if isinstance(model, str):
-        model = get_model(model)
-    if not isinstance(model, Mapping):
-        raise ModelValidationError("model 必须是模型 dict 或模型 id 字符串")
-
-    name = str(model.get("name") or model.get("id") or "未命名模型").strip()
-    description = str(model.get("description") or "").strip()
-    text = f"{name}：{description}" if description else name
-
-    weights = model.get("weights")
-    highlights: list[tuple[float, str]] = []
-    if isinstance(weights, Mapping):
-        for factor, value in weights.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            amount = float(value)
-            if amount > 0:
-                highlights.append((amount, str(factor)))
-    if highlights:
-        highlights.sort(reverse=True)
-        top = "、".join(
-            f"{FACTOR_LABELS.get(factor, factor)} {amount * 100:.0f}%"
-            for amount, factor in highlights[:3]
-        )
-        text += f"（重点看：{top}）"
-    return text

@@ -146,8 +146,8 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(state["active_model"]["name"], "AI 生成模型")
         self.assertTrue(state["active_model"]["version_id"])
         self.assertTrue(state["versions"])
-        # 旧全局版本概念不再用于选股；会话状态是唯一来源
-        self.assertIsNone(self.service.store.active_version())
+        # 会话状态是唯一模型来源
+        self.assertTrue(self.service.store.session_active_version_id(self.sid))
         self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
         self.assertIn("已启用", text)
         self.assertIn("新建对话", text)
@@ -179,7 +179,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue((works[-1].get("code_change") or {}).get("diff"))
         self.assertTrue(_typed(events, "tuning"))
 
-        # 9) 没有 pending 时模型仍要求“同意启用”：不能报错，应自动重新分析并生成候选
+        # 9) 没有 pending 时模型仍要求“同意启用”：不报错、不误执行，交给 LLM 重新规划
         self.service._save_runtime(self.sid, pending=None)
         original_plan = self.service.agent.plan
         try:
@@ -191,9 +191,8 @@ class ChatFlowTest(unittest.TestCase):
         finally:
             self.service.agent.plan = original_plan
         self.assertFalse([data for event, data in events if event == "error"])
-        self.assertTrue(_typed(events, "work"))
-        self.assertIn("没有等待您确认", text)
-        self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
+        # 动作与状态不一致时，服务端把错误回传 LLM 重新规划，不会误用旧方案
+        self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
 
     # ------------------------------------------------------------------
     def test_code_preview_works_when_current_model_has_code(self) -> None:
@@ -376,25 +375,19 @@ class WeightTuningTest(unittest.TestCase):
         self.assertEqual(set(best), set(registry.FACTOR_NAMES))
         self.assertEqual(len(pending["tuning"]["space"]), 3)
 
-    def test_continue_optimize_is_forced_to_analyze(self) -> None:
-        """审批卡「继续优化」不能被误判为回滚/一般询问。"""
-        original_plan = self.service.agent.plan
-        self.service.agent.plan = lambda state, history, message: Plan(
-            reply="需要您确认：是否回滚到均衡多因子？",
-            actions=[{"name": "rollback_version", "args": {}}],
-        )
-        try:
-            events = list(self.service.chat_stream(
-                self.sid, "继续优化模型，上一版未达到我的预期"))
-        finally:
-            self.service.agent.plan = original_plan
+    def test_continue_optimize_is_structured_escalation(self) -> None:
+        """「继续优化」由 LLM 的 escalate=true 表达，服务端按上一版结构升级。"""
+        # 先产生一个 pending 方案
+        list(self.service.chat_stream(self.sid, "帮我优化一下模型"))
+        self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
+        events = list(self.service.chat_stream(
+            self.sid, "继续优化模型，上一版未达到我的预期"))
         self.assertFalse([data for event, data in events if event == "error"])
-        text = "".join(data.get("text", "") for event, data in events if event == "token")
-        self.assertNotIn("是否回滚", text)
         works = [data["block"] for event, data in events
                  if event == "ui" and data["block"]["type"] == "work"]
         self.assertTrue(works)
-        self.assertIn("升级优化策略", [step.get("title") for step in works[-1]["steps"]])
+        titles = [step.get("title") for step in works[-1]["steps"]]
+        self.assertIn("升级优化策略", titles)
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
 
     def test_code_model_uses_tuned_params_in_selection(self) -> None:
@@ -423,6 +416,104 @@ class WeightTuningTest(unittest.TestCase):
         model["params"] = {"tilt": 0.0}
         _weights, zero_transform = self.service._model_engine(model)
         self.assertEqual(list(zero_transform(frame, weights)), [0.0, 0.0])
+
+    def test_new_math_model_request_forces_code_engine(self) -> None:
+        """「更换数学模型」必须通过 tool 参数强制 AI 重写引擎，不能降级为调权重/换风格。"""
+        from backend.models import pipeline
+
+        param_code = (
+            "import pandas as pd\n\n"
+            "def build_transform(params=None):\n"
+            "    tilt = float((params or {}).get('tilt', 0.3))\n"
+            "    def transform(z, weights):\n"
+            "        score = pd.Series(0.0, index=z.index, dtype=float)\n"
+            "        for factor, weight in weights.items():\n"
+            "            column = 'z_' + factor\n"
+            "            if column in z.columns:\n"
+            "                values = pd.to_numeric(z[column], errors='coerce').fillna(0.0)\n"
+            "                score = score + float(weight) * values\n"
+            "        return score * tilt\n"
+            "    return transform\n"
+        )
+        captured: dict = {}
+        base = dict(registry.get_model("multi_factor")["weights"])
+        plan = {
+            "approach": "code",
+            "summary": "把打分方式换成一套新的参数化数学引擎",
+            "code": param_code,
+            "param_space": {"tilt": {"min": 0.0, "max": 0.8, "step": 0.2,
+                                     "type": "float", "default": 0.4}},
+            "weights": base,
+            "objective": "sharpe",
+            "max_trials": 8,
+            "why": "原引擎对回撤控制不足",
+            "expected_effect": "回撤有望下降",
+            "risks": ["历史回测不代表未来表现"],
+            "repair_attempts": 0,
+        }
+
+        def fake_plan(llm, state):
+            captured.update(state)
+            return dict(plan)
+
+        original = pipeline.build_tuning_plan
+        pipeline.build_tuning_plan = fake_plan
+        try:
+            events = list(self.service.chat_stream(self.sid, "更换数学模型"))
+        finally:
+            pipeline.build_tuning_plan = original
+        self.assertFalse([data for event, data in events if event == "error"])
+        self.assertEqual(captured["directive"]["engine"], "code")
+        works = [data["block"] for event, data in events
+                 if event == "ui" and data["block"]["type"] == "work"]
+        self.assertTrue(works)
+        self.assertEqual((works[-1].get("proposal") or {}).get("approach"),
+                         "服务端网格寻优（自定义引擎）")
+        self.assertEqual((works[-1].get("code_change") or {}).get("kind"), "code")
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertEqual((pending.get("model") or {}).get("kind"), "code")
+        # 审计：意图来源必须是 llm_tool，而不是关键词
+        audit = self.service.store.list_audit(limit=5)
+        analyze = [item for item in audit if item["action"] == "analyze_model"]
+        self.assertTrue(analyze)
+        self.assertEqual(analyze[0]["payload"]["tool_args"]["engine"], "code")
+        self.assertEqual(analyze[0]["payload"]["directive"]["engine"], "code")
+
+    def test_objective_from_tool_args(self) -> None:
+        """目标指标由 tool args 传入，服务端不再从用户原话 regex 猜测。"""
+        from backend.models import pipeline
+
+        captured: dict = {}
+        base = dict(registry.get_model("multi_factor")["weights"])
+
+        def fake_plan(llm, state):
+            captured.update(state)
+            return {
+                "approach": "weights",
+                "summary": "围绕低波因子做范围寻优",
+                "search_space": {
+                    "volatility_60": {"min": 0.04, "max": 0.2, "step": 0.04},
+                    "ep": {"min": 0.04, "max": 0.2, "step": 0.04},
+                    "roe": {"min": 0.04, "max": 0.2, "step": 0.04},
+                },
+                "weights": base,
+                "objective": "mdd",
+                "max_trials": 8,
+                "why": "控制回撤",
+                "risks": [],
+                "repair_attempts": 0,
+            }
+
+        original = pipeline.build_tuning_plan
+        pipeline.build_tuning_plan = fake_plan
+        try:
+            events = list(self.service.chat_stream(self.sid, "优化模型，回撤再小一点"))
+        finally:
+            pipeline.build_tuning_plan = original
+        self.assertFalse([data for event, data in events if event == "error"])
+        self.assertEqual(captured["directive"]["objective"], "mdd")
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertEqual(pending["tuning"]["objective"], "mdd")
 
     def test_plan_contains_no_ai_chosen_weights(self) -> None:
         """AI 方案只暴露范围（weights 仅作为基线），最终权重由服务端写回。"""

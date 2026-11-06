@@ -7,6 +7,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Iterator, Protocol
 
 from .config import LLM_BASE_URL, LLM_MODEL
@@ -16,10 +17,33 @@ class LLMError(RuntimeError):
     """模型调用或输出解析失败。"""
 
 
+@dataclass
+class ToolCall:
+    """LLM 发起的一次工具调用（OpenAI function calling 协议）。"""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    raw_arguments: str = ""
+
+
+@dataclass
+class ToolChatResult:
+    """带工具调用的一次 chat 响应。"""
+
+    content: str
+    tool_calls: list[ToolCall]
+    message: dict[str, Any]
+
+
 class LLMClient(Protocol):
     def chat_json(self, system: str, messages: list[dict[str, str]]) -> dict[str, Any]: ...
 
     def chat_text(self, system: str, messages: list[dict[str, str]]) -> str: ...
+
+    def chat_tools(self, system: str, messages: list[dict[str, Any]],
+                   tools: list[dict[str, Any]],
+                   tool_choice: str = "auto") -> ToolChatResult: ...
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -102,6 +126,54 @@ class OpenAICompatClient:
             raise LLMError("模型返回空文本")
         return text
 
+    def chat_tools(self, system: str, messages: list[dict[str, Any]],
+                   tools: list[dict[str, Any]],
+                   tool_choice: str = "auto") -> ToolChatResult:
+        """OpenAI 兼容的 function calling：模型主动调用工具并返回参数。"""
+        if not tools:
+            raise LLMError("chat_tools 至少需要一个工具定义")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "temperature": 0.2,
+        }
+        message = self._post(payload)
+        content = str(message.get("content") or "").strip()
+        calls: list[ToolCall] = []
+        for index, item in enumerate(message.get("tool_calls") or []):
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") or {}
+            name = str(function.get("name") or "").strip()
+            raw = function.get("arguments")
+            if isinstance(raw, str):
+                raw_text = raw
+                try:
+                    arguments = json.loads(raw) if raw.strip() else {}
+                except json.JSONDecodeError as exc:
+                    raise LLMError(
+                        f"工具 {name or '<unknown>'} 参数不是合法 JSON：{raw[:200]}"
+                    ) from exc
+            elif isinstance(raw, dict):
+                arguments = raw
+                raw_text = json.dumps(raw, ensure_ascii=False)
+            else:
+                arguments = {}
+                raw_text = ""
+            if not isinstance(arguments, dict):
+                raise LLMError(f"工具 {name or '<unknown>'} 参数必须是 JSON 对象")
+            calls.append(ToolCall(
+                id=str(item.get("id") or f"call_{index + 1}"),
+                name=name,
+                arguments=arguments,
+                raw_arguments=raw_text,
+            ))
+        if not content and not calls:
+            raise LLMError("模型既没有返回文本，也没有调用工具")
+        return ToolChatResult(content=content, tool_calls=calls, message=message)
+
 
 class FakeLLM:
     """确定性模型：驱动无 Key 的自动化测试与现场演示。
@@ -123,11 +195,6 @@ class FakeLLM:
                 payload = {}
         if payload.get("tuning_request"):
             return self._tuning_plan(payload)
-        if "proposal_request" in payload:
-            request = payload["proposal_request"]
-            return self._proposal(request if isinstance(request, dict) else payload)
-        if "current_model" in payload and "factor_stats" in payload:
-            return self._proposal(payload)
         if "facts" in payload:
             return {"text": self._explain(payload["facts"], payload.get("question", ""))}
         return self._plan(payload)
@@ -138,6 +205,45 @@ class FakeLLM:
         if "facts" in payload:
             return self._explain(payload["facts"], payload.get("question", ""))
         return str(payload.get("text", "我在，有什么可以帮你？"))
+
+    def chat_tools(self, system: str, messages: list[dict[str, Any]],
+                   tools: list[dict[str, Any]],
+                   tool_choice: str = "auto") -> ToolChatResult:
+        """确定性测试替身：把 ``_plan`` 的规则结果包装成原生 tool_calls。
+
+        注意：这里的意图映射规则只服务于无 Key 的自动化测试/结构演示；
+        真实语义判断由真实 LLM 的 tool_calls 参数完成（见 action_schema）。
+        """
+        payload = {}
+        for message in reversed(messages):
+            if str(message.get("role")) != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                parsed = self._parse(content)
+                if parsed:
+                    payload = parsed
+                    break
+        plan = self._plan(payload)
+        reply = str(plan.get("reply") or "")
+        delta = plan.get("profile_delta") if isinstance(plan.get("profile_delta"), dict) else {}
+        content = json.dumps({"reply": reply, "profile_delta": delta}, ensure_ascii=False)
+        calls: list[ToolCall] = []
+        wire_calls: list[dict[str, Any]] = []
+        for index, action in enumerate(plan.get("actions") or []):
+            if not isinstance(action, dict):
+                continue
+            name = str(action.get("name") or "").strip()
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            call_id = f"call_{index + 1}"
+            raw = json.dumps(args, ensure_ascii=False)
+            calls.append(ToolCall(id=call_id, name=name, arguments=args, raw_arguments=raw))
+            wire_calls.append({"id": call_id, "type": "function",
+                               "function": {"name": name, "arguments": raw}})
+        message = {"role": "assistant", "content": content}
+        if wire_calls:
+            message["tool_calls"] = wire_calls
+        return ToolChatResult(content=content, tool_calls=calls, message=message)
 
     # ------------------------------------------------------------------
     # 工具
@@ -221,8 +327,50 @@ class FakeLLM:
         return any(mark in text for mark in ("为什么", "风险", "怎么看", "如何", "怎么", "?", "？", "吗"))
 
     # ------------------------------------------------------------------
-    # Planner
+    # Planner（测试替身）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _analyze_intent(message: str) -> dict[str, Any]:
+        """FakeLLM 的确定性意图映射（仅测试/无 Key 结构演示）。"""
+        text = str(message or "")
+        lower = text.lower()
+        args: dict[str, Any] = {"engine": "auto", "model_type": "",
+                                "objective": "", "escalate": False, "reason": "fake-llm"}
+        if any(word in text for word in (
+                "继续优化", "未达到我的预期", "未达预期", "再试一版", "继续调",
+                "换个方向", "更激进")):
+            args.update({"engine": "auto", "escalate": True})
+            return args
+        if any(word in text for word in (
+                "数学模型", "数学建模", "打分模型", "打分引擎", "投资模型", "选股模型",
+                "模型公式", "新的模型", "新模型", "自建模型", "自己建模",
+                "构建模型", "新建模型", "创建模型", "设计模型", "搭建模型",
+                "写一个模型", "写个模型", "换一套模型", "更换模型", "换模型",
+                "重写模型", "重写打分")):
+            args.update({"engine": "code"})
+        elif any(word in lower for word in (
+                "svm", "支持向量机", "随机森林", "randomforest", "xgboost",
+                "lightgbm", "梯度提升", "gbdt", "神经网络", "机器学习",
+                "sklearn", "kmeans", "聚类", "pca", "降维", "lasso", "ridge")):
+            args.update({"engine": "code"})
+        else:
+            aliases = {
+                "multi_factor": ("均衡多因子", "均衡配置"),
+                "low_vol_quality": ("低波质量", "低波稳健"),
+                "momentum_growth": ("趋势成长", "动量成长"),
+                "value_dividend": ("价值红利", "红利策略"),
+                "contrarian": ("反转策略", "反转模型", "反转"),
+            }
+            for model_id, words in aliases.items():
+                if any(word in text for word in words):
+                    args.update({"engine": "model_type", "model_type": model_id})
+                    break
+        if any(word in text for word in ("收益", "回报", "赚钱", "涨幅")):
+            args["objective"] = "cagr"
+        elif any(word in text for word in ("回撤", "风险", "波动")):
+            args["objective"] = "mdd"
+        return args
+
     def _plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         state = payload.get("state") or {}
         message = str(payload.get("user_message", ""))
@@ -234,6 +382,7 @@ class FakeLLM:
         complete = all(slots.get(key) for key in ("goal", "horizon", "drawdown_tolerance", "loss_reaction"))
         pending = state.get("pending")
         pending_intent = state.get("pending_intent")
+        analyze_intent = self._analyze_intent(message)
         actions: list[dict[str, Any]] = []
 
         if pending_intent and not self._is_question(message):
@@ -246,8 +395,10 @@ class FakeLLM:
         elif pending and self._agree(message):
             actions = [{"name": "apply_pending_change", "args": {}}]
             reply = "收到。我将应用该改进方案并切换模型版本，随后给出对比结果。"
-        elif self._wants_optimize(message) and profile.get("confirmed"):
-            actions = [{"name": "analyze_model", "args": {}}]
+        elif (self._wants_optimize(message)
+              or analyze_intent["engine"] != "auto"
+              or analyze_intent["escalate"]) and profile.get("confirmed"):
+            actions = [{"name": "analyze_model", "args": analyze_intent}]
             reply = ("我会先评估当前模型的表现与不足，再给出可验证的改进方案；"
                      "分析与回测过程会逐步展示，未经你确认不会启用。")
         elif self._confirm(message) and complete and not profile.get("confirmed"):
@@ -276,49 +427,62 @@ class FakeLLM:
         return plan
 
     # ------------------------------------------------------------------
-    # 建模提案
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _proposal(request: dict[str, Any]) -> dict[str, Any]:
-        base = dict(request.get("weights") or {})
-        weights = {name: float(base.get(name, 0.1)) for name in (
-            "ep", "bp", "roe", "ocf_to_profit", "revenue_growth",
-            "momentum_60", "reversal_5", "volatility_60", "liquidity_20", "size")}
-        total = sum(weights.values()) or 1.0
-        weights = {name: round(value / total, 4) for name, value in weights.items()}
-        code = (
-            "import numpy as np\n"
-            "import pandas as pd\n"
-            "\n"
-            "def build_transform():\n"
-            "    def transform(z, weights):\n"
-            "        score = pd.Series(0.0, index=z.index, dtype=float)\n"
-            "        for factor, weight in weights.items():\n"
-            "            column = 'z_' + factor\n"
-            "            if column in z.columns:\n"
-            "                values = pd.to_numeric(z[column], errors='coerce').fillna(0.0)\n"
-            "                score = score + float(weight) * values\n"
-            "        # 让低波动和短期反转多拿一点分，降低组合大起大落\n"
-            "        score = score + 0.12 * pd.to_numeric(z['z_volatility_60'], errors='coerce').fillna(0.0)\n"
-            "        score = score + 0.08 * pd.to_numeric(z['z_reversal_5'], errors='coerce').fillna(0.0)\n"
-            "        return score\n"
-            "    return transform\n"
-        )
-        return {
-            "approach": "code",
-            "summary": "把打分逻辑往「低波动 + 短期反转」多偏一点，让组合更稳、回撤更小。",
-            "weights": weights,
-            "code": code,
-            "why": "回测显示当前组合波动偏大，低波动和反转因子最近贡献更稳定。",
-            "expected_effect": "波动和最大回撤有望下降，收益略降但持有体验更好。",
-            "risks": ["低波动策略在快速上涨行情里可能跑输", "这是历史回测，不代表未来"],
-        }
-
-    # ------------------------------------------------------------------
     # 调参方案（AI 只给引擎 + 搜索范围，具体参数由服务端网格寻优）
     # ------------------------------------------------------------------
     @staticmethod
     def _tuning_plan(request: dict[str, Any]) -> dict[str, Any]:
+        from .models import registry
+
+        directive = request.get("directive") if isinstance(request.get("directive"), dict) else {}
+        engine = str(directive.get("engine") or "auto").strip().lower()
+        objective = str(directive.get("objective") or "sharpe").strip().lower()
+        if objective not in ("sharpe", "cagr", "mdd"):
+            objective = "sharpe"
+        max_trials = 12
+
+        def _space(weights: dict[str, float]) -> dict[str, dict[str, float]]:
+            top = sorted(weights.items(), key=lambda pair: pair[1], reverse=True)[:5]
+            space: dict[str, dict[str, float]] = {}
+            for name, weight in top:
+                low = max(0.0, round(float(weight) - 0.08, 2))
+                high = min(0.4, round(float(weight) + 0.08, 2))
+                if high - low < 0.04:
+                    high = min(0.4, round(low + 0.04, 2))
+                space[name] = {"min": low, "max": high, "step": 0.04}
+            return space
+
+        if engine == "model_type":
+            model_id = str(directive.get("model_type") or "").strip()
+            if model_id not in registry.MODEL_TYPES:
+                model_id = "low_vol_quality"
+            info = registry.get_model(model_id)
+            return {
+                "approach": "model_type",
+                "model_type": model_id,
+                "summary": f"按指令切换到{info.get('name')}，并在该风格权重附近做小范围寻优。",
+                "why": "客户明确点名该基础模型，服务端将围绕其风格权重验证更优组合。",
+                "expected_effect": "风格与客户要求一致，回撤/收益以本次寻优回测为准。",
+                "risks": ["切换风格后短期表现可能差异较大", "历史回测不代表未来表现"],
+                "weights": dict(info["weights"]),
+                "search_space": _space(dict(info["weights"])),
+                "objective": objective,
+                "max_trials": max_trials,
+            }
+
+        if engine == "weights":
+            base = dict(request.get("weights") or registry.get_model("multi_factor")["weights"])
+            return {
+                "approach": "weights",
+                "summary": "保留现有打分框架，在 AI 给定的因子权重范围内由服务端寻优。",
+                "why": "当前模型表现需要改善，先在不改变引擎结构的前提下搜索更优权重。",
+                "expected_effect": "目标指标有望改善，具体以寻优回测为准。",
+                "risks": ["历史回测不代表未来表现"],
+                "weights": base,
+                "search_space": _space(base),
+                "objective": objective,
+                "max_trials": max_trials,
+            }
+
         code = (
             "import numpy as np\n"
             "import pandas as pd\n"
@@ -355,8 +519,8 @@ class FakeLLM:
                     "default": 0.5,
                 }
             },
-            "objective": "sharpe",
-            "max_trials": 12,
+            "objective": objective,
+            "max_trials": max_trials,
         }
 
     # ------------------------------------------------------------------

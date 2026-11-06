@@ -10,17 +10,9 @@ import json
 import re
 from typing import Any, Iterator
 
-from .llm import LLMClient, LLMError
+from .chat.action_schema import TOOL_DEFINITIONS, ToolArgsError, validate_tool_call
+from .llm import LLMClient, LLMError, ToolChatResult, extract_json
 from .schemas import Plan, SLOT_DEFS
-
-ACTION_NAMES = {
-    "confirm_profile",
-    "run_selection",
-    "explain_results",
-    "analyze_model",
-    "apply_pending_change",
-    "rollback_version",
-}
 
 BANNED_WORDS = ("稳赚", "必涨", "保证收益", "推荐买入", "满仓干", "包赚", "翻倍牛股")
 
@@ -92,11 +84,11 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 当必填槽位齐全、只差客户确认时，不再追问任何必填项；可选信息可在确认后继续了解。
 
 ## 澄清与执行必须分离（硬性规则）
-- 如果需要客户补充信息或做选择（例如优化方向、风险偏好、资金安排），本轮只提问，actions 必须为空。
-- 客户回答后的下一轮再执行动作；不得在提出问题的同一轮执行任何动作。
-- 执行动作时不要再向客户提问。
+- 如果需要客户补充信息或做选择（例如优化方向、风险偏好、资金安排），本轮只提问，不调用任何工具。
+- 客户回答后的下一轮再执行工具；不得在提出问题的同一轮调用工具。
+- 调用工具时不要再向客户提问。
 - 同一待执行动作最多澄清一次；客户已回答后必须执行，不得再次提问。
-- 若 state.pending_intent 非空且客户本轮已回答澄清问题，执行该动作。
+- 若 state.pending_intent 非空且客户本轮已回答澄清问题，调用对应工具。
 
 ## 确认协议
 凡需要客户决定，必须使用明确、可回复的句式，禁止用“要不要”“可以吗”这类模糊问法：
@@ -105,21 +97,43 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - 动作未执行前不得声称已完成。
 - 同一轮只能提出一个需要客户回答的问题：如果本轮在询问优化方向/其他信息，不得再附加“是否启用上一版方案”的确认；如果认为候选不宜启用，不要把“继续优化”的提问和“是否启用”的确认放在同一段。
 
-## 可执行动作（actions 数组；不需要动作时输出空数组）
-- confirm_profile：客户本轮明确同意画像时使用（“可以/确认/没问题/就按这个来”），且必填齐全。
-- run_selection：画像确认后开始选股；客户说“开始/帮我选股/可以”时与 confirm_profile 一同输出。
-- explain_results：最近有选股结果、客户在问“为什么/风险/怎么看”时使用。
-- analyze_model：客户明确要求优化模型/效果不好/想调参/点名切换模型（如随机森林、SVM、低波质量）时使用；系统会分析并给出候选方案，不会直接启用。客户泛泛说“帮我优化一下模型/模型效果不太好/调调参”而没有指定方向时，直接执行 analyze_model，不要追问“优先收益还是回撤”这类选择题；系统会默认以夏普为目标、并自动用画像里的回撤上限做约束。只有客户主动要求你给方案选项时才追问。客户点名模型中已有选项时不得以“没有对应选项”为由拒绝，服务端会优先按客户点名的模型生成方案。
-- apply_pending_change：存在待审批方案（state.pending 非空）且客户本轮明确同意时使用。
-- rollback_version：客户明确要求回滚时使用。
+## 工具调用规则
+- 动作只能通过 tools 里的函数调用表达，**不要**在 content 的 JSON 里写 actions。
+- 工具参数由 schema 约束；`analyze_model` 必须明确 engine/model_type/objective/escalate，服务端不会再从文字里猜你的意图。
+- 客户要求构建/更换新的投资数学模型、打分模型、引擎、公式 → engine="code"；点名内置模型 → engine="model_type" 并填 model_type；点名 SVM/随机森林等清单外模型 → engine="code"。
+- 客户说继续优化/上一版未达预期 → escalate=true；普通优化 → engine="auto"。
+- 客户本轮明确同意画像时调用 confirm_profile；开始选股调用 run_selection；追问结果调用 explain_results；明确同意启用方案调用 apply_pending_change；明确要求回滚调用 rollback_version。
+
+## 工具调用示例（必须模仿；参数只写关键字段）
+- “更换数学模型” → analyze_model(engine="code")
+- “构建一个新的投资数学模型” → analyze_model(engine="code")
+- “帮我写一个新的打分引擎” → analyze_model(engine="code")
+- “换成低波质量” → analyze_model(engine="model_type", model_type="low_vol_quality")
+- “用随机森林” → analyze_model(engine="code")
+- “继续优化，上一版没达到预期” → analyze_model(engine="auto", escalate=true)
+- “帮我优化一下模型” → analyze_model(engine="auto")（直接调用，不要先反问方向）
+- “可以，就按这个来”（画像已齐全、待确认）→ 同一轮依次调用 confirm_profile、run_selection
+- “帮我选股” → run_selection
+
+## 硬性要求（违反视为不合格）
+- 只要客户本轮是在要求执行动作（优化/换模型/构建模型/继续优化/选股/确认画像/启用方案/回滚），就**必须调用对应工具**；只在 content 里说“我来优化/我来设计/已切换/已启用”而不调用工具，视为未执行，服务端不会替你执行。
+- “数学模型/打分模型/数学引擎/模型公式/打分引擎”指的是**底层打分公式或代码引擎**，不是内置模型清单；客户说“更换数学模型/构建数学模型”时，必须 analyze_model(engine="code") 并立即调用，禁止反问“想换成哪种模型/想换成什么风格”，禁止罗列内置模型选项。
+- 工具调用后的 content 必须与工具一致：直接说“已收到，正在执行/已安排”并说明会展示进度与风险；**不得**在 content 里说“没有权限/不能写代码/暂未找到/没有该模型”，不得列出备选方案或反问。
+- 不要说“没有权限创建/修改打分引擎”。AI 的职责就是设计/重写引擎；工具 analyze_model(engine="code") 就是执行入口。
+- 需要客户补充信息才可澄清；客户只是问概念/寒暄时不要调用工具。
+- 客户说“继续优化/上一版未达到预期/再试一版”时，必须直接调用 analyze_model(engine="auto", escalate=true)，**不得**反问“哪里不满意/先确认方向/想优化哪方面”；服务端会按上一版结构做升级。
+- 客户本轮明确同意画像（“可以/确认/没问题/就按这个来”）且画像已齐全时，必须同时调用 confirm_profile 与 run_selection（按该画像当场给出选股结果）。
+- 客户说“回滚到上一个版本/恢复上一版模型”时，必须直接调用 rollback_version，**不得**反问确认；当前会话有可回滚版本时服务端会执行，没有可回滚版本时会返回错误并由你说明。
+- content 只输出干净中文：不要 Markdown 标题、加粗、列表符号；不超过 180 字。
 
 ## 合规红线
 - 不荐股、不预测涨跌、不承诺收益；禁用“稳赚、必涨、保证收益、推荐买入、满仓”等表述。
 - 说明历史回测的局限性；涉及风险时使用规范表述：“历史业绩不代表未来表现，市场有风险，投资需谨慎。”
 
-## 输出格式（只输出 JSON，不要代码块或多余文字）
-{{"reply": "给客户看的回复，≤180字，专业克制", "actions": [{{"name": "动作名", "args": {{}}}}], "profile_delta": {{"槽位key": "客户本轮新提供的事实"}}}}
-profile_delta 只放客户本轮新说出的事实，不要编造；没有就给空对象。"""
+## 输出格式（content 只输出 JSON，不要代码块或多余文字）
+{{"reply": "给客户看的回复，≤180字，专业克制", "profile_delta": {{"槽位key": "客户本轮新提供的事实"}}}}
+profile_delta 只放客户本轮新说出的事实，不要编造；没有就给空对象。
+需要动作时调用工具；不需要动作时不要调用工具。"""
 
 EXPLAIN_SYSTEM = """你是一名金融机构的投资研究服务人员。请依据给定事实，用规范、克制的中文回答客户问题：
 1. 结构：先给结论，再列 1~2 条依据（必须引用事实中的数字），最后做风险提示。
@@ -272,7 +286,7 @@ def confirmation_hint(state: dict[str, Any], plan: Plan) -> str:
     profile = state.get("profile") or {}
     if profile.get("complete") and not profile.get("confirmed"):
         return CONFIRM_PROFILE_HINT
-        return ""
+    return ""
 
 
 def attach_confirmation(reply: str, hint: str) -> str:
@@ -286,6 +300,194 @@ def attach_confirmation(reply: str, hint: str) -> str:
 class Agent:
     def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
+
+    # ------------------------------------------------------------------
+    # Planner（原生 function calling）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _payload(state: dict[str, Any], history: list[dict[str, Any]],
+                 message: str, action_errors: list[str] | None = None) -> str:
+        last_question = _last_assistant_text(history)
+        data: dict[str, Any] = {
+            "state": state,
+            "user_message": message,
+            "recent_history": history[-8:],
+            "last_assistant_question": last_question,
+            "awaiting_slot": infer_pending_slot(state, history),
+        }
+        if action_errors:
+            data["previous_action_errors"] = list(action_errors)
+        return json.dumps(data, ensure_ascii=False)
+
+    @staticmethod
+    def _actions_from_result(result: ToolChatResult) -> tuple[list[dict[str, Any]], list[str]]:
+        actions: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for call in result.tool_calls:
+            try:
+                args = validate_tool_call(call.name, call.arguments)
+            except ToolArgsError as exc:
+                errors.append(str(exc))
+                continue
+            actions.append({"name": call.name, "args": args})
+        return actions, errors
+
+    @staticmethod
+    def _repair_messages(user_content: str, result: ToolChatResult,
+                         errors: list[str]) -> list[dict[str, Any]]:
+        message = result.message if isinstance(result.message, dict) else {}
+        assistant = {
+            "role": "assistant",
+            "content": str(message.get("content") or ""),
+            "tool_calls": message.get("tool_calls") or [],
+        }
+        tool_messages = [
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": "参数校验失败；请修正该工具参数后重新调用。",
+            }
+            for call in result.tool_calls
+        ]
+        correction = (
+            "上一次工具调用参数未通过校验：\n- " + "\n- ".join(errors)
+            + "\n请重新调用正确的工具并修正参数；不要解释，不要在 content 里输出动作。"
+        )
+        return [
+            {"role": "user", "content": user_content},
+            assistant,
+            *tool_messages,
+            {"role": "user", "content": correction},
+        ]
+
+    @staticmethod
+    def _clean_reply(text: str) -> str:
+        value = str(text or "").strip()
+        value = value.replace("**", "").replace("__", "")
+        value = re.sub(r"^#{1,6}\s*", "", value, flags=re.MULTILINE)
+        value = re.sub(r"^\s*[-*]\s+", "", value, flags=re.MULTILINE)
+        value = re.sub(r"\n{3,}", "\n\n", value).strip()
+        if len(value) > 180:
+            value = value[:179].rstrip() + "…"
+        return value
+
+    def _content_reply(self, result: ToolChatResult, state: dict[str, Any],
+                       user_content: str, action_count: int) -> tuple[str, dict[str, Any]]:
+        content = str(result.content or "").strip()
+        reply = ""
+        delta: dict[str, Any] = {}
+        if content:
+            try:
+                data = extract_json(content)
+            except LLMError:
+                reply = content
+            else:
+                reply = str(data.get("reply") or "").strip()
+                raw_delta = data.get("profile_delta")
+                if isinstance(raw_delta, dict):
+                    delta = raw_delta
+        if reply:
+            return self._clean_reply(reply), delta
+        if action_count:
+            reply = self._generate_short_reply(state, user_content)
+            return reply, delta
+        return "", delta
+
+    def _generate_short_reply(self, state: dict[str, Any], user_content: str) -> str:
+        """模型只给了 tool_calls 没给内容（或文案自相矛盾）时，生成一句执行确认。"""
+        payload = json.dumps({"state": state, "user_message": user_content}, ensure_ascii=False)
+        try:
+            text = str(self.llm.chat_text(
+                "你是持牌投资顾问。客户刚提出一个需要执行的动作，而你已经在系统中发起执行。"
+                "请用一句专业、克制的中文确认已收到并正在执行，说明过程与结果会逐步展示、"
+                "重要变更需客户确认；不要否认能力，不要罗列选项，不要反问，不要提系统权限。",
+                [{"role": "user", "content": payload}]) or "").strip()
+            if text:
+                return ensure_compliance(text)[:180]
+        except (LLMError, AgentError):
+            pass
+        return "已收到，正在按您的要求执行，过程与结果会逐步展示；重要变更需您确认后才会生效。"
+
+    @staticmethod
+    def _has_capability_denial(text: str) -> bool:
+        markers = (
+            "不能写", "不能编写", "无法编写", "不能直接帮您编写", "没有权限",
+            "暂未找到", "暂未内置", "没有该模型", "无法创建", "无法修改",
+            "不能创建", "不能修改", "无法帮您编写",
+        )
+        return any(marker in str(text or "") for marker in markers)
+
+    def _plan_payload(self, user_content: str, state: dict[str, Any],
+                      history: list[dict[str, Any]], message: str) -> Plan:
+        try:
+            result = self.llm.chat_tools(
+                PLANNER_SYSTEM,
+                [{"role": "user", "content": user_content}],
+                TOOL_DEFINITIONS,
+            )
+        except LLMError as exc:
+            raise AgentError(f"AI 暂时无法理解这句话：{exc}") from exc
+
+        # 复核：模型只给了文字、没调用任何工具时，让它自己再判断一次是否应执行动作。
+        # 这是 LLM 的语义复核，不是服务端关键词判断。
+        if not result.tool_calls:
+            review_messages = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": result.content},
+                {
+                    "role": "user",
+                    "content": (
+                        "请复核上一轮：如果客户本轮是在要求执行动作（优化/更换或构建模型/"
+                        "选股/确认画像/启用方案/回滚），必须立即调用对应工具，不要只在文字里答应；"
+                        "如果客户只是提问、回答信息或寒暄，则不要调用工具。不要修改 reply 文案。"
+                    ),
+                },
+            ]
+            try:
+                reviewed = self.llm.chat_tools(PLANNER_SYSTEM, review_messages, TOOL_DEFINITIONS)
+            except LLMError:
+                reviewed = None
+            if reviewed is not None and reviewed.tool_calls:
+                # 复核轮只用于补工具调用；如果它没给出合法 reply JSON，沿用第一轮文案。
+                try:
+                    parsed = extract_json(str(reviewed.content or ""))
+                except LLMError:
+                    parsed = {}
+                if not str(parsed.get("reply") or "").strip():
+                    reviewed.content = result.content
+                result = reviewed
+
+        actions, errors = self._actions_from_result(result)
+        if errors:
+            if not result.tool_calls:
+                raise AgentError("AI 工具调用缺少参数：" + "；".join(errors))
+            repair_messages = self._repair_messages(user_content, result, errors)
+            try:
+                repaired = self.llm.chat_tools(PLANNER_SYSTEM, repair_messages, TOOL_DEFINITIONS)
+            except LLMError as exc:
+                raise AgentError(f"AI 工具参数修复失败：{exc}") from exc
+            actions, errors = self._actions_from_result(repaired)
+            if errors:
+                raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
+            result = repaired
+
+        reply, delta = self._content_reply(result, state, user_content, len(actions))
+        if not reply:
+            raise AgentError("AI 没有给出回复内容")
+        if actions and self._has_capability_denial(reply):
+            # 工具已经发起执行，文案却否认能力/说没有该模型：换成一致的专业确认。
+            reply = self._generate_short_reply(state, user_content)
+        ensure_compliance(reply)
+        if not actions and is_explanation_question(message) and has_mechanical_style(reply):
+            reply = self._regenerate_explanation(reply, state, history, message)
+
+        plan = Plan(reply=reply, actions=actions, profile_delta=delta)
+        # 澄清与执行分离：提问时本轮不调用工具；记录待执行意图，客户回答后再执行
+        if plan.actions and asks_clarifying_question(plan.reply):
+            plan.deferred_intent = plan.actions[0]["name"]
+            plan.actions = []
+        plan.reply = attach_confirmation(plan.reply, confirmation_hint(state, plan))
+        return plan
 
     def _regenerate_explanation(self, draft: str, state: dict[str, Any],
                                 history: list[dict[str, str]], message: str) -> str:
@@ -313,35 +515,14 @@ class Agent:
     # ------------------------------------------------------------------
     def plan(self, state: dict[str, Any], history: list[dict[str, str]],
              message: str) -> Plan:
-        last_question = _last_assistant_text(history)
-        payload = json.dumps(
-            {"state": state, "user_message": message, "recent_history": history[-8:],
-             "last_assistant_question": last_question,
-             "awaiting_slot": infer_pending_slot(state, history)},
-            ensure_ascii=False)
-        try:
-            raw = self.llm.chat_json(
-                PLANNER_SYSTEM, [{"role": "user", "content": payload}])
-        except LLMError as exc:
-            raise AgentError(f"AI 暂时无法理解这句话：{exc}") from exc
-        reply = str(raw.get("reply", "")).strip()
-        if not reply:
-            reply = "在继续之前，需要向您确认当前的投资目标与资金安排，以便为您做适当性匹配。"
-        ensure_compliance(reply)
-        actions = self._parse_actions(raw.get("actions"))
-        if not actions and is_explanation_question(message) and has_mechanical_style(reply):
-            reply = self._regenerate_explanation(reply, state, history, message)
-        delta = raw.get("profile_delta")
-        if not isinstance(delta, dict):
-            delta = {}
+        user_content = self._payload(state, history, message)
+        return self._plan_payload(user_content, state, history, message)
 
-        plan = Plan(reply=reply, actions=actions, profile_delta=delta)
-        # 澄清与执行分离：提问时本轮不执行动作；记录待执行意图，客户回答后再执行
-        if plan.actions and asks_clarifying_question(plan.reply):
-            plan.deferred_intent = plan.actions[0]["name"]
-            plan.actions = []
-        plan.reply = attach_confirmation(plan.reply, confirmation_hint(state, plan))
-        return plan
+    def replan(self, state: dict[str, Any], history: list[dict[str, str]],
+               message: str, action_errors: list[str]) -> Plan:
+        """动作执行前的状态校验失败时，让 LLM 依据错误信息重新调用工具。"""
+        user_content = self._payload(state, history, message, action_errors)
+        return self._plan_payload(user_content, state, history, message)
 
     # ------------------------------------------------------------------
     def explain(self, facts: dict[str, Any], question: str = "") -> str:
@@ -351,22 +532,6 @@ class Agent:
         except LLMError as exc:
             raise AgentError(f"解读生成失败：{exc}") from exc
         return ensure_compliance(text)
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _parse_actions(raw: Any) -> list[dict[str, Any]]:
-        if not isinstance(raw, list):
-            return []
-        actions: list[dict[str, Any]] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            if name not in ACTION_NAMES:
-                continue
-            args = item.get("args") if isinstance(item.get("args"), dict) else {}
-            actions.append({"name": name, "args": args})
-        return actions
 
 
 def safe_question(text: str) -> str:

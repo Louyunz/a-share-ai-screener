@@ -62,23 +62,37 @@ class StoreTest(unittest.TestCase):
         self.assertNotIn("pending", state)
         self.assertIn("last_selection", state)
 
-    def test_versions_activate_rollback_and_parent(self) -> None:
+    def test_session_active_version_is_single_source(self) -> None:
+        sid = self.store.create_session()
+        other = self.store.create_session()
+        self.assertIsNone(self.store.session_active_version_id(sid))
         base = self.store.create_version(
             {"kind": "builtin", "model_id": "multi_factor", "name": "均衡多因子",
-             "weights": {"ep": 1.0}}, {"sharpe": 1.0}, status="active", parent_id=None)
+             "weights": {"ep": 1.0}}, {"sharpe": 1.0},
+            status="baseline", parent_id=None, session_id=sid)
         candidate = self.store.create_version(
             {"kind": "code", "model_id": "ai_generated", "name": "AI 生成模型",
              "weights": {"ep": 0.5, "bp": 0.5}, "code": "def build_transform():\n    pass\n"},
-            {"sharpe": 1.2}, status="candidate", parent_id=base)
-        self.assertEqual(self.store.active_version()["id"], base)
-        self.store.activate(candidate, reason="test")
-        self.assertEqual(self.store.active_version()["id"], candidate)
-        parent = self.store.parent_version()
-        self.assertEqual(parent["id"], base)
-        self.store.rollback(base, reason="test")
-        self.assertEqual(self.store.active_version()["id"], base)
-        self.assertEqual(len(self.store.list_versions()), 2)
+            {"sharpe": 1.2}, status="applied", parent_id=base, session_id=sid)
+        self.store.set_session_active_version(sid, candidate)
+        self.assertEqual(self.store.session_active_version_id(sid), candidate)
+        self.assertEqual(self.store.session_active_version(sid)["id"], candidate)
         self.assertTrue(self.store.get_version(candidate)["model"]["code"])
+        # 会话隔离：另一个会话不受影响
+        self.assertIsNone(self.store.session_active_version_id(other))
+        self.assertEqual(self.store.list_versions(session_id=other), [])
+        # 回滚 = 把会话 active 指回父版本
+        self.store.set_session_active_version(sid, base)
+        self.assertEqual(self.store.session_active_version(sid)["id"], base)
+        self.assertEqual(len(self.store.list_versions(session_id=sid)), 2)
+
+    def test_audit_payload(self) -> None:
+        sid = self.store.create_session()
+        self.store.audit("analyze_model", reason="llm_tool",
+                         payload={"engine": "code", "objective": "sharpe"})
+        item = self.store.list_audit(limit=1)[0]
+        self.assertEqual(item["action"], "analyze_model")
+        self.assertEqual(item["payload"]["engine"], "code")
 
     def test_list_sessions_archive(self) -> None:
         first = self.store.create_session()
@@ -130,6 +144,10 @@ class StoreTest(unittest.TestCase):
         try:
             columns = [row[1] for row in store._conn.execute("PRAGMA table_info(version)")]
             self.assertIn("session_id", columns)
+            session_columns = [row[1] for row in store._conn.execute("PRAGMA table_info(session)")]
+            self.assertIn("active_version_id", session_columns)
+            audit_columns = [row[1] for row in store._conn.execute("PRAGMA table_info(audit_log)")]
+            self.assertIn("payload_json", audit_columns)
             version = store.get_version("v-legacy")
             self.assertIsNotNone(version)
             self.assertEqual(version["session_id"], None)
@@ -139,9 +157,9 @@ class StoreTest(unittest.TestCase):
         finally:
             store.close()
 
-    def test_unknown_version(self) -> None:
+    def test_unknown_session_raises(self) -> None:
         with self.assertRaises(KeyError):
-            self.store.activate("not-exist")
+            self.store.session_active_version_id("not-exist")
 
 
 if __name__ == "__main__":

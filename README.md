@@ -9,8 +9,9 @@
 - 用对话收集投资期限、风险承受能力等信息。
 - 基于 10 个因子筛选股票，展示指标、因子贡献、组合和净值曲线。
 - 支持示例数据、AkShare 和 Tushare。数据源只在构建缓存时访问网络，服务运行时读取本地缓存。
-- 支持内置模型和 AI 生成的参数化模型。生成的代码会经过 AST 检查、子进程冒烟和回测。
-- 在当前会话中保存模型版本，候选模型需确认后才启用，也可以回滚。
+- **原生 function calling**：Planner 通过 tools/tool_calls 表达动作与参数（例如 `analyze_model(engine="code")`），服务端只校验和执行，不再从聊天文本里用关键词猜意图。
+- 支持内置模型和 AI 生成的参数化模型。AI 只决定「引擎 + 参数搜索范围」，服务端执行真实网格寻优并实时展示进度；生成代码会经过 AST 检查、子进程冒烟和回测。
+- 模型版本按会话隔离：候选模型需确认后才在当前会话启用，也可以回滚；新建对话回到默认「均衡多因子」。
 - 前端是原生 JavaScript 和 SVG，无前端构建步骤。
 
 ## 快速开始
@@ -104,16 +105,17 @@ python -m backend.data.build_cache `
 backend/
   main.py            FastAPI 入口
   dev_server.py      无 FastAPI 依赖的本地预览服务
-  service.py         对话和业务流程
-  agent.py           AI 计划与动作校验
-  llm.py             OpenAI 兼容客户端
-  store.py           SQLite 持久化
+  service.py         对话编排与卡片
+  agent.py           原生 function calling 规划 + 工具参数修复 + 合规后处理
+  chat/              工具契约（action_schema）与确定性策略（directives）
+  llm.py             OpenAI 兼容客户端（chat_json / chat_text / chat_tools）
+  store.py           SQLite 持久化（会话 active_version_id 为单一模型状态源）
   data/              数据源适配器和缓存 CLI
-  engine/            因子、选股、组合和回测
-  models/            模型注册、代码校验和调参
+  engine/            因子、选股、组合、回测和服务端网格寻优
+  models/            模型注册、代码校验、调参方案生成
 frontend/             页面、对话和图表
-tests/                Python 测试
-scripts/              本地开发和验收脚本
+tests/                Python 测试（含动作契约与“禁止关键词路由”回归）
+scripts/              本地开发、E2E 冒烟、真实 LLM 语义矩阵
 ```
 
 ## 测试
@@ -124,10 +126,17 @@ node --check frontend/app.js
 node --check frontend/charts.js
 ```
 
-如果要运行浏览器冒烟测试，先启动服务，再执行：
+结构 E2E（FakeLLM，无需 Key）：
 
 ```powershell
 python scripts\e2e_smoke.py
+```
+
+真实 LLM 语义矩阵（需要 `DEEPSEEK_API_KEY`，验证“更换数学模型/换内置模型/随机森林/继续优化/回滚”等意图是否通过 tool_calls 正确表达，10/10 通过才允许发版）：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-..."
+.\.venv\Scripts\python.exe scripts\semantic_eval.py
 ```
 
 ## 说明

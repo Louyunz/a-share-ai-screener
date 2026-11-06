@@ -4,7 +4,7 @@
 包含三部分：
 - 内置模型注册表（``registry``）：模型清单、权重校验；
 - 自定义代码安全校验与编译（``custom``）：AST 白名单 + 子进程冒烟；
-- 提案流水线（``pipeline``）：LLM 提案生成与结构化校验（不跑回测）。
+- 调参方案流水线（``pipeline``）：LLM 生成「引擎 + 搜索范围」并校验，不跑回测。
 """
 
 from __future__ import annotations
@@ -19,9 +19,12 @@ from .custom import (
 )
 from .pipeline import (
     APPROACHES,
-    build_candidate_proposal,
-    describe_model,
-    normalize_proposal,
+    MAX_TUNING_PARAMS,
+    OBJECTIVES,
+    TUNING_REPAIR_SYSTEM,
+    TUNING_SYSTEM,
+    build_tuning_plan,
+    normalize_tuning_plan,
 )
 from .registry import (
     DEFAULT_MODEL_ID,
@@ -49,9 +52,12 @@ __all__ = [
     "ModelCodeError",
     "validate_code",
     "compile_code",
-    # pipeline
+    # tuning plan
     "APPROACHES",
-    "normalize_proposal",
-    "build_candidate_proposal",
-    "describe_model",
+    "OBJECTIVES",
+    "MAX_TUNING_PARAMS",
+    "TUNING_SYSTEM",
+    "TUNING_REPAIR_SYSTEM",
+    "normalize_tuning_plan",
+    "build_tuning_plan",
 ]

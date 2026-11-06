@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Agent 规划与合规测试（FakeLLM，不联网）。"""
+"""Agent 规划与合规测试（FakeLLM / 脚本化 LLM，不联网）。"""
 from __future__ import annotations
 
+import json
 import unittest
 
 from backend.agent import (Agent, AgentError, ComplianceError, ensure_compliance,
                           has_mechanical_style, is_explanation_question,
                           strip_confirmation_tail, trim_duplicate_confirmation)
-from backend.llm import FakeLLM
+from backend.llm import FakeLLM, ToolCall, ToolChatResult
 from backend.schemas import profile_payload
 
 
@@ -18,6 +19,21 @@ def _state(slots: dict | None = None, confirmed: bool = False, **extra) -> dict:
     return state
 
 
+def _tool_result(reply: str, profile_delta: dict | None = None,
+                 calls: list[ToolCall] | None = None) -> ToolChatResult:
+    calls = calls or []
+    content = json.dumps({"reply": reply, "profile_delta": profile_delta or {}},
+                         ensure_ascii=False)
+    message: dict = {"role": "assistant", "content": content}
+    if calls:
+        message["tool_calls"] = [
+            {"id": call.id, "type": "function",
+             "function": {"name": call.name,
+                          "arguments": json.dumps(call.arguments, ensure_ascii=False)}}
+            for call in calls
+        ]
+    return ToolChatResult(content=content, tool_calls=calls, message=message)
+
 
 class _RewriteLLM:
     def __init__(self, first_reply: str) -> None:
@@ -25,7 +41,10 @@ class _RewriteLLM:
         self.text_calls = 0
 
     def chat_json(self, system, messages):
-        return {"reply": self.first_reply, "actions": [], "profile_delta": {}}
+        return {"reply": self.first_reply, "profile_delta": {}}
+
+    def chat_tools(self, system, messages, tools, tool_choice="auto"):
+        return _tool_result(self.first_reply)
 
     def chat_text(self, system, messages):
         self.text_calls += 1
@@ -84,10 +103,18 @@ class _ContextLLM:
         self.payload = None
 
     def chat_json(self, system, messages):
-        import json
         self.payload = json.loads(messages[-1]["content"])
         return {"reply": "已记录，出现浮亏时您倾向于继续持有、等待修复。",
-                "actions": [], "profile_delta": {"loss_reaction": "继续持有等待修复"}}
+                "profile_delta": {"loss_reaction": "继续持有等待修复"}}
+
+    def chat_tools(self, system, messages, tools, tool_choice="auto"):
+        content = str(messages[-1].get("content") or "")
+        try:
+            self.payload = json.loads(content)
+        except json.JSONDecodeError:
+            pass
+        return _tool_result("已记录，出现浮亏时您倾向于继续持有、等待修复。",
+                            {"loss_reaction": "继续持有等待修复"})
 
 
 class SemanticContextTest(unittest.TestCase):
@@ -146,7 +173,15 @@ class AgentPlanTest(unittest.TestCase):
         class QuestionLLM:
             def chat_json(self, system, messages):
                 return {"reply": "在开始模型优化前，需要向您确认：您更希望改善回撤还是收益？",
-                        "actions": [{"name": "analyze_model"}], "profile_delta": {}}
+                        "profile_delta": {}}
+
+            def chat_tools(self, system, messages, tools, tool_choice="auto"):
+                call = ToolCall(id="call_1", name="analyze_model",
+                                arguments={"engine": "auto", "model_type": "",
+                                           "objective": "", "escalate": False})
+                return _tool_result(
+                    "在开始模型优化前，需要向您确认：您更希望改善回撤还是收益？",
+                    calls=[call])
 
             def chat_text(self, system, messages):
                 return ""
@@ -157,6 +192,63 @@ class AgentPlanTest(unittest.TestCase):
         self.assertEqual(plan.actions, [])
         self.assertEqual(plan.deferred_intent, "analyze_model")
         self.assertIn("需要向您确认", plan.reply)
+
+    def test_analyze_intent_engine_code(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = self.agent.plan(_state(slots, confirmed=True), [], "更换数学模型")
+        action = plan.action("analyze_model")
+        self.assertIsNotNone(action)
+        self.assertEqual(action["args"]["engine"], "code")
+
+    def test_analyze_intent_model_type(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = self.agent.plan(_state(slots, confirmed=True), [], "换成低波质量")
+        action = plan.action("analyze_model")
+        self.assertEqual(action["args"]["engine"], "model_type")
+        self.assertEqual(action["args"]["model_type"], "low_vol_quality")
+
+    def test_analyze_intent_escalate(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = self.agent.plan(_state(slots, confirmed=True, pending={"summary": "旧方案"}),
+                               [], "继续优化模型，上一版未达到我的预期")
+        action = plan.action("analyze_model")
+        self.assertTrue(action["args"]["escalate"])
+
+    def test_analyze_intent_objective(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = self.agent.plan(_state(slots, confirmed=True), [], "优化模型，回撤再小一点")
+        action = plan.action("analyze_model")
+        self.assertEqual(action["args"]["objective"], "mdd")
+
+    def test_invalid_tool_args_are_repaired_once(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+
+        class _RepairLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_tools(self, system, messages, tools, tool_choice="auto"):
+                self.calls += 1
+                if self.calls == 1:
+                    call = ToolCall(id="call_1", name="analyze_model",
+                                    arguments={"engine": "magic"})
+                else:
+                    call = ToolCall(id="call_2", name="analyze_model",
+                                    arguments={"engine": "code"})
+                return _tool_result("正在按您的要求优化模型。", calls=[call])
+
+            def chat_text(self, system, messages):
+                return ""
+
+        llm = _RepairLLM()
+        plan = Agent(llm).plan(_state(slots, confirmed=True), [], "更换数学模型")
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(plan.action("analyze_model")["args"]["engine"], "code")
 
     def test_pending_intent_executes_after_answer(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",

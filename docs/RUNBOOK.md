@@ -1,10 +1,10 @@
-# 运行手册（v2：单对话 + AI 主动建模）
+# 运行手册（v3：原生 function calling + 服务端网格寻优）
 
-## 1. 最快跑起来（离线演示）
+## 1. 最快跑起来
 
 ```powershell
 cd a-share-ai-screener
-$py = "C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+$py = ".venv\Scripts\python.exe"   # Windows 启动脚本；也可用 DSH runtime python
 
 & $py -m backend.data.build_cache --source sample
 $env:DEEPSEEK_API_KEY = "sk-..."
@@ -26,11 +26,12 @@ $env:LLM_MODEL = "deepseek-chat"
 2. 补充“大概 5 年不用、最多能接受亏 15%、真亏了会有点慌但先不卖”；
 3. 回“可以，就按这个来”——AI 自己完成画像确认 + 选股，展示画像卡、选股卡、指标与解读；
 4. 追问“为什么最大回撤这么大”，AI 基于这次回测事实解释；
-5. 说“帮我优化一下模型”——AI 展示：看表现 → 翻数据 → 提出「引擎 + 参数搜索范围」方案；
-6. 服务端开始网格寻优：左侧出现「参数网格寻优」卡片，进度条按已评估组数实时推进，当前最优指标、Top 因子权重/参数、搜索范围与得分走势同步更新；work 卡步骤同步推进，最后展示改动 diff（代码/权重/模型类型）；
-7. 审批卡会说明寻优组数、目标指标、回测对比与过拟合风险；点“同意”或说“同意启用这个改进”，**当前会话**启用新模型；
-8. 点顶部「新对话」验证：新会话右侧工作台回到「均衡多因子」，不会沿用上一个对话的模型；
-9. 回到原会话说“回滚到上一个版本”，切回该会话的基线。
+5. 说“帮我优化一下模型”——AI 通过 tool 调用发起优化：看表现 → 翻数据 → 提出「引擎 + 参数搜索范围」方案；
+6. 服务端开始网格寻优：「参数网格寻优」卡片实时推进（已评估组数、当前最优指标、Top 参数、搜索范围、得分走势）；work 卡同步展示步骤与改动 diff；
+7. 说“更换数学模型”——AI 必须调用 `analyze_model(engine="code")`，写一套新的参数化打分引擎，再由服务端重新寻优（而不是只调权重或换内置模型）；
+8. 审批卡说明寻优组数、目标指标、回测对比与过拟合风险；点“同意”在当前会话启用新模型；
+9. 点顶部「新对话」验证：新会话回到默认「均衡多因子」，不会沿用上一个对话的模型；
+10. 回到原会话说“回滚到上一个版本”，切回该会话基线。
 
 ## 3. 使用真实 A 股数据
 
@@ -66,8 +67,12 @@ $env:LLM_MODEL = "deepseek-chat"
 ## 5. 验收命令
 
 ```powershell
+$py = ".venv\Scripts\python.exe"
 & $py -m unittest discover -s tests -v
 $node --check frontend/app.js
 $node --check frontend/charts.js
 & $py scripts\e2e_smoke.py
+
+# 真实 LLM 语义矩阵（需要 DEEPSEEK_API_KEY；10/10 才允许发版）
+& $py scripts\semantic_eval.py
 ```

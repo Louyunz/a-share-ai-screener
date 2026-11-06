@@ -1,22 +1,24 @@
-# A 股 AI 选股助手 · v2.1 契约（对话优先 + AI 定引擎/范围 + 服务端网格寻优）
+# A 股 AI 选股助手 · v3.0 契约（原生 function calling + AI 定引擎/范围 + 服务端网格寻优）
 
-> 本文件是 v2 唯一契约。旧版接口/页面/兜底设计直接替换，不保留兼容层；历史版本见 git。
+> 本文件是当前唯一契约。旧版接口/页面/关键词路由/legacy proposal 协议直接删除，不保留兼容层；历史版本见 git。
 
 ## 0. 环境
 
 - 项目根：`C:\Users\77578\Documents\deepseek-harness\default-workspace\a-share-ai-screener`
-- Python：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（已装 fastapi/uvicorn/akshare/tushare；sklearn 用于 AI 自定义模型；token 通过项目根目录 .env 注入，不入库）
+- Python：项目内 `.venv`（Python 3.12，含 fastapi/uvicorn/pandas/scikit-learn/tushare；也可用 DSH runtime python）。真实 Key 通过环境变量 `DEEPSEEK_API_KEY` 或 `.env` 注入，不入库。
 - Node：`C:\Users\77578\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe`
+- 测试：`.venv\Scripts\python.exe -m unittest discover -s tests -v`
 - git 由 Lead 统一提交；子任务不要执行 git，不要改自己写作用域之外的文件。
 
-## 1. 产品原则（v2）
+## 1. 产品原则（v3）
 
 1. **一个对话框完成全部操作**：画像采集、确认、选股、解读、追问、模型优化、版本启用/回滚，全部在同一个聊天流里完成。没有模块页签、没有独立的“运行/确认”按钮页面。
-2. **AI 主动执行（用户确认后）**：AI 判断用户意图并调用后端动作。画像确认、发起选股等低风险动作，在用户对话中确认后由 AI 直接执行；应用模型变更/启用版本等高影响动作，在聊天中给出审批卡，用户点击聊天内快捷回复或直接说“同意”后执行。
+2. **AI 主动执行（用户确认后）**：AI 通过**原生 function calling** 调用后端工具。画像确认、发起选股等低风险动作，在用户对话中确认后由 AI 直接执行；应用模型变更/启用版本等高影响动作，在聊天中给出审批卡，用户点击聊天内快捷回复或直接说“同意”后执行。
 3. **普通用户语言**：AI 不用专业术语提问；必须把“回撤、夏普、因子”等翻译成生活化解释；一次只问一个问题；先共情再提问。
 4. **AI 定引擎，服务端调参**：AI 负责选择/编写底层打分引擎并给出参数搜索范围；最终权重或代码参数由服务端在范围内网格寻优、逐组回测选出。AI 不直接拍最终参数。
 5. **AI 工作过程可见**：优化过程中，前端实时展示 AI 的步骤（分析 → 提出调参方案 → 服务端网格寻优 → 写入改动 → 回测 → 对比 → 等待确认），步骤由后端真实动作产生，不伪造。寻优进度卡按真实回测事件实时更新。
 6. **模型会话隔离**：模型改动只在被启用的会话内生效；新建对话默认使用「均衡多因子」模型，不继承上一个对话的模型。每个会话保留自己的版本链，可独立回滚。
+7. **意图唯一权威**：意图只来自 LLM 的 tool_calls（typed args）；服务端只校验 schema、执行确定性策略、审计，**禁止**从自然语言关键词推断意图（`_wants_*` / `_requested_*` / 基于回复文本的路由均删除）。
 
 ## 1.1 数据源（真实数据）
 
@@ -38,6 +40,8 @@
 | GET | `/api/versions?session={sid}` | 版本列表；带 `session` 时只返回该会话版本链（`model_scope=session`），不带时返回全局归档 |
 
 不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
+
+**状态单一来源（SCHEMA_VERSION=5）**：会话当前模型 = `session.active_version_id` 指向的 `version` 行（为空则默认「均衡多因子」）；`session_state` 只保存 pending/待执行意图/最近结果，不再保存 active_model/metrics/version_id。旧的全局 `store.active_version/activate/parent_version` 接口已删除，版本链按 `session_id` 隔离。
 
 ## 3. 聊天 SSE 事件
 
@@ -117,37 +121,46 @@
 ```
 用户同意后仅当前会话启用新模型；新建对话时 `active_model` 为默认「均衡多因子」，`versions` 为空。
 
-## 4. AI 动作与权限（后端执行，前端不直接调）
+## 4. AI 动作与权限（原生 function calling，服务端只执行）
 
-Planner 每轮输出：
+Planner 通过 OpenAI 兼容的 **tools / tool_calls** 表达动作；`content` 只输出客户可见 JSON：
+
 ```json
-{"reply":"给用户看的自然语言（≤120字，通俗）",
- "actions":[{"name":"...","args":{}}],
- "profile_delta":{"horizon":"3-5 年"}}
+// content（模型文本）
+{"reply":"给用户看的自然语言（≤180字，干净中文）","profile_delta":{"horizon":"3-5 年"}}
 ```
 
-| action | 何时允许 | 行为 |
-|---|---|---|
-| `confirm_profile` | 用户本轮明确确认（可以/确认/没问题/就按这个来）且画像必填齐全 | 写入 confirmed，返回 profile 卡，AI 回复确认 |
-| `run_selection` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
-| `explain_results` | 有最近一次选股结果 | 基于事实回答追问 |
-| `analyze_model` | 画像已确认即可 | AI 分析当前模型 → 产出「底层引擎 + 参数搜索范围」调参方案 → 服务端逐轴网格寻优（实时推送 tuning 卡进度）→ 写入改动 diff → 候选回测 → work 卡 + tuning 卡 + approval 卡，**不自动启用** |
-| `apply_pending_change` | 存在待审批方案且用户本轮明确同意 | 在当前会话保存新模型版本并设为会话 active，返回 version 卡；其他会话与新对话不受影响 |
-| `rollback_version` | 用户明确要求回滚且当前会话存在可回滚版本 | 沿当前会话版本链切回上一版，返回 version 卡 |
+```json
+// tool_calls（模型主动调用，由 Action Gateway 校验）
+[{"name":"analyze_model","args":{"engine":"code","model_type":"","objective":"","escalate":false,"reason":"客户要求更换数学模型"}}]
+```
 
-低风险动作不允许在缺少用户确认时触发；高影响动作必须有本轮明确同意。所有动作由后端校验，不信任前端。
+工具 schema 的唯一来源：`backend/chat/action_schema.py`（Pydantic 模型同时用于运行时校验、发给模型的 JSON Schema、测试）。服务端不再解析自然语言判断意图。
+
+| tool | args（截图） | 何时允许 | 行为 |
+|---|---|---|---|
+| `confirm_profile` | `{}` | 画像必填齐全且用户本轮明确确认 | 写入 confirmed，返回 profile 卡 |
+| `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
+| `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
+| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 按 engine 执行调参方案 → 服务端网格寻优（实时 tuning 卡）→ 改动 diff → 回测 → work/tuning/approval 卡，**不自动启用** |
+| `apply_pending_change` | `{}` | 存在待审批方案且用户本轮明确同意 | 当前会话启用新模型版本，返回 version 卡 |
+| `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
+
+**`analyze_model` 参数语义**（由 AI 判断，服务端只做确定性策略）：
+- `engine`: `auto`（普通优化，由 pipeline 决定） / `weights`（只调因子权重） / `model_type`（点名内置模型） / `code`（构建或更换新的数学模型/打分引擎）
+- `model_type`: `engine=model_type` 时的内置模型 id（`multi_factor/low_vol_quality/momentum_growth/value_dividend/contrarian`）
+- `objective`: `sharpe|cagr|mdd`，空字符串表示默认夏普
+- `escalate`: 客户说继续优化/上一版未达预期时为 true；服务端按上一版结构做升级（上一版权重→换基础模型；上一版模型/代码→写 code），禁止只调权重
+- `reason`: 一句话审计原因（不参与路由）
+
+**动作前置校验**：服务端校验“当前状态是否允许该动作”（apply 需要 pending、rollback 需要可回滚版本、选股需要已确认画像等）；不合法时不猜意图，而是把结构化错误回传 LLM，让它重新调用工具（最多一次）。仍不合法则返回明确错误。
+
+**“更换数学模型”约定**：`数学模型/打分模型/引擎/公式` 指底层打分逻辑，必须 `engine=code`；不允许降级成切内置模型或只调权重，也不允许声称没有权限写代码。
 
 **AI 与服务的调参分工**：
 - AI 只输出 `approach + search_space/param_space + code`（见 6.2），**不输出最终权重/参数值**；
 - 服务端在范围内执行逐轴网格搜索，逐组回测后按目标指标保留最优（见 6.5）；
 - 最终候选的权重/参数由服务端写回模型与改动框，并在 tuning 卡中展示搜索范围与得分走势。
-
-**继续优化升级**：用户点击审批卡的「继续优化」或说“上一版未达预期”时，服务端读取上一版 pending 方案并做结构性升级，禁止只微调参数：
-- 上一版是 `weights` → 直接选择另一个内置基础模型（`model_type`）；
-- 上一版是 `model_type` 或 `code` → 强制 `approach=code`，由 AI 重写参数化数学打分引擎，再由服务端重新寻优；
-- 会话会在 work 卡中明确展示「升级优化策略」步骤，并说明本轮采取的结构性策略。
-
-**动作前置校验（防止状态不一致）**：若模型输出 `apply_pending_change` 但 runtime 中没有 pending 方案，服务端不执行该动作、不报错，而是自动改为 `analyze_model` 重新分析并生成候选；若回复声称有模型改进方案待确认但既没有 pending 也没有动作，同样自动进入分析。历史版本为空时 `rollback_version` 也会被拦截并给出说明。
 
 ## 5. 画像槽位（12 项，全部用生活化标签）
 
@@ -168,7 +181,13 @@ AI 追问原则：一次一个问题；先回应/共情，再问；提供生活�
 
 ### 6.2 LLM 调参方案 JSON（AI 只出引擎 + 范围）
 
-`build_tuning_plan` 要求 LLM 只输出「引擎 + 搜索范围」，由服务端执行真实调参：
+`build_tuning_plan` 要求 LLM 只输出「引擎 + 搜索范围」，由服务端执行真实调参。调用时 state 里包含 `directive`：
+
+```json
+{"engine":"auto|weights|model_type|code", "model_type":"low_vol_quality", "objective":"sharpe|mdd|cagr", "escalate":false, "previous_approach":"weights|model_type|code|"}
+```
+
+`directive` 由 `backend/chat/directives.resolve_directive()` 从 analyze_model 的 tool args + 上一版结构确定性生成；LLM 必须遵守（engine/model_type/objective/escalate），违反会触发修复重试。LLM 的方案 JSON：
 
 ```json
 {"approach":"weights|model_type|code",
@@ -229,14 +248,18 @@ def build_transform(params=None):
 ### 6.6 pipeline 与安全模块公开函数
 
 ```python
-# backend/models/pipeline.py
+# backend/models/pipeline.py（只保留调参方案协议；legacy proposal 已删除）
 def normalize_tuning_plan(raw, base_weights=None, current_model=None) -> dict
-def build_tuning_plan(llm, state) -> dict          # 调 LLM 生成「引擎+范围」，含自动修复
+def build_tuning_plan(llm, state) -> dict          # 生成「引擎+范围」，含自动修复；按 state.directive 强制方向
 TUNING_SYSTEM / TUNING_REPAIR_SYSTEM               # 调参方案提示词
 
-# legacy（保留兼容，不再被 analyze_model 使用）
-def normalize_proposal(raw, base_weights=None) -> dict
-def build_candidate_proposal(llm, state) -> dict
+# backend/chat/action_schema.py（唯一动作契约）
+TOOL_DEFINITIONS                                    # 发给 LLM 的 OpenAI tools schema
+validate_tool_call(name, arguments) -> dict         # Pydantic 校验；失败抛 ToolArgsError
+
+# backend/chat/directives.py（确定性策略，无自然语言解析）
+resolve_directive(args, previous_approach="") -> EngineDirective
+drawdown_tolerance_ratio(slots) -> float | None     # 画像槽位数值化，非意图识别
 
 # backend/models/custom.py
 def validate_code(code, params=None) -> dict        # AST + 冒烟；返回 takes_params 等
@@ -261,7 +284,7 @@ def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
 
 ## 8. 文件与分工
 
-- Lead：`backend/agent.py`、`backend/service.py`、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`backend/engine/tuning.py`（服务端网格寻优）、`tests/` 集成测试、`scripts/e2e_smoke.py`、文档。
+- Lead：`backend/agent.py`、`backend/llm.py`（原生 function calling 客户端）、`backend/chat/action_schema.py`（工具契约）、`backend/chat/directives.py`（确定性策略）、`backend/service.py`（编排）、`backend/main.py`、`backend/dev_server.py`、`backend/store.py`（会话 active_version_id 单一状态源）、`backend/schemas.py`、`backend/engine/selection.py`（score_transform 钩子）、`backend/engine/tuning.py`（服务端网格寻优）、`tests/` 集成测试、`scripts/e2e_smoke.py`、`scripts/semantic_eval.py`、文档。
 - **chat-ui-dev**：只写 `frontend/` 下 `index.html`、`app.js`、`style.css`、`charts.js`（含 tuning 卡与实时进度）。
-- **model-pipeline-dev**：只写 `backend/models/*.py`、`backend/llm.py`、`tests/test_models.py`。
-- 完成标准：`node --check` 通过；后端 `unittest discover` 通过；E2E 通过；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘帮我优化模型’→观察网格寻优进度→审批→当前会话模型更新→新对话回到默认模型→回滚”全流程。
+- **model-pipeline-dev**：只写 `backend/models/*.py`、`tests/test_models.py`。
+- 完成标准：`node --check` 通过；后端 `unittest discover` 通过；`scripts/e2e_smoke.py` 通过；真实 LLM 语义矩阵 `scripts/semantic_eval.py` ≥10/10；真实浏览器可完成“说目标→AI 追问→AI 总结并确认→AI 选股→AI 解读→说‘更换数学模型’→AI 写新引擎+寻优进度→审批→当前会话模型更新→新对话回到默认模型→回滚”全流程。

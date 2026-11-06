@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _now() -> str:
@@ -45,7 +45,8 @@ class Store:
             """
             CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                active_version_id TEXT
             );
             CREATE TABLE IF NOT EXISTS message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +86,7 @@ class Store:
                 from_version TEXT,
                 to_version TEXT,
                 reason TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
             """
@@ -99,8 +101,44 @@ class Store:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_version_session "
             "ON version(session_id, created_at)")
+        session_columns = [row[1] for row in self._conn.execute("PRAGMA table_info(session)")]
+        if "active_version_id" not in session_columns:
+            self._conn.execute("ALTER TABLE session ADD COLUMN active_version_id TEXT")
+        audit_columns = [row[1] for row in self._conn.execute("PRAGMA table_info(audit_log)")]
+        if "payload_json" not in audit_columns:
+            self._conn.execute(
+                "ALTER TABLE audit_log ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'")
+        self._backfill_active_version()
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _backfill_active_version(self) -> None:
+        """把旧版 session_state 里的 active_version_id 迁移到 session 表（单一状态源）。"""
+        rows = self._conn.execute(
+            """
+            SELECT s.id AS sid, s.active_version_id AS active_id, st.state_json AS state_json
+            FROM session s
+            LEFT JOIN session_state st ON st.session_id = s.id
+            WHERE s.active_version_id IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            state: dict[str, Any] = {}
+            try:
+                state = json.loads(row["state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                state = {}
+            active_id = state.get("active_version_id")
+            if active_id:
+                self._conn.execute(
+                    "UPDATE session SET active_version_id = ? WHERE id = ?",
+                    (str(active_id), row["sid"]))
+            if any(key in state for key in ("active_model", "active_metrics", "active_version_id")):
+                for key in ("active_model", "active_metrics", "active_version_id"):
+                    state.pop(key, None)
+                self._conn.execute(
+                    "UPDATE session_state SET state_json = ? WHERE session_id = ?",
+                    (json.dumps(state, ensure_ascii=False), row["sid"]))
 
     # ------------------------------------------------------------------
     # 会话与消息
@@ -245,53 +283,51 @@ class Store:
                     "ORDER BY created_at ASC, id ASC", (session_id,)).fetchall()
         return [self._version_row(row) for row in rows]
 
-    def active_version(self) -> dict[str, Any] | None:
+    def session_active_version_id(self, session_id: str) -> str | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM version WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
-        return self._version_row(row) if row else None
+                "SELECT active_version_id FROM session WHERE id = ?",
+                (session_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"会话不存在：{session_id}")
+        value = row["active_version_id"]
+        return str(value) if value else None
 
-    def activate(self, version_id: str, *, reason: str = "user_action") -> dict[str, Any]:
-        target = self.get_version(version_id)
-        if target is None:
-            raise KeyError(f"版本不存在：{version_id}")
-        previous = self.active_version()
+    def set_session_active_version(self, session_id: str, version_id: str | None) -> None:
         with self._lock:
-            self._conn.execute("UPDATE version SET status = 'archived' WHERE status = 'active'")
-            self._conn.execute("UPDATE version SET status = 'active' WHERE id = ?", (version_id,))
             self._conn.execute(
-                "INSERT INTO audit_log(action, from_version, to_version, reason, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("activate", previous["id"] if previous else None, version_id, reason, _now()))
+                "UPDATE session SET active_version_id = ? WHERE id = ?",
+                (version_id, session_id))
             self._conn.commit()
-        return self.get_version(version_id) or target
 
-    def rollback(self, version_id: str, *, reason: str = "user_rollback") -> dict[str, Any]:
-        return self.activate(version_id, reason=reason)
-
-    def parent_version(self, version_id: str | None = None) -> dict[str, Any] | None:
-        current = self.get_version(version_id) if version_id else self.active_version()
-        if current is None:
-            return None
-        if current.get("parent_id"):
-            return self.get_version(current["parent_id"])
-        archived = [v for v in self.list_versions() if v["id"] != current["id"]]
-        return archived[-1] if archived else None
+    def session_active_version(self, session_id: str) -> dict[str, Any] | None:
+        version_id = self.session_active_version_id(session_id)
+        return self.get_version(version_id) if version_id else None
 
     def audit(self, action: str, *, from_version: str | None = None,
-              to_version: str | None = None, reason: str = "") -> None:
+              to_version: str | None = None, reason: str = "",
+              payload: dict[str, Any] | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO audit_log(action, from_version, to_version, reason, created_at) "
-                "VALUES (?, ?, ?, ?, ?)", (action, from_version, to_version, reason, _now()))
+                "INSERT INTO audit_log(action, from_version, to_version, reason, "
+                "payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (action, from_version, to_version, reason,
+                 json.dumps(payload or {}, ensure_ascii=False), _now()))
             self._conn.commit()
 
     def list_audit(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
-        return [dict(row) for row in rows]
+        items = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.pop("payload_json", "{}") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["payload"] = {}
+            items.append(item)
+        return items
 
     @staticmethod
     def _version_row(row: sqlite3.Row) -> dict[str, Any]:
