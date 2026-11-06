@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B1220">
   <meta name="description" content="智投罗盘 · AI 选股助手：在一个对话框里完成投资画像、因子选股、结果解读与模型优化。">
   <title>智投罗盘 · AI 选股助手</title>
-  <link rel="stylesheet" href="style.css?v=3">
+  <link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
   <!-- 内联图标库：无字体、无 CDN、无第三方资源 -->
@@ -28,6 +28,8 @@
     <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4.6 12h14.8M13.4 6l6 6-6 6"/></symbol>
     <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M4 7h10M4 12h10M4 17h7"/><circle cx="18.4" cy="15.2" r="3.4"/><path d="M18.4 13.6v1.8l1.3.8"/></symbol>
   </svg>
 
   <div class="ambient" aria-hidden="true">
@@ -48,6 +50,12 @@
     </a>
 
     <div class="topbar-right">
+      <button class="topbar-btn" id="new-chat" type="button" title="开启新对话">
+        <svg class="icon"><use href="#i-plus"></use></svg><span>新对话</span>
+      </button>
+      <button class="topbar-btn" id="history-btn" type="button" title="历史对话归档">
+        <svg class="icon"><use href="#i-history"></use></svg><span>历史对话</span>
+      </button>
       <div class="health-pill" id="health-pill" title="后端与数据服务状态">
         <span class="health-dot is-loading" id="health-dot"></span>
         <span id="health-text">连接中</span>
@@ -127,6 +135,21 @@
     </aside>
   </main>
 
+  <div class="history-overlay" id="history-overlay" hidden>
+    <div class="history-panel" role="dialog" aria-modal="true" aria-labelledby="history-title">
+      <header class="history-head">
+        <div>
+          <h2 id="history-title">历史对话归档</h2>
+          <p class="history-note">所有对话自动归档保存在本地服务端，可随时切回继续。</p>
+        </div>
+        <button class="icon-btn" id="history-close" type="button" aria-label="关闭历史对话">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </header>
+      <div class="history-list" id="history-list"></div>
+    </div>
+  </div>
+
   <footer class="app-footer">
     <p class="disclaimer">
       <svg class="icon"><use href="#i-shield"></use></svg>
@@ -135,7 +158,7 @@
     <span class="footer-meta" id="footer-meta">数据加载中…</span>
   </footer>
 
-  <script src="charts.js?v=3"></script>
-  <script src="app.js?v=3"></script>
+  <script src="charts.js?v=4"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>

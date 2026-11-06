@@ -22,9 +22,10 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/health` | `{ok, source, as_of, universe, llm}` |
+| GET | `/api/sessions` | 历史对话归档 `{sessions:[{id,title,created_at,updated_at,message_count,profile_summary,profile_confirmed}]}` |
 | POST | `/api/sessions` | `{session_id}` |
 | POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
-| GET | `/api/sessions/{sid}/messages` | 文本历史 `{messages:[{role,content,created_at}]}` |
+| GET | `/api/sessions/{sid}/messages` | 文本 + 富卡片历史 `{messages:[{role,content,blocks,created_at}]}` |
 | GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection}` |
 | GET | `/api/versions` | 版本列表（兼容保留给状态面板） |
 

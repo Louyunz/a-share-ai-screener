@@ -79,6 +79,22 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(len(self.store.list_versions()), 2)
         self.assertTrue(self.store.get_version(candidate)["model"]["code"])
 
+    def test_list_sessions_archive(self) -> None:
+        first = self.store.create_session()
+        self.store.add_message(first, "user", "第一个会话的问题")
+        self.store.add_message(first, "assistant", "第一个会话的回复")
+        self.store.save_profile(first, {"goal": "养老"}, "目标：养老", False)
+        second = self.store.create_session()
+        self.store.add_message(second, "user", "第二个会话")
+        sessions = self.store.list_sessions()
+        self.assertEqual([item["id"] for item in sessions], [second, first])
+        latest = sessions[0]
+        self.assertEqual(latest["message_count"], 1)
+        self.assertEqual(latest["title"], "第二个会话")
+        older = sessions[1]
+        self.assertEqual(older["message_count"], 2)
+        self.assertTrue(older["profile_summary"])
+
     def test_unknown_version(self) -> None:
         with self.assertRaises(KeyError):
             self.store.activate("not-exist")

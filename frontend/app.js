@@ -229,6 +229,11 @@
     dom.result = $('#wb-result');
     dom.chatModelChip = $('#chat-model-chip');
     dom.footerMeta = $('#footer-meta');
+    dom.newChat = $('#new-chat');
+    dom.historyBtn = $('#history-btn');
+    dom.historyOverlay = $('#history-overlay');
+    dom.historyList = $('#history-list');
+    dom.historyClose = $('#history-close');
   }
 
   /* ============================== 网络请求 ============================== */
@@ -1550,6 +1555,103 @@
     dom.input.style.height = Math.min(dom.input.scrollHeight, 148) + 'px';
   }
 
+  function formatHistoryTime(value) {
+    var text = String(value || '');
+    var match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})/);
+    return match ? (match[2] + '-' + match[3] + ' ' + match[4]) : (text.slice(0, 16) || '');
+  }
+
+  async function fetchSessions() {
+    var data = await api('/api/sessions');
+    return Array.isArray(data.sessions) ? data.sessions : [];
+  }
+
+  function renderHistoryList(sessions) {
+    if (!dom.historyList) return;
+    if (!sessions.length) {
+      dom.historyList.innerHTML = '<p class="history-empty">还没有历史对话。开始一段新对话后会自动归档在这里。</p>';
+      return;
+    }
+    dom.historyList.innerHTML = sessions.map(function (item) {
+      var active = item.id === state.sessionId;
+      var meta = [formatHistoryTime(item.updated_at), (item.message_count || 0) + ' 条消息'];
+      if (item.profile_confirmed) meta.push('画像已确认');
+      var summary = item.profile_summary ? String(item.profile_summary) : '';
+      return '<button type="button" class="history-item' + (active ? ' is-current' : '') + '" data-session-id="' + esc(item.id) + '">'
+        + '<span class="history-item-main"><strong>' + esc(item.title || '新对话') + '</strong>'
+        + '<span class="history-item-meta">' + esc(meta.join(' · ')) + '</span>'
+        + (summary ? '<span class="history-item-summary">' + esc(summary) + '</span>' : '')
+        + '</span><span class="history-item-state">' + (active ? '当前' : '打开') + '</span>'
+        + '</button>';
+    }).join('');
+  }
+
+  async function openHistory() {
+    if (!dom.historyOverlay || !dom.historyList) return;
+    dom.historyOverlay.hidden = false;
+    document.body.classList.add('history-open');
+    dom.historyList.innerHTML = '<p class="history-empty">正在读取历史对话…</p>';
+    try {
+      renderHistoryList(await fetchSessions());
+    } catch (error) {
+      dom.historyList.innerHTML = '<p class="history-empty">历史对话读取失败：' + esc(error.message || '请稍后重试') + '</p>';
+    }
+  }
+
+  function closeHistory() {
+    if (!dom.historyOverlay) return;
+    dom.historyOverlay.hidden = true;
+    document.body.classList.remove('history-open');
+  }
+
+  async function activateSession(sessionId) {
+    if (!sessionId) return false;
+    if (state.streaming) {
+      dom.historyList.insertAdjacentHTML('afterbegin', '<p class="history-empty">当前回复还没结束，请稍后再切换会话。</p>');
+      return false;
+    }
+    closeHistory();
+    state.sessionId = sessionId;
+    saveSession(sessionId);
+    updateSessionChip();
+    clearChat();
+    state.profile = null;
+    state.activeModel = null;
+    state.versions = [];
+    state.pendingProposal = null;
+    state.lastSelection = null;
+    state.lastUserMessage = '';
+    state.lastMessageId = null;
+    state.activity = [];
+    state.stateError = null;
+    state.following = true;
+    var fetched = await fetchMessages(sessionId);
+    var history = fetched.ok ? (fetched.messages || []) : [];
+    if (history.length) renderHistory(history);
+    else appendWelcome();
+    await loadState();
+    await loadVersions();
+    renderAllWorkbench();
+    if (history.length) pushActivity('switch', '已切换到一个历史对话', 'done', 'history');
+    scrollToBottom(true);
+    dom.input.focus();
+    return true;
+  }
+
+  async function startNewChat() {
+    if (state.streaming) return;
+    closeHistory();
+    try {
+      var created = await api('/api/sessions', { method: 'POST' });
+      var sessionId = created && created.session_id ? String(created.session_id) : '';
+      if (!sessionId) throw new Error('后端未返回会话 ID');
+      await activateSession(sessionId);
+      dom.input.focus();
+    } catch (error) {
+      appendSystemError('无法开启新对话', error.message || '请确认后端服务已启动。', 'retry-init');
+    }
+  }
+
   function toggleWorkbench() {
     var wide = window.matchMedia('(min-width: 1280px)').matches;
     if (wide) {
@@ -1626,6 +1728,26 @@
     dom.wbToggle.addEventListener('click', toggleWorkbench);
     dom.stream.addEventListener('click', handleActionClick);
     dom.workbench.addEventListener('click', handleActionClick);
+    if (dom.newChat) dom.newChat.addEventListener('click', startNewChat);
+    if (dom.historyBtn) dom.historyBtn.addEventListener('click', openHistory);
+    if (dom.historyClose) dom.historyClose.addEventListener('click', closeHistory);
+    if (dom.historyOverlay) {
+      dom.historyOverlay.addEventListener('click', function (event) {
+        if (event.target === dom.historyOverlay) closeHistory();
+      });
+    }
+    if (dom.historyList) {
+      dom.historyList.addEventListener('click', function (event) {
+        var item = event.target.closest ? event.target.closest('[data-session-id]') : null;
+        if (!item || item.disabled) return;
+        var sessionId = item.getAttribute('data-session-id');
+        if (sessionId && sessionId !== state.sessionId) activateSession(sessionId);
+        else closeHistory();
+      });
+    }
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') closeHistory();
+    });
 
     var media = window.matchMedia('(min-width: 1280px)');
     var onViewportChange = function () {

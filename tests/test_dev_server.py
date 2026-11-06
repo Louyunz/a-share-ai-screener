@@ -81,6 +81,16 @@ class DevServerTest(unittest.TestCase):
         self.assertTrue(any(event == "ui" and data["block"]["type"] == "profile"
                             for event, data in events))
 
+    def test_sessions_archive(self) -> None:
+        status, body = self._request("POST", "/api/sessions")
+        sid = json.loads(body)["session_id"]
+        self._request("POST", f"/api/sessions/{sid}/chat", {"content": "我想为养老攒点钱"})
+        status, body = self._request("GET", "/api/sessions")
+        self.assertEqual(status, 200)
+        sessions = json.loads(body)["sessions"]
+        self.assertTrue(any(item["id"] == sid for item in sessions))
+        self.assertTrue(all("title" in item and "message_count" in item for item in sessions))
+
     def test_state_and_messages(self) -> None:
         status, body = self._request("POST", "/api/sessions")
         sid = json.loads(body)["session_id"]

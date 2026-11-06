@@ -122,6 +122,27 @@ class Store:
                  json.dumps(blocks or [], ensure_ascii=False), _now()))
             self._conn.commit()
 
+    def list_sessions(self, limit: int = 80) -> list[dict[str, Any]]:
+        """历史对话归档列表：按最近消息时间倒序。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.id AS id,
+                       s.created_at AS created_at,
+                       (SELECT content FROM message WHERE session_id = s.id AND role = 'user'
+                        ORDER BY id LIMIT 1) AS title,
+                       (SELECT COUNT(*) FROM message WHERE session_id = s.id) AS message_count,
+                       (SELECT MAX(created_at) FROM message WHERE session_id = s.id) AS last_at,
+                       COALESCE(p.summary, '') AS profile_summary,
+                       COALESCE(p.confirmed, 0) AS profile_confirmed
+                FROM session s
+                LEFT JOIN profile p ON p.session_id = s.id
+                ORDER BY COALESCE(last_at, s.created_at) DESC, s.rowid DESC
+                LIMIT ?
+                """,
+                (int(limit),)).fetchall()
+        return [dict(row) for row in rows]
+
     def get_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

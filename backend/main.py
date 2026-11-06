@@ -84,6 +84,13 @@ def create_app(service: AppService | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
+    @app.get("/api/sessions")
+    def list_sessions() -> Any:
+        try:
+            return get_service().list_sessions()
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
     @app.post("/api/sessions")
     def create_session() -> Any:
         try:

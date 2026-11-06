@@ -102,6 +102,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 return self._send_json(200, self.service.health())
+            if path == "/api/sessions":
+                return self._send_json(200, self.service.list_sessions())
             if path == "/api/versions":
                 active = self.service.store.active_version()
                 return self._send_json(200, {

@@ -122,6 +122,23 @@ class AppService:
         session_id = self.store.create_session()
         return {"session_id": session_id}
 
+    def list_sessions(self) -> dict[str, Any]:
+        sessions = []
+        for item in self.store.list_sessions():
+            title = str(item.get("title") or "").strip().replace("\n", " ")
+            if len(title) > 28:
+                title = title[:28] + "…"
+            sessions.append({
+                "id": item["id"],
+                "title": title or "新对话",
+                "created_at": item["created_at"],
+                "updated_at": item.get("last_at") or item["created_at"],
+                "message_count": int(item.get("message_count") or 0),
+                "profile_summary": str(item.get("profile_summary") or ""),
+                "profile_confirmed": bool(item.get("profile_confirmed")),
+            })
+        return {"sessions": sessions, "current": None}
+
     def messages(self, session_id: str) -> dict[str, Any]:
         self._require_session(session_id)
         return {"messages": self.store.get_messages(session_id)}
