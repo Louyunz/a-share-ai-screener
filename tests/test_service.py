@@ -82,6 +82,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue(approvals)
         self.assertIn("需要您确认", text)
         self.assertIn("同意启用", text)
+        self.assertEqual(text.count("需要您确认"), 1, "确认话术不应重复出现")
         self.assertIsNotNone(self.service.store.get_state(self.sid).get("pending"))
         history = self.service.messages(self.sid)["messages"]
         persisted = [block for message in history for block in (message.get("blocks") or [])]
@@ -102,6 +103,14 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue([block for block in _blocks(events) if block["type"] == "version"])
         rolled = self.service.store.active_version()
         self.assertNotEqual(rolled["id"], active["id"])
+
+        # 8) 客户点名切换 SVM：必须直接按 svm_linear 生成候选方案，不得说“没有对应选项”
+        events, text = self.chat("帮我换成 SVM 模型")
+        works = [block for block in _blocks(events) if block["type"] == "work"]
+        approvals = [block for block in _blocks(events) if block["type"] == "approval"]
+        self.assertTrue(works and approvals)
+        self.assertEqual((works[-1].get("proposal") or {}).get("model_name"), "svm_linear")
+        self.assertEqual(text.count("需要您确认"), 1)
 
     def test_state_endpoint_payload(self) -> None:
         state = self.service.get_state(self.sid)

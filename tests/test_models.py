@@ -118,7 +118,9 @@ class RegistryTests(unittest.TestCase):
     """内置模型注册表。"""
 
     def test_builtin_model_ids_complete(self) -> None:
-        self.assertGreaterEqual(len(MODEL_TYPES), 5)
+        self.assertGreaterEqual(len(MODEL_TYPES), 6)
+        self.assertIn("svm_linear", MODEL_TYPES)
+        self.assertIn("SVM", MODEL_TYPES["svm_linear"].name)
         for model_id in REQUIRED_MODEL_IDS:
             self.assertIn(model_id, MODEL_TYPES)
             self.assertEqual(MODEL_TYPES[model_id].id, model_id)

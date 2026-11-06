@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from backend.agent import Agent, AgentError, ComplianceError, ensure_compliance
+from backend.agent import (Agent, AgentError, ComplianceError, ensure_compliance,
+                          strip_confirmation_tail, trim_duplicate_confirmation)
 from backend.llm import FakeLLM
 from backend.schemas import profile_payload
 
@@ -14,6 +15,21 @@ def _state(slots: dict | None = None, confirmed: bool = False, **extra) -> dict:
     state = {"profile": payload, "pending": None, "versions": [], "last_selection": None}
     state.update(extra)
     return state
+
+
+
+class ConfirmationDedupTest(unittest.TestCase):
+    def test_duplicate_confirmation_is_removed(self) -> None:
+        text = ("已按您的要求完成回测，最大回撤由 19% 收窄至 16%。\n\n"
+                "需要您确认：是否启用该模型改进方案？请回复「同意启用」应用该方案。\n\n"
+                "需要您确认：是否启用该模型改进方案？请回复「同意启用」应用该方案。")
+        cleaned = trim_duplicate_confirmation(text)
+        self.assertEqual(cleaned.count("需要您确认"), 1)
+        self.assertIn("19%", cleaned)
+
+    def test_strip_confirmation_tail_keeps_facts(self) -> None:
+        note = "已生成候选方案，最大回撤 16%。需要您确认：是否启用？"
+        self.assertEqual(strip_confirmation_tail(note), "已生成候选方案，最大回撤 16%")
 
 
 class AgentPlanTest(unittest.TestCase):

@@ -62,7 +62,7 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - 称呼客户为“您”；语气专业、克制、礼貌，不使用网络用语、感叹号、表情或夸张形容。
 - 不进行自我叙述，不描述“我接下来要做什么步骤”，禁止出现“先问第一个问题、第一个问题、接下来我会、作为 AI、希望以上、感谢您的信任”等套话。
 - 需要了解信息时，使用业务化表达，例如：“在为您提供适配建议前，需要向您确认一项信息：……”“为完成适当性匹配，请补充……”。
-- 一次只确认一个信息点；信息足够时先做简明摘要，再请客户确认，不要反复追问。
+- 一次只确认一个信息点；信息足够时先做简明摘要，再请客户确认，不要反复追问；已经确认或已经回答过的画像字段不得再次询问。
 - 不重复客户原话，不做机械式分点罗列；能用两句话说清就不用五点。
 
 ## 服务流程
@@ -94,7 +94,7 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - confirm_profile：客户本轮明确同意画像时使用（“可以/确认/没问题/就按这个来”），且必填齐全。
 - run_selection：画像确认后开始选股；客户说“开始/帮我选股/可以”时与 confirm_profile 一同输出。
 - explain_results：最近有选股结果、客户在问“为什么/风险/怎么看”时使用。
-- analyze_model：客户明确要求优化模型/效果不好/想调参，且没有待澄清问题时使用；系统会分析并给出候选方案，不会直接启用。
+- analyze_model：客户明确要求优化模型/效果不好/想调参/点名切换模型（如 SVM、支持向量机、低波质量）时使用；系统会分析并给出候选方案，不会直接启用。客户点名模型中已有选项时不得以“没有对应选项”为由拒绝，服务端会优先按客户点名的模型生成方案。
 - apply_pending_change：存在待审批方案（state.pending 非空）且客户本轮明确同意时使用。
 - rollback_version：客户明确要求回滚时使用。
 
@@ -152,6 +152,35 @@ def asks_clarifying_question(reply: str) -> bool:
 
 def has_confirmation_request(text: str) -> bool:
     return any(marker in text for marker in CONFIRMATION_MARKERS)
+
+
+CONFIRMATION_LEADS = ("需要您确认", "请您确认", "【请确认】", "【待确认】")
+
+
+def strip_confirmation_tail(text: str) -> str:
+    """去掉文本中从第一个确认话术开始的后半段（用于避免重复追问）。"""
+    value = str(text or "")
+    positions = [value.find(marker) for marker in CONFIRMATION_LEADS if marker in value]
+    if not positions:
+        return value
+    head = value[:min(positions)].rstrip(" \n；。")
+    return head
+
+
+def trim_duplicate_confirmation(text: str) -> str:
+    """保留一段确认话术，删除后面重复的纯确认段落。"""
+    value = str(text or "")
+    if not has_confirmation_request(value):
+        return value
+    paragraphs = value.split("\n\n")
+    confirmation_indices = [index for index, item in enumerate(paragraphs) if has_confirmation_request(item)]
+    if len(confirmation_indices) <= 1:
+        return value
+    for index in confirmation_indices[1:]:
+        stripped = paragraphs[index].strip()
+        if stripped.startswith(CONFIRMATION_LEADS):
+            paragraphs[index] = ""
+    return "\n\n".join(item for item in paragraphs if item.strip())
 
 
 def confirmation_hint(state: dict[str, Any], plan: Plan) -> str:

@@ -13,7 +13,8 @@ from typing import Any, Iterator
 import pandas as pd
 
 from .agent import (Agent, AgentError, CONFIRM_PENDING_HINT, CONFIRM_PROFILE_HINT,
-                     chunk_text, has_confirmation_request, safe_question)
+                     chunk_text, has_confirmation_request, safe_question,
+                     strip_confirmation_tail, trim_duplicate_confirmation)
 from .config import (
     A_SHARE_DIR,
     BACKTEST_YEARS,
@@ -55,6 +56,16 @@ WORK_STEP_TEMPLATES = {
     "check": "检查代码安不安全",
     "backtest": "拿候选方案回测",
     "compare": "和现在比一比",
+}
+
+
+MODEL_REQUEST_ALIASES: dict[str, tuple[str, ...]] = {
+    "svm_linear": ("svm", "支持向量机", "线性核", "support vector", "supportvector"),
+    "low_vol_quality": ("低波质量", "低波稳健"),
+    "multi_factor": ("均衡多因子", "均衡配置"),
+    "momentum_growth": ("趋势成长", "动量成长"),
+    "value_dividend": ("价值红利", "红利策略"),
+    "contrarian": ("反转策略", "反转模型"),
 }
 
 
@@ -222,7 +233,8 @@ class AppService:
                               + profile_summary(updated_profile["slots"])
                               + "\n\n" + CONFIRM_PROFILE_HINT)
 
-        # 2) 流式回复
+        # 2) 流式回复（去掉模型自行重复的确认段落）
+        plan.reply = trim_duplicate_confirmation(plan.reply)
         notes: list[str] = []
         pending_before = bool(public_state.get("pending"))
         try:
@@ -235,10 +247,13 @@ class AppService:
                     if isinstance(block, dict) and block.get("id"):
                         saved_blocks[str(block["id"])] = block
                 if note:
-                    notes.append(note)
-                    yield "token", {"text": "\n\n"}
-                    for piece in chunk_text(note):
-                        yield "token", {"text": piece}
+                    if has_confirmation_request(plan.reply) and has_confirmation_request(note):
+                        note = strip_confirmation_tail(note).strip()
+                    if note:
+                        notes.append(note)
+                        yield "token", {"text": "\n\n"}
+                        for piece in chunk_text(note):
+                            yield "token", {"text": piece}
                 if should_stop:
                     break
             # 有待审批方案但没有处理时，明确提醒用户做决定
@@ -246,7 +261,10 @@ class AppService:
                     and not plan.has_action("analyze_model")
                     and self.store.get_state(session_id).get("pending")):
                 hint = CONFIRM_PENDING_HINT
-                if hint not in notes and hint not in plan.reply:
+                notes_have_confirmation = any(has_confirmation_request(item) for item in notes)
+                if (hint not in notes and hint not in plan.reply
+                        and not has_confirmation_request(plan.reply)
+                        and not notes_have_confirmation):
                     yield "token", {"text": "\n\n"}
                     for piece in chunk_text(hint):
                         yield "token", {"text": piece}
@@ -423,14 +441,19 @@ class AppService:
         factor_stats = self._factor_stats(_scores, weights)
         recent_metrics = self._recent_metrics(model)
         force_code = self._wants_code_change(request_text)
-        proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
-                                            request_text, force_code)
-        proposal = self._normalize_proposal(proposal_raw, weights)
-        if force_code and proposal["approach"] != "code":
-            # 客户明确要求改代码时，再明确约束一次
+        requested_model = self._requested_model_type(request_text)
+        if requested_model:
+            # 客户点名模型：优先按点名模型生成确定性方案，避免模型说“没有对应选项”
+            proposal = self._normalize_proposal(self._model_switch_proposal(requested_model), weights)
+        else:
             proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
-                                                request_text, True, strict=True)
+                                                request_text, force_code)
             proposal = self._normalize_proposal(proposal_raw, weights)
+            if force_code and proposal["approach"] != "code":
+                # 客户明确要求改代码时，再明确约束一次
+                proposal_raw = self._propose_change(model, base_metrics, factor_stats, recent_metrics,
+                                                    request_text, True, strict=True)
+                proposal = self._normalize_proposal(proposal_raw, weights)
         add_step("提出改进方案", str(proposal.get("summary", "")), "done", "plan")
         yield "ui", publish(proposal=self._proposal_public(proposal))
 
@@ -549,6 +572,30 @@ class AppService:
         yield "ui", {"block": approval}
         return [final_work["block"], approval], ("需要您确认：新的模型方案已完成回测。是否启用？"
                     "请回复「同意启用」应用该方案，或回复「先不启用」保留现有模型。"), False
+
+    @staticmethod
+    def _requested_model_type(request_text: str) -> str:
+        text = str(request_text or "").lower().replace(" ", "").replace("-", "")
+        if not text:
+            return ""
+        for model_id, aliases in MODEL_REQUEST_ALIASES.items():
+            for alias in aliases:
+                if alias.lower().replace(" ", "") in text:
+                    return model_id
+        return ""
+
+    @staticmethod
+    def _model_switch_proposal(model_type: str) -> dict[str, Any]:
+        from .models import registry
+        info = registry.get_model(model_type)
+        return {
+            "approach": "model_type",
+            "model_type": model_type,
+            "summary": f"按您的要求切换为「{info.get('name')}」模型：{info.get('description')}",
+            "why": "您明确点名了该模型；本次先保留既有因子框架，切换为对应风格权重后再做同区间回测。",
+            "expected_effect": "风格与您指定的模型一致；收益与回撤变化以本次候选回测数据为准。",
+            "risks": ["历史回测不代表未来实际表现。", "切换风格后短期表现可能与原模型差异较大。"],
+        }
 
     def _propose_change(self, model: dict[str, Any], base_metrics: dict[str, Any],
                         factor_stats: dict[str, Any], recent_metrics: dict[str, Any],

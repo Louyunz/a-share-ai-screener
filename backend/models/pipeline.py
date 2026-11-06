@@ -107,6 +107,9 @@ def _build_system_prompt() -> str:
         "## 内置模型清单",
         model_lines,
         "",
+        "客户点名清单内的模型（例如 SVM / 支持向量机）时，必须优先使用 approach=\"model_type\"，"
+        "model_type 使用对应 id（SVM → svm_linear）；不得声称没有对应选项，也不得擅自替换成其他风格。",
+        "",
         "## 可用因子",
         f"{factor_lines}。",
         "因子值（z 列）已经做过方向对齐：数值越大代表该因子越优（例如 volatility_60 越大代表波动越低）。",

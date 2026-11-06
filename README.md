@@ -5,7 +5,7 @@
 - 前端：原生 JS + 纯 SVG 图表，无构建链、无 CDN；**Professional Financial SaaS** 三栏布局（左侧导航 / 中间 AI 对话工作区 / 右侧投资上下文）
 - 后端：FastAPI（单进程同时托管页面与 API）+ SQLite + pandas
 - 数据：AkShare 为主、Tushare 为辅；离线缓存自动选择 parquet/CSV；无网络时可用内置示例数据
-- 模型：10 因子选股引擎 + 5 种内置模型类型 + AI 生成自定义打分代码（AST 白名单 + 子进程冒烟 + 回测验证）
+- 模型：10 因子选股引擎 + 6 种内置模型类型（含 SVM 线性核）+ AI 生成自定义打分代码（AST 白名单 + 子进程冒烟 + 回测验证）
 
 ## 它怎么工作
 
@@ -91,6 +91,7 @@ $env:LLM_MODEL = "deepseek-chat"
 - **字体与数字**：`Inter, PingFang SC, Microsoft YaHei, Noto Sans CJK SC`；金融指标和表格数字使用 `font-variant-numeric: tabular-nums`，避免变化时跳动。
 - **克制交互**：页面淡入 150ms、按钮/输入聚焦 120–150ms；不使用动态渐变背景、玻璃拟态、持续发光 AI 图标或无意义悬浮动画；支持 `prefers-reduced-motion`。
 - **AI 对话组织**：AI 回复不只输出大段文字，还以指标卡、数据表格、代码 diff、方案对比、风险提示等结构化卡片呈现；审批与启用必须经过聊天确认。
+- **换模型与重复提问**：内置 6 种模型类型（含 SVM 线性核）；客户点名模型（如 SVM/支持向量机）时优先按点名模型生成候选方案，不再以“没有对应选项”拒绝。确认话术在服务端去重，已确认画像字段不会被重复询问。SVM 为线性核风格的规则化因子权重模型，不进行在线训练。
 
 ## 导航与对话管理
 
@@ -124,7 +125,7 @@ backend/
   models/            内置模型类型、AI 代码安全校验与编译、提案流水线
 frontend/
   index.html / app.js / style.css / charts.js
-tests/               95+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
+tests/               97+ 个 unittest（引擎/模型/Agent/存储/对话服务/HTTP）
 scripts/             构建缓存、启动、重置、全量测试、E2E 冒烟
 docs/                接口契约、运行手册、设计摘要、界面截图
 ```
