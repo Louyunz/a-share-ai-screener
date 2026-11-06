@@ -7,6 +7,7 @@ from typing import Any
 
 # 槽位顺序即画像卡展示顺序；“label”用生活化语言，避免风控术语吓到用户
 SLOT_DEFS: list[dict[str, Any]] = [
+    {"key": "name", "label": "称呼", "required": False, "hint": "怎么称呼您"},
     {"key": "goal", "label": "投资目标", "required": True, "hint": "这笔钱主要想用来做什么"},
     {"key": "horizon", "label": "投资期限", "required": True, "hint": "大概多久不用这笔钱"},
     {"key": "drawdown_tolerance", "label": "能接受的最大亏损", "required": True, "hint": "最多能接受亏多少"},
@@ -28,6 +29,10 @@ SLOT_HINTS = {item["key"]: item["hint"] for item in SLOT_DEFS}
 
 # 外部输入里常见的同义键
 _ALIASES = {
+    "name": "name",
+    "称呼": "name",
+    "姓名": "name",
+    "怎么称呼": "name",
     "risk_level": "risk_level",
     "risk": "risk_level",
     "drawdown": "drawdown_tolerance",
@@ -79,7 +84,7 @@ def _risk_level(slots: dict[str, str]) -> str:
 
 
 def normalize_slots(raw: dict[str, Any] | None) -> dict[str, str]:
-    """把外部输入收敛成 12 个标准槽位（值为字符串，空值删除）。"""
+    """把外部输入收敛成标准槽位（值为字符串，空值删除）。"""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
