@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from backend.agent import (Agent, AgentError, ComplianceError, ensure_compliance,
-                          is_explanation_question, repair_mechanical_reply,
+                          has_mechanical_style, is_explanation_question,
                           strip_confirmation_tail, trim_duplicate_confirmation)
 from backend.llm import FakeLLM
 from backend.schemas import profile_payload
@@ -19,22 +19,48 @@ def _state(slots: dict | None = None, confirmed: bool = False, **extra) -> dict:
 
 
 
+class _RewriteLLM:
+    def __init__(self, first_reply: str) -> None:
+        self.first_reply = first_reply
+        self.text_calls = 0
+
+    def chat_json(self, system, messages):
+        return {"reply": self.first_reply, "actions": [], "profile_delta": {}}
+
+    def chat_text(self, system, messages):
+        self.text_calls += 1
+        return ("刚才问的是您的「亏损反应」，也就是市场下跌、持仓出现浮亏时您通常会怎么处理。"
+                "它没有标准答案，用于判断您对波动的真实承受方式。您用自己的话说即可，"
+                "继续持有、补仓或减仓都只是常见例子，不必按固定选项回答。")
+
+
 class ExplanationStyleTest(unittest.TestCase):
-    def test_mechanical_option_reply_is_repaired(self) -> None:
+    def test_mechanical_reply_is_regenerated(self) -> None:
         reply = ("您指的是刚才那个问题。它用于判断您在市场下跌时的真实反应，直接影响适当性匹配结果。"
                  "请选择一项：一是继续持有等待修复，二是分批补仓摊低成本，三是止损离场。回复对应选项即可。")
-        state = {"profile": {"missing": ["亏损反应"]}}
+        self.assertTrue(has_mechanical_style(reply))
+        llm = _RewriteLLM(reply)
+        agent = Agent(llm)
+        state = {"profile": {"complete": False, "confirmed": False,
+                             "missing": ["亏损反应"], "summary": ""},
+                 "pending": None, "versions": [], "last_selection": None}
         history = [{"role": "assistant", "content": "真亏了会怎么做？例如继续持有等待修复，或者分批补仓摊低成本。"}]
-        repaired = repair_mechanical_reply(reply, state, history, "这些都是什么意思")
-        self.assertIn("亏损反应", repaired)
-        self.assertNotIn("请选择一项", repaired)
-        self.assertNotIn("回复对应选项即可", repaired)
-        self.assertNotIn("您指的是刚才那个问题", repaired)
-        self.assertIn("不必按固定选项回答", repaired)
+        plan = agent.plan(state, history, "这些都是什么意思")
+        self.assertEqual(llm.text_calls, 1)
+        self.assertIn("亏损反应", plan.reply)
+        self.assertNotIn("请选择一项", plan.reply)
+        self.assertNotIn("回复对应选项即可", plan.reply)
+        self.assertNotIn("您指的是刚才那个问题", plan.reply)
 
-    def test_normal_reply_is_kept(self) -> None:
-        reply = "这笔钱大概多久可以不用？您按实际情况说一个大致年限即可。"
-        self.assertEqual(repair_mechanical_reply(reply, {}, [], "这个是什么意思"), reply)
+    def test_normal_reply_is_not_rewritten(self) -> None:
+        llm = _RewriteLLM("这笔钱大概多久可以不用？您按实际情况说一个大致年限即可。")
+        agent = Agent(llm)
+        state = {"profile": {"complete": False, "confirmed": False,
+                             "missing": ["投资期限"], "summary": ""},
+                 "pending": None, "versions": [], "last_selection": None}
+        plan = agent.plan(state, [], "这个是什么意思")
+        self.assertEqual(llm.text_calls, 0)
+        self.assertTrue(plan.reply)
         self.assertTrue(is_explanation_question("这些都是什么意思"))
         self.assertFalse(is_explanation_question("帮我选股"))
 

@@ -170,60 +170,23 @@ def _last_assistant_text(history: list[dict[str, str]] | None) -> str:
     return ""
 
 
-def _slot_from_context(state: dict[str, Any], history: list[dict[str, str]] | None) -> str:
-    text = _last_assistant_text(history)
-    mappings = (
-        ("loss_reaction", ("亏损反应", "真亏了", "下跌时", "继续持有", "补仓", "止损", "怎么处理")),
-        ("drawdown_tolerance", ("回撤", "最大亏损", "能接受亏", "亏损承受", "跌多少")),
-        ("horizon", ("投资期限", "多久", "不用这笔钱", "什么时候用")),
-        ("goal", ("投资目标", "资金用途", "用来做什么", "做什么用")),
-        ("income_stability", ("收入稳定",)),
-        ("experience", ("投资经验", "基金", "股票")),
-        ("liquidity_need", ("用钱计划", "大额支出")),
-    )
-    for slot, keywords in mappings:
-        if any(word in text for word in keywords):
-            return slot
-    profile = state.get("profile") or {}
-    missing = profile.get("missing") or []
-    for slot, _keywords in mappings:
-        label = {"loss_reaction": "亏损反应", "drawdown_tolerance": "最大亏损",
-                 "horizon": "投资期限", "goal": "投资目标"}.get(slot, "")
-        if label and label in missing:
-            return slot
-    return ""
+MECHANICAL_STYLE_MARKERS = (
+    "请选择一项", "回复对应选项即可", "您指的是刚才那个问题",
+    "一是继续持有", "二是分批补仓", "三是止损离场",
+)
+
+STYLE_REPAIR_SYSTEM = """你是持牌投资顾问。客户刚才对适当性提问表示不理解。
+请重写给定回复，要求：
+1. 用 2-4 句自然中文，先明确说出具体字段/概念是什么、为什么需要了解，再邀请客户用自己的话回答；
+2. 不得使用“请选择一项”“一是/二是/三是”“回复对应选项即可”等问卷/表单式表达；
+3. 不得使用“您指的是刚才那个问题”这类空泛指代；
+4. 不要编造客户信息，不要新增风险承诺；最后只问一个开放式问题，或直接邀请客户按实际情况描述。
+只输出重写后的回复正文，不要解释你的修改过程。"""
 
 
-def _explanation_reply(state: dict[str, Any], history: list[dict[str, str]] | None) -> str:
-    slot = _slot_from_context(state, history)
-    if slot == "loss_reaction":
-        return ("刚才问的是您的「亏损反应」，也就是市场下跌、持仓出现浮亏时，您通常会怎么处理。"
-                "它没有标准答案，目的是了解您对波动的真实承受方式，并和最大回撤上限一起做适当性匹配。"
-                "继续持有、分批补仓、减仓或止损都只是常见例子，您可以直接用自己的话描述，不必按固定选项回答。")
-    if slot == "drawdown_tolerance":
-        return ("刚才问的是「最大可接受回撤」，也就是持仓从高点回落时，您最多能接受亏多少。"
-                "它用于适当性匹配和策略风险控制，给一个大致百分比区间即可，没有对错。")
-    if slot == "horizon":
-        return ("刚才问的是「投资期限」，指这笔钱大概多久可以不动用。"
-                "期限越短，越需要控制波动和流动性风险；您按实际情况说一个大致年限即可，不必精确到某一天。")
-    if slot == "goal":
-        return ("刚才问的是「资金用途」，也就是这笔钱主要想解决什么问题。不同用途对应的期限和风险差异很大，"
-                "您按真实想法说即可，没有标准答案。")
-    return ("刚才那一项是在了解您的资金安排和风险承受情况，用于做适当性匹配。没有标准答案，"
-            "您按自己的实际情况和直观感受说就可以，不需要按固定选项回答。")
-
-
-def repair_mechanical_reply(reply: str, state: dict[str, Any],
-                            history: list[dict[str, str]] | None,
-                            message: str) -> str:
-    """客户追问概念时，替换明显的问卷式/空泛指代回复。"""
-    value = str(reply or "").strip()
-    if not is_explanation_question(message):
-        return value
-    banned = ("请选择一项", "回复对应选项即可", "您指的是刚才那个问题", "一是继续持有", "二是分批补仓")
-    if any(item in value for item in banned):
-        return _explanation_reply(state, history)
-    return value
+def has_mechanical_style(reply: str) -> bool:
+    value = str(reply or "")
+    return any(marker in value for marker in MECHANICAL_STYLE_MARKERS)
 
 
 def has_confirmation_request(text: str) -> bool:
@@ -283,6 +246,29 @@ class Agent:
     def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
 
+    def _regenerate_explanation(self, draft: str, state: dict[str, Any],
+                                history: list[dict[str, str]], message: str) -> str:
+        """提示词已约束；若仍出现问卷式话术，调用同一模型重写一次/两次。"""
+        last_question = _last_assistant_text(history)
+        profile = state.get("profile") or {}
+        payload = json.dumps({
+            "customer_question": message,
+            "previous_question": last_question,
+            "draft_reply": draft,
+            "profile_summary": profile.get("summary", ""),
+            "missing_labels": profile.get("missing", []),
+        }, ensure_ascii=False)
+        for _attempt in range(2):
+            try:
+                rewritten = str(self.llm.chat_text(
+                    STYLE_REPAIR_SYSTEM, [{"role": "user", "content": payload}]) or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                raise AgentError(f"AI 暂时无法重新组织说明：{exc}") from exc
+            if rewritten and not has_mechanical_style(rewritten):
+                ensure_compliance(rewritten)
+                return rewritten
+        raise AgentError("AI 暂时无法把这条说明讲清楚，请换一种问法再试。")
+
     # ------------------------------------------------------------------
     def plan(self, state: dict[str, Any], history: list[dict[str, str]],
              message: str) -> Plan:
@@ -299,8 +285,8 @@ class Agent:
             reply = "在继续之前，需要向您确认当前的投资目标与资金安排，以便为您做适当性匹配。"
         ensure_compliance(reply)
         actions = self._parse_actions(raw.get("actions"))
-        if not actions:
-            reply = repair_mechanical_reply(reply, state, history, message)
+        if not actions and is_explanation_question(message) and has_mechanical_style(reply):
+            reply = self._regenerate_explanation(reply, state, history, message)
         delta = raw.get("profile_delta")
         if not isinstance(delta, dict):
             delta = {}
