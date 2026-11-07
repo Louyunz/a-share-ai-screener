@@ -297,12 +297,28 @@ class AuthManager:
     # ------------------------------------------------------------------
     # Cookie / 状态
     # ------------------------------------------------------------------
-    def set_cookie(self, response: Response, token: str) -> None:
+    def set_cookie(self, response: Response, token: str, *, secure: bool = False) -> None:
         response.set_cookie(
             AUTH_COOKIE_NAME, token,
             max_age=int(AUTH_SESSION_HOURS * 3600),
-            httponly=True, samesite="strict", secure=AUTH_COOKIE_SECURE, path="/",
+            httponly=True, samesite="strict", secure=bool(secure), path="/",
         )
+
+    @staticmethod
+    def request_is_https(request: Request) -> bool:
+        """直连 HTTPS 或反向代理声明 X-Forwarded-Proto: https。"""
+        forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        return request.url.scheme == "https" or forwarded == "https"
+
+    @classmethod
+    def cookie_secure_for(cls, request: Request) -> bool:
+        """显式 1/0 优先；auto 时根据 HTTPS/反向代理判断。"""
+        mode = str(AUTH_COOKIE_SECURE or "auto").strip().lower()
+        if mode in ("1", "true", "yes", "always", "force"):
+            return True
+        if mode in ("0", "false", "no", "never"):
+            return False
+        return cls.request_is_https(request)
 
     @staticmethod
     def clear_cookie(response: Response) -> None:

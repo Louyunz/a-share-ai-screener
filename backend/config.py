@@ -60,7 +60,8 @@ AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "").strip()
 AUTH_PASSWORD_HASH = os.environ.get("AUTH_PASSWORD_HASH", "").strip()
 AUTH_SESSION_HOURS = float(os.environ.get("AUTH_SESSION_HOURS", "12"))
 AUTH_COOKIE_NAME = os.environ.get("AUTH_COOKIE_NAME", "zhitou_admin_session")
-AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "1").strip().lower() in ("1", "true", "yes")
+# auto=按 HTTPS/反代自动判断；1=强制 Secure（生产 HTTPS 推荐）；0=强制不 Secure（仅本机 HTTP）
+AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "auto").strip().lower()
 AUTH_ALLOW_SETUP = os.environ.get("AUTH_ALLOW_SETUP", "1").strip().lower() not in ("0", "false", "no")
 
 # 演示账户（单用户）

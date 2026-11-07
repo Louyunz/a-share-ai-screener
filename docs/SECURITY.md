@@ -6,7 +6,7 @@
 - **所有业务 API 默认需要登录**：`/api/auth/*` 之外的所有 `/api/**` 在未认证时返回 401；管理员接口额外校验 admin 角色。
 - **密码哈希**：PBKDF2-HMAC-SHA256（390,000 次迭代、随机盐）；密码明文不落库、不回显。重置密码会立刻注销该用户的所有会话。
 - **服务端会话**：浏览器只持有随机 256-bit 会话令牌（HttpOnly Cookie）；数据库只存令牌的 SHA-256，可服务端注销。
-- **Cookie**：默认启用 `Secure`，并使用 `HttpOnly` + `SameSite=Strict` + `Path=/`；仅本机 HTTP 开发调试时才应显式设置 `AUTH_COOKIE_SECURE=0`。
+- **Cookie**：`HttpOnly` + `SameSite=Strict` + `Path=/`。`AUTH_COOKIE_SECURE`：`auto` 按 HTTPS/反向代理自动判断；`1` 强制 Secure（生产 HTTPS 推荐）；`0` 强制不 Secure（仅本机 HTTP 调试）。HTTP 下强制 Secure 时，Python 等严格 HTTP 客户端不会回传 Cookie；现代浏览器通常允许 localhost 上的 Secure Cookie，但生产环境仍应使用 HTTPS。
 - **CSRF**：SameSite=Strict，并对带 `Origin` 的写请求校验同源；已移除通配 CORS。
 - **暴力破解**：同一来源 5 分钟内连续失败 5 次后短时锁定。
 - **首次初始化**：没有账号时，只允许从服务器本机（loopback）创建管理员；设置完成后初始化接口自动关闭。
@@ -27,7 +27,7 @@
 
 **不存在“绝对安全”**。当前项目是本地单机、小规模多用户演示：
 
-- 默认通过 HTTP 暴露在 `127.0.0.1`，但 Cookie 默认带 `Secure`，因此 HTTP 访问不会发送管理员会话 Cookie；如果要在局域网/公网使用，**必须**放在 HTTPS 反向代理后，禁止关闭 `AUTH_COOKIE_SECURE`，否则 Cookie 和密码可能在链路上被截获。
+- 默认通过 HTTP 暴露在 `127.0.0.1`：本机 HTTP 下 Cookie 不设 `Secure`，否则浏览器不会发送登录 Cookie；服务检测到 HTTPS（或 `X-Forwarded-Proto: https`）时会自动加 `Secure`。局域网/公网使用**必须**放在 HTTPS 反向代理后，否则 Cookie 和密码可能在链路上被截获。
 - SQLite 数据文件本身不加密；能读到 `data/app.db` 的人仍能看到会话内容。生产环境需要磁盘加密、最小权限运行账号和备份加密。
 - 账号体系只有 admin/user 两种角色，无 MFA、无 SSO/LDAP；需要机构级合规时应接入统一身份认证。
 - 前端仍有内联样式和动态 `innerHTML` 渲染卡片；CSP 已限制脚本来源，但 XSS 防护仍需持续审计。
@@ -35,7 +35,7 @@
 
 上线检查清单：
 
-1. HTTPS 反向代理，并保持 `AUTH_COOKIE_SECURE=1`；
+1. HTTPS 反向代理（代理需传递 `X-Forwarded-Proto: https`，服务会自动启用 Secure Cookie）；
 2. 仅监听内网/本机，不用 `--host 0.0.0.0` 直接暴露；
 3. 使用强密码（≥ 10 位，字母+数字；建议 16 位以上随机密码）；
 4. 定期更新依赖与备份 `data/app.db`（备份本身要加密）。

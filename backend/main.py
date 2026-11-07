@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """FastAPI 入口：登录保护的单页应用 + 对话 SSE。
 
 启动：``uvicorn backend.main:app --port 8000``
@@ -150,7 +150,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
             token = get_auth().setup(
                 request, str(body.get("username", "")), str(body.get("password", "")))
             response = JSONResponse({"ok": True, "username": str(body.get("username", "")).strip()})
-            get_auth().set_cookie(response, token)
+            get_auth().set_cookie(response, token, secure=get_auth().cookie_secure_for(request))
             return response
         except AuthError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
@@ -162,7 +162,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
             token = get_auth().login(
                 request, str(body.get("username", "")), str(body.get("password", "")))
             response = JSONResponse({"ok": True, "username": str(body.get("username", "")).strip()})
-            get_auth().set_cookie(response, token)
+            get_auth().set_cookie(response, token, secure=get_auth().cookie_secure_for(request))
             return response
         except AuthError as exc:
             headers = {"Retry-After": "60"} if exc.status == 429 else None
