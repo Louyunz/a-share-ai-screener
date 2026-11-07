@@ -297,7 +297,8 @@ class AuthManager:
     # ------------------------------------------------------------------
     # Cookie / 状态
     # ------------------------------------------------------------------
-    def set_cookie(self, response: Response, token: str, *, secure: bool = False) -> None:
+    def set_cookie(self, response: Response, token: str, *, secure: bool = True) -> None:
+        """Web 路由必须传入 cookie_secure_for(request)；默认 Secure 便于安全测试/默认安全。"""
         response.set_cookie(
             AUTH_COOKIE_NAME, token,
             max_age=int(AUTH_SESSION_HOURS * 3600),
