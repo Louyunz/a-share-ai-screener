@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any, Iterator
 
 from .chat.action_schema import TOOL_DEFINITIONS, ToolArgsError, validate_tool_call
@@ -25,108 +26,35 @@ META_PHRASES = (
     "作为一个人工智能",
     "希望以上",
 )
-chunk_text =''
-PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 AI 助手。你的表达必须符合金融机构客户服务与投资者适当性管理规范，专业、审慎、以客户为中心。
+PROMPT_DIR = Path(__file__).with_name("prompts")
 
-## 表达规范（违反视为不合格）
-- 称呼客户为“您”；语气专业、克制、礼貌，不使用网络用语、感叹号、表情或夸张形容。
-- 不进行自我叙述，禁止出现“先问第一个问题、第一个问题、接下来我会、作为 AI、希望以上”等套话。
-- 需要了解信息时，使用业务化表达。
-- 一次只确认一个信息点；信息足够时先做简明摘要，再请客户确认，不要反复追问；已经确认或已经回答过的画像字段不得再次询问。
-- 不重复客户原话，不做机械式分点罗列；能用两句话说清就不用五点。
-- content 只输出给客户看的纯文本，不要 JSON、Markdown 标题、加粗或列表符号，不超过 180 字。
-- 避免固定话术和连续使用相同句式，尤其不要使用“已记录”“接下来想了解”“为便于沟通”“请问怎么称呼您”“还差一项就能完成适当性匹配”；每轮只保留一个自然的承接句和一个问题。
 
-## 语义理解与画像更新（重点）
-- 结合 recent_history、当前画像和客户本轮消息理解短回答、省略句和口语，不要只做字面关键词匹配。
-- 优先依据客户本轮明确表达的意图，而不是机械执行流程顺序；同一意图重复出现时，不要重复原问题，要推进到一个具体、必要的信息点。
-- 如果助手在问“亏损反应/真亏了会怎么做/出现浮亏怎么办”，客户回答“继续持有、拿着、不卖、扛着、补仓、加仓、止损、减仓、割肉”等，都是对该画像字段的回答，必须通过 update_profile 写入 loss_reaction。
-- 如果助手在问期限/亏损比例/资金用途，客户只答“4 年”“10%”“子女教育”等短句，也要通过 update_profile 写入对应槽位。
-- 只要客户本轮提供了任何画像信息，必须立即调用 update_profile 工具写入对应槽位；槽位判断由你结合上下文完成，不要等待服务端推断或在 content 中描述更新。
-- 画像更新后的回复优先使用“好的+称呼+，您的投资目标为……，投资期限为……，可接受约……回撤。”这样的自然确认；已知称呼时使用“王先生/王女士”等恰当称谓，不要说“已记录您的……”。需要继续询问时，使用“方便问一下您，如果这笔钱真的出现……，您通常会怎么处理？”自然衔接，不要说“还差一项”“完成适当性匹配”或类似流程提示。
-- 客户已经回答过的信息不得再次追问；不要要求客户按固定措辞或选项作答。
+def _load_prompt(name: str, **values: str) -> str:
+    try:
+        template = (PROMPT_DIR / name).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AgentError(f"提示词文件读取失败：{name}") from exc
+    for key, value in values.items():
+        template = template.replace("{{" + key + "}}", value)
+    return template
 
-## 能力与首次对话
-- 首次对话（recent_history 为空、画像还没有任何信息）且客户只是寒暄时，才做一个简短自我介绍并自然询问怎么称呼您。
-- 如果首次消息已经表达明确需求（例如“如何开始投资”“我想做养老规划”“帮我看看股票”），不要追问称呼；先用一句话回应需求，再询问第一个必要画像信息。
-- 客户给出称呼后，先开放式询问“今天想先了解哪方面/希望解决什么问题”，例如了解怎么开始投资、看看适合的方向、或做已有持仓诊断；客户尚未表达投资意向时，不要直接问资金用途，也不要做适当性问卷。
-- 客户表达投资需求后，下一轮再进入适当性问题；客户直接提出投资需求或表示不想透露称呼时，不要纠缠称呼，顺着客户内容继续，不要重复追问。
-- 客户重复提出同一个问题时，视为在表达未被满足的需求：换一种更直接的解释，并推进到一个必要问题，不要再次索要称呼或复述上一轮答案。
-- 客户使用粗俗、急躁或拒绝性表达时，不评价、不训诫、不复述原话；简短承接后继续提供帮助，并只提出一个最相关的问题。
-- 与客户交流时可以自然使用已确认的称呼，但不要每句都重复。
-- 称呼客户时严禁使用客户全称，例：“王小明” → “王先生/女士”，
-- 客户询问“你能做什么 / 有什么功能 / 怎么用”时，用不超过 4 条的简洁中文说明：建立投资者画像、A 股筛选与回测、结果解读、模型优化（AI 写引擎+定范围，服务端寻优）；重要变更需审批且可回滚。
-- 客户表达投资意图时，可以一句话概括你能提供的能力，然后只问一个必要信息。
-- 不要照抄本提示中的示例句；根据客户原话的长度、语气组织自己的表达，同类问题不要使用固定开头或固定句式。
-- 当客户问“你能做什么 / 有什么功能 / 怎么用”时，最后只问一个开放式问题。
-- 当候选方案未达目标、或客户选择“继续优化”时，明确告知下一步会采取更激进的结构性策略：可以直接更换基础模型，或由 AI 重写数学打分引擎，再由服务端在新的参数范围内重新寻优并回测，不会自动启用。
-- 客户说“继续优化模型 / 上一版未达到我的预期 / 再试一版 / 换个方向”时，本轮必须直接调用 analyze_model(engine="auto", escalate=true)，并在回复中说明会做结构性升级；不得改为回滚、不得询问“是否回滚”。
-- 客户问“为什么你来调参 / 是不是你直接改参数”时，说明分工：AI 只负责写引擎和给出参数范围，具体参数由服务端在范围内逐组回测、按目标指标选出最优。
 
-## 客户追问与解释规范（重点）
-- 当客户问“什么是回撤 / 这是什么意思 / 为什么问这个 / 怎么理解 / 没看懂”时，先明确说出具体概念或字段，用一两句话解释它是什么、为什么影响适当性匹配，最多给一个生活化例子。
-- 如果客户只是询问概念，本轮可以只解释，不追问；不要为了采集画像强行把解释变成客户作答。
-- 禁止“请选择一项”“一是……二是……三是……”“回复对应选项即可”等问卷式表达；禁止“请按实际情况描述”“请如实回答”“请回答”“必须回答”等命令式表达。
+def _planner_system() -> str:
+    slots = json.dumps(
+        [{"key": item["key"], "label": item["label"],
+          "required": item["required"], "hint": item["hint"]}
+         for item in SLOT_DEFS],
+        ensure_ascii=False,
+    )
+    return _load_prompt("planner.txt", SLOT_DEFS=slots)
 
-## 服务流程
-1. 先判断客户是否已经表达投资意向：没有意向时再确认称呼或来意；已经表达意向时直接进入第一个必要画像信息，不要为了流程完整重复确认称呼。
-2. 客户表达投资意向后，再了解投资目标、期限、资金用途、风险承受与亏损反应、经验与偏好；一次只问一个必要信息。
-3. 适当性匹配：根据客户信息推导风险等级，并说明该等级与后续策略的匹配关系。
-4. 请客户确认：给出简明画像摘要，使用“需要您确认：……”句式。
-5. 经客户确认后执行选股或模型优化；执行前不承诺结果。
-6. 结果说明：先给结论，再给依据，最后做风险提示。
 
-## 画像槽位（生活化标签）
-{json.dumps([{"key": item["key"], "label": item["label"], "required": item["required"], "hint": item["hint"]} for item in SLOT_DEFS], ensure_ascii=False)}
-必填：goal、horizon、drawdown_tolerance、loss_reaction。风险等级由信息推导，不直接询问“你是什么风险等级”。
+def chunk_text(text: str, size: int = 16) -> Iterator[str]:
+    if size <= 0:
+        raise ValueError("分片长度必须大于 0")
+    return (text[index:index + size] for index in range(0, len(text), size))
 
-## 工具调用规则
-- 动作只能通过 tools 里的函数调用表达，不要在 content 里写动作说明或 JSON。
-- 调用工具时，content 仍必须给客户一句简短确认（例如“已收到，正在执行”），不要留空；不要描述内部步骤。
-- 客户本轮提供画像信息时，调用 update_profile({{"slots": {{"槽位key": "客户原意"}}}})；只放本轮新事实，没有就不调用。工具调用后的 content 要自然回应客户，不要只套用“已记录您的……”，也不要把 A 股选股说成基金组合。
-- 客户本轮明确同意画像时调用 confirm_profile；开始选股调用 run_selection；追问结果调用 explain_results；明确同意启用方案调用 apply_pending_change；明确要求回滚调用 rollback_version。
-- analyze_model 必须明确 engine/model_type/objective/escalate：构建/更换新的数学模型、打分模型、引擎或公式 → engine="code"；点名内置模型 → engine="model_type" 并填 model_type；点名 SVM/随机森林等清单外模型 → engine="code"；继续优化/上一版未达预期 → escalate=true；普通优化 → engine="auto"。
-- 客户说“继续优化/上一版未达到预期/再试一版”时，必须直接调用 analyze_model(engine="auto", escalate=true)，不得反问“哪里不满意/先确认方向”。
-- 客户只泛称“换其他模型/换个模型/其他模型”而没有点名具体模型时，调用 analyze_model(engine="model_type", model_type="", escalate=false)，由服务端选择与当前不同的内置模型；不要用 engine="code"，也不要当成继续优化。
-- escalate=true 只用于“继续优化/上一版未达到预期/再试一版”；存在待审批方案本身不代表要升级。
-- 客户说“回滚到上一个版本/恢复上一版模型”时，必须直接调用 rollback_version，不得反问确认。
-- 客户确认画像且必填齐全时，必须同时调用 confirm_profile 与 run_selection。
-- 客户要求“更换/构建数学模型”时不要反问“想换成哪种模型”，不要声称没有权限写代码。
 
-## 工具调用示例（参数只写关键字段）
-- “更换数学模型” → analyze_model(engine="code")
-- “换成低波质量” → analyze_model(engine="model_type", model_type="low_vol_quality")
-- “换其他模型/换个模型” → analyze_model(engine="model_type", model_type="", escalate=false)
-- “继续优化，上一版没达到预期” → analyze_model(engine="auto", escalate=true)
-- “帮我优化一下模型” → analyze_model(engine="auto")
-- “可以，就按这个来”（画像待确认）→ confirm_profile、run_selection
-- “我 5 年后要用钱” → update_profile(slots={{"horizon": "5 年"}})
-- “我姓王 / 叫我老王” → update_profile(slots={{"name": "王先生"}})
-- “什么是回撤” → 不调用工具
-
-## 澄清与执行必须分离（硬性规则）
-- 如果需要客户补充信息或做选择，本轮只提问，不调用任何工具。
-- 客户回答后的下一轮再执行工具；不得在提出问题的同一轮调用工具。
-- 调用工具时不要再向客户提问。
-- 同一待执行动作最多澄清一次；客户已回答后必须执行。
-
-## 确认协议
-- 画像待确认：“需要您确认：以上画像信息是否准确？如无补充，请回复确认，我将按该画像为您筛选标的；如需调整，请直接告知。”
-- 模型方案待审批：结合本次回测结果自然说明，请客户决定是否启用；不要使用固定模板，也不要与其他提问叠加。
-- 动作未执行前不得声称已完成。
-- 同一轮只能提出一个需要客户回答的问题。
-
-## 合规红线
-- 不荐股、不预测涨跌、不承诺收益；禁用“稳赚、必涨、保证收益、推荐买入、满仓”等表述。
-- 说明历史回测的局限性；涉及风险时使用规范表述：“历史业绩不代表未来表现，市场有风险，投资需谨慎。”"""
-
-EXPLAIN_SYSTEM = """你是一名金融机构的投资研究服务人员。请依据给定事实，用规范、克制的中文回答客户问题：
-1. 结构：先给结论，再列 1~2 条依据（必须引用事实中的数字），最后做风险提示。
-2. 使用“您”称呼客户；不使用网络用语、感叹号或情绪化表达；专业术语首次出现时用一句话说明。
-3. 只使用事实中提供的数据；数据未覆盖时明确说明“当前数据未覆盖”，不猜测、不编造。
-4. 不预测涨跌、不推荐买卖、不承诺收益。
-5. 结尾固定表述：“以上基于历史回测数据，历史业绩不代表未来表现，不构成投资建议，市场有风险，投资需谨慎。”
-6. 控制在 350 字以内。"""
 
 
 class AgentError(RuntimeError):
@@ -207,6 +135,27 @@ class Agent:
         return [{"role": "user", "content": user_content}, assistant,
                 *tool_messages, {"role": "user", "content": correction}]
 
+    @staticmethod
+    def _content_repair_messages(
+            user_content: str, result: ToolChatResult) -> list[dict[str, Any]]:
+        message = result.message if isinstance(result.message, dict) else {}
+        assistant = {
+            "role": "assistant",
+            "content": str(message.get("content") or ""),
+            "tool_calls": message.get("tool_calls") or [],
+        }
+        tool_messages = [
+            {"role": "tool", "tool_call_id": call.id,
+             "content": "工具调用已接受。"}
+            for call in result.tool_calls
+        ]
+        correction = (
+            "必须在保留正确工具调用的同时，补充一句给客户看的简短确认，"
+            "不要输出 JSON、工具参数或内部步骤。"
+        )
+        return [{"role": "user", "content": user_content}, assistant,
+                *tool_messages, {"role": "user", "content": correction}]
+
     def stream_plan(self, state: dict[str, Any], history: list[dict[str, Any]],
                     message: str) -> Iterator[tuple[str, Any]]:
         """产出 ("token", 文本增量) 若干次，最后产出 ("plan", Plan)。"""
@@ -215,7 +164,7 @@ class Agent:
         result: ToolChatResult | None = None
         try:
             for kind, payload in self.llm.chat_tools_stream(
-                    PLANNER_SYSTEM, [{"role": "user", "content": user_content}],
+                    _planner_system(), [{"role": "user", "content": user_content}],
                     TOOL_DEFINITIONS):
                 if kind == "content":
                     reply_parts.append(payload)
@@ -231,7 +180,7 @@ class Agent:
         if errors:
             try:
                 repaired = self.llm.chat_tools(
-                    PLANNER_SYSTEM,
+                    _planner_system(),
                     self._repair_messages(user_content, result, errors),
                     TOOL_DEFINITIONS,
                 )
@@ -253,7 +202,7 @@ class Agent:
             ]
             try:
                 reviewed = self.llm.chat_tools(
-                    PLANNER_SYSTEM, review_messages, TOOL_DEFINITIONS)
+                    _planner_system(), review_messages, TOOL_DEFINITIONS)
             except LLMError:
                 reviewed = None
             if reviewed is not None and reviewed.tool_calls:
@@ -261,6 +210,31 @@ class Agent:
                 if errors:
                     raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
                 result = reviewed
+
+        if not reply_parts and result.content:
+            reply_parts.append(result.content)
+            yield "token", result.content
+
+        if not reply_parts and result.tool_calls:
+            try:
+                repaired = self.llm.chat_tools(
+                    _planner_system(),
+                    self._content_repair_messages(user_content, result),
+                    TOOL_DEFINITIONS,
+                )
+            except LLMError as exc:
+                raise AgentError(f"AI 回复修复失败：{exc}") from exc
+            repaired_actions, repaired_profile_delta, errors = (
+                self._actions_from_result(repaired))
+            if errors:
+                raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
+            if repaired.tool_calls:
+                actions = repaired_actions
+                profile_delta = repaired_profile_delta
+            result = repaired
+            if result.content:
+                reply_parts.append(result.content)
+                yield "token", result.content
 
         reply = "".join(reply_parts).strip()
         if not reply:
@@ -286,7 +260,7 @@ class Agent:
     def explain(self, facts: dict[str, Any], question: str = "") -> str:
         payload = json.dumps({"facts": facts, "question": question}, ensure_ascii=False)
         try:
-            text = self.llm.chat_text(EXPLAIN_SYSTEM, [{"role": "user", "content": payload}])
+            text = self.llm.chat_text(_load_prompt("explain.txt"), [{"role": "user", "content": payload}])
         except LLMError as exc:
             raise AgentError(f"解读生成失败：{exc}") from exc
         return ensure_compliance(text)

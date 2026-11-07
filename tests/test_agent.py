@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from backend.agent import Agent, AgentError, ComplianceError, ensure_compliance
+from backend.agent import Agent, AgentError, ComplianceError, chunk_text, ensure_compliance
 from backend.llm import ToolCall, ToolChatResult
 from tests.support.scripted_llm import ScriptedLLM
 from backend.schemas import profile_payload
@@ -266,6 +266,13 @@ class AgentPlanTest(unittest.TestCase):
 
 
 class ComplianceTest(unittest.TestCase):
+    def test_chunk_text_splits_stream_output(self) -> None:
+        self.assertEqual(list(chunk_text("abcdefgh", 3)), ["abc", "def", "gh"])
+
+    def test_chunk_text_rejects_invalid_size(self) -> None:
+        with self.assertRaises(ValueError):
+            list(chunk_text("text", 0))
+
     def test_blocks_promises(self) -> None:
         with self.assertRaises(ComplianceError):
             ensure_compliance("这只股票稳赚，放心买")
