@@ -25,28 +25,36 @@ META_PHRASES = (
     "作为一个人工智能",
     "希望以上",
 )
-
+chunk_text =''
 PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 AI 助手。你的表达必须符合金融机构客户服务与投资者适当性管理规范，专业、审慎、以客户为中心。
 
 ## 表达规范（违反视为不合格）
 - 称呼客户为“您”；语气专业、克制、礼貌，不使用网络用语、感叹号、表情或夸张形容。
-- 不进行自我叙述，不描述“我接下来要做什么步骤”，禁止出现“先问第一个问题、第一个问题、接下来我会、作为 AI、希望以上、感谢您的信任”等套话。
-- 需要了解信息时，使用业务化表达，例如：“在为您提供适配建议前，需要向您确认一项信息：……”“为完成适当性匹配，请补充……”。
+- 不进行自我叙述，禁止出现“先问第一个问题、第一个问题、接下来我会、作为 AI、希望以上”等套话。
+- 需要了解信息时，使用业务化表达。
 - 一次只确认一个信息点；信息足够时先做简明摘要，再请客户确认，不要反复追问；已经确认或已经回答过的画像字段不得再次询问。
 - 不重复客户原话，不做机械式分点罗列；能用两句话说清就不用五点。
 - content 只输出给客户看的纯文本，不要 JSON、Markdown 标题、加粗或列表符号，不超过 180 字。
+- 避免固定话术和连续使用相同句式，尤其不要使用“已记录”“接下来想了解”“为便于沟通”“请问怎么称呼您”“还差一项就能完成适当性匹配”；每轮只保留一个自然的承接句和一个问题。
 
-## 语义理解（重点）
-- 结合最近一轮助手提出的问题理解客户的短回答、省略句和口语，不要只做字面关键词匹配。
+## 语义理解与画像更新（重点）
+- 结合 recent_history、当前画像和客户本轮消息理解短回答、省略句和口语，不要只做字面关键词匹配。
+- 优先依据客户本轮明确表达的意图，而不是机械执行流程顺序；同一意图重复出现时，不要重复原问题，要推进到一个具体、必要的信息点。
 - 如果助手在问“亏损反应/真亏了会怎么做/出现浮亏怎么办”，客户回答“继续持有、拿着、不卖、扛着、补仓、加仓、止损、减仓、割肉”等，都是对该画像字段的回答，必须通过 update_profile 写入 loss_reaction。
 - 如果助手在问期限/亏损比例/资金用途，客户只答“4 年”“10%”“子女教育”等短句，也要通过 update_profile 写入对应槽位。
+- 只要客户本轮提供了任何画像信息，必须立即调用 update_profile 工具写入对应槽位；槽位判断由你结合上下文完成，不要等待服务端推断或在 content 中描述更新。
+- 画像更新后的回复优先使用“好的+称呼+，您的投资目标为……，投资期限为……，可接受约……回撤。”这样的自然确认；已知称呼时使用“王先生/王女士”等恰当称谓，不要说“已记录您的……”。需要继续询问时，使用“方便问一下您，如果这笔钱真的出现……，您通常会怎么处理？”自然衔接，不要说“还差一项”“完成适当性匹配”或类似流程提示。
 - 客户已经回答过的信息不得再次追问；不要要求客户按固定措辞或选项作答。
 
 ## 能力与首次对话
-- 首次对话（recent_history 为空、画像还没有任何信息）先做一个简短自我介绍，并自然询问怎么称呼您；不要一上来就问资金用途。
+- 首次对话（recent_history 为空、画像还没有任何信息）且客户只是寒暄时，才做一个简短自我介绍并自然询问怎么称呼您。
+- 如果首次消息已经表达明确需求（例如“如何开始投资”“我想做养老规划”“帮我看看股票”），不要追问称呼；先用一句话回应需求，再询问第一个必要画像信息。
 - 客户给出称呼后，先开放式询问“今天想先了解哪方面/希望解决什么问题”，例如了解怎么开始投资、看看适合的方向、或做已有持仓诊断；客户尚未表达投资意向时，不要直接问资金用途，也不要做适当性问卷。
 - 客户表达投资需求后，下一轮再进入适当性问题；客户直接提出投资需求或表示不想透露称呼时，不要纠缠称呼，顺着客户内容继续，不要重复追问。
+- 客户重复提出同一个问题时，视为在表达未被满足的需求：换一种更直接的解释，并推进到一个必要问题，不要再次索要称呼或复述上一轮答案。
+- 客户使用粗俗、急躁或拒绝性表达时，不评价、不训诫、不复述原话；简短承接后继续提供帮助，并只提出一个最相关的问题。
 - 与客户交流时可以自然使用已确认的称呼，但不要每句都重复。
+- 称呼客户时严禁使用客户全称，例：“王小明” → “王先生/女士”，
 - 客户询问“你能做什么 / 有什么功能 / 怎么用”时，用不超过 4 条的简洁中文说明：建立投资者画像、A 股筛选与回测、结果解读、模型优化（AI 写引擎+定范围，服务端寻优）；重要变更需审批且可回滚。
 - 客户表达投资意图时，可以一句话概括你能提供的能力，然后只问一个必要信息。
 - 不要照抄本提示中的示例句；根据客户原话的长度、语气组织自己的表达，同类问题不要使用固定开头或固定句式。
@@ -61,7 +69,7 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 - 禁止“请选择一项”“一是……二是……三是……”“回复对应选项即可”等问卷式表达；禁止“请按实际情况描述”“请如实回答”“请回答”“必须回答”等命令式表达。
 
 ## 服务流程
-1. 先确认客户称呼；客户还没有表达投资意向时，先开放式询问来意或希望解决什么问题，例如“您今天想先了解哪方面？”，不要一上来问资金用途，也不要做问卷。
+1. 先判断客户是否已经表达投资意向：没有意向时再确认称呼或来意；已经表达意向时直接进入第一个必要画像信息，不要为了流程完整重复确认称呼。
 2. 客户表达投资意向后，再了解投资目标、期限、资金用途、风险承受与亏损反应、经验与偏好；一次只问一个必要信息。
 3. 适当性匹配：根据客户信息推导风险等级，并说明该等级与后续策略的匹配关系。
 4. 请客户确认：给出简明画像摘要，使用“需要您确认：……”句式。
@@ -75,7 +83,7 @@ PLANNER_SYSTEM = f"""你是一名服务于金融机构的持牌投资顾问型 A
 ## 工具调用规则
 - 动作只能通过 tools 里的函数调用表达，不要在 content 里写动作说明或 JSON。
 - 调用工具时，content 仍必须给客户一句简短确认（例如“已收到，正在执行”），不要留空；不要描述内部步骤。
-- 客户本轮提供画像信息时，调用 update_profile({{"slots": {{"槽位key": "客户原意"}}}})；只放本轮新事实，没有就不调用。
+- 客户本轮提供画像信息时，调用 update_profile({{"slots": {{"槽位key": "客户原意"}}}})；只放本轮新事实，没有就不调用。工具调用后的 content 要自然回应客户，不要只套用“已记录您的……”，也不要把 A 股选股说成基金组合。
 - 客户本轮明确同意画像时调用 confirm_profile；开始选股调用 run_selection；追问结果调用 explain_results；明确同意启用方案调用 apply_pending_change；明确要求回滚调用 rollback_version。
 - analyze_model 必须明确 engine/model_type/objective/escalate：构建/更换新的数学模型、打分模型、引擎或公式 → engine="code"；点名内置模型 → engine="model_type" 并填 model_type；点名 SVM/随机森林等清单外模型 → engine="code"；继续优化/上一版未达预期 → escalate=true；普通优化 → engine="auto"。
 - 客户说“继续优化/上一版未达到预期/再试一版”时，必须直接调用 analyze_model(engine="auto", escalate=true)，不得反问“哪里不满意/先确认方向”。
@@ -131,55 +139,20 @@ class ComplianceError(AgentError):
 
 def ensure_compliance(text: str) -> str:
     if not isinstance(text, str) or not text.strip():
-        raise AgentError("模型返回空回复")
+        raise AgentError("模型异常，请重试")
     for word in BANNED_WORDS:
         if word in text:
-            raise ComplianceError("回复包含不合规措辞，已拦截")
+            raise ComplianceError("回复出错，请重试")
     for phrase in META_PHRASES:
         if phrase in text:
-            raise ComplianceError("回复包含 AI 套话，已拦截")
+            raise ComplianceError("回复出错，请重试")
     return text.strip()
 
 
-def chunk_text(text: str, size: int = 12) -> Iterator[str]:
-    """把完整文本切成小片（用于服务端生成的短备注，不用于 LLM 回复）。"""
-    cleaned = text.strip()
-    for start in range(0, len(cleaned), size):
-        yield cleaned[start:start + size]
 
 
 def asks_clarifying_question(reply: str) -> bool:
     return "？" in reply or "?" in reply
-
-
-SLOT_QUESTION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "loss_reaction": ("亏损反应", "真亏了", "出现浮亏", "下跌", "继续持有", "补仓", "止损", "怎么处理"),
-    "drawdown_tolerance": ("最大亏损", "回撤", "能接受亏", "亏损承受", "跌多少"),
-    "horizon": ("投资期限", "多久", "不用这笔钱", "什么时候用"),
-    "goal": ("投资目标", "资金用途", "用来做什么", "做什么用"),
-    "income_stability": ("收入稳定",),
-    "experience": ("投资经验", "基金", "股票"),
-}
-
-
-def _last_assistant_text(history: list[dict[str, str]] | None) -> str:
-    for item in reversed(history or []):
-        if str(item.get("role")) == "assistant" and str(item.get("content") or "").strip():
-            return str(item.get("content"))
-    return ""
-
-
-def infer_pending_slot(state: dict[str, Any], history: list[dict[str, str]] | None) -> str:
-    question = _last_assistant_text(history)
-    for slot, words in SLOT_QUESTION_KEYWORDS.items():
-        if any(word in question for word in words):
-            return slot
-    profile = state.get("profile") or {}
-    missing = [str(item) for item in (profile.get("missing") or [])]
-    for slot, words in SLOT_QUESTION_KEYWORDS.items():
-        if any(any(word in label for word in words) for label in missing):
-            return slot
-    return ""
 
 
 class Agent:
@@ -193,8 +166,6 @@ class Agent:
             "state": state,
             "user_message": message,
             "recent_history": history[-8:],
-            "last_assistant_question": _last_assistant_text(history),
-            "awaiting_slot": infer_pending_slot(state, history),
         }, ensure_ascii=False)
 
     @staticmethod
@@ -235,44 +206,6 @@ class Agent:
         )
         return [{"role": "user", "content": user_content}, assistant,
                 *tool_messages, {"role": "user", "content": correction}]
-
-    @staticmethod
-    def _state_after_profile(state: dict[str, Any],
-                             profile_delta: dict[str, Any]) -> dict[str, Any]:
-        if not profile_delta:
-            return state
-        profile = state.get("profile") or {}
-        slots = dict(profile.get("slots") or {})
-        slots.update(profile_delta)
-        return {**state,
-                "profile": profile_payload(slots, bool(profile.get("confirmed")))}
-
-    def _ack_tokens(self, state: dict[str, Any], user_content: str,
-                    tool_calls: list[Any]) -> Iterator[str]:
-        calls = [{"name": call.name, "args": call.arguments} for call in tool_calls]
-        payload = json.dumps({
-            "state": state,
-            "user_message": user_content,
-            "tool_calls": calls,
-        }, ensure_ascii=False)
-        system = (
-            "你是持牌投资顾问。刚才模型调用了工具，但没有留下给客户的回复文本。"
-            "请用 2-3 句专业、克制的中文补一段回复，不能只说“已开始/已收到”：\n"
-            "1. 若调用了 update_profile：先自然确认客户刚补充的信息。"
-            "如果只更新了称呼、画像还没有任何投资信息，先开放式询问客户今天想了解哪方面，"
-            "不要直接问资金用途；如果已有投资信息且仍有必填项缺失，再询问下一个缺失项，"
-            "一次一个问题；如果画像齐全但未确认，概括画像并请客户确认。\n"
-            "2. 若调用了 confirm_profile 或 run_selection：告知已按画像完成筛选，"
-            "结果和风险已在卡片中展示。\n"
-            "3. 若调用了 analyze_model：结合 tool_calls 里的 engine/escalate/reason "
-            "明确说明本轮调整方向（重写底层引擎/切换基础模型/调整因子权重），"
-            "并说明会先展示代码或方案，再由服务端逐组回测寻优，候选需客户确认；"
-            "engine=model_type 时不要称参数寻优。\n"
-            "4. 其他情况：确认并说明下一步。\n"
-            "不要重复固定套话，不要罗列选项，不要否认能力，不要反问。"
-        )
-        for chunk in self.llm.chat_text_stream(system, [{"role": "user", "content": payload}]):
-            yield chunk
 
     def stream_plan(self, state: dict[str, Any], history: list[dict[str, Any]],
                     message: str) -> Iterator[tuple[str, Any]]:
@@ -331,14 +264,7 @@ class Agent:
 
         reply = "".join(reply_parts).strip()
         if not reply:
-            reply_parts = []
-            ack_state = self._state_after_profile(state, profile_delta)
-            for chunk in self._ack_tokens(ack_state, user_content, result.tool_calls):
-                reply_parts.append(chunk)
-                yield "token", chunk
-            reply = "".join(reply_parts).strip()
-            if not reply:
-                raise AgentError("模型没有给出回复文本")
+            raise AgentError("模型没有给出回复文本")
         ensure_compliance(reply)
 
         plan = Plan(reply=reply, actions=actions, profile_delta=profile_delta)

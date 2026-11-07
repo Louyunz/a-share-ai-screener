@@ -68,15 +68,15 @@ class _ContextLLM:
 
 
 class SemanticContextTest(unittest.TestCase):
-    def test_plan_passes_question_and_awaiting_slot_to_llm(self) -> None:
+    def test_plan_uses_update_profile_tool_for_contextual_slot(self) -> None:
         llm = _ContextLLM()
         state = {"profile": {"complete": False, "confirmed": False,
                              "missing": ["亏钱时的反应"], "summary": ""},
                  "pending": None, "versions": [], "last_selection": None}
         history = [{"role": "assistant", "content": "若持有期间真的出现浮亏，您通常会怎么做，比如继续持有等待回升、分批补仓摊低成本，还是先减仓止损？"}]
         plan = Agent(llm).plan(state, history, "继续持有")
-        self.assertEqual(llm.payload.get("awaiting_slot"), "loss_reaction")
-        self.assertIn("浮亏", llm.payload.get("last_assistant_question", ""))
+        self.assertNotIn("awaiting_slot", llm.payload)
+        self.assertNotIn("last_assistant_question", llm.payload)
         self.assertEqual(plan.profile_delta.get("loss_reaction"), "继续持有等待修复")
 
 class AgentPlanTest(unittest.TestCase):
@@ -195,39 +195,22 @@ class AgentPlanTest(unittest.TestCase):
         self.assertEqual(llm.calls, 2)
         self.assertEqual(plan.action("analyze_model")["args"]["engine"], "code")
 
-    def test_empty_content_uses_context_aware_ack(self) -> None:
+    def test_empty_content_raises_error(self) -> None:
         slots = {"goal": "养老", "drawdown_tolerance": "10%", "loss_reaction": "先拿住"}
 
-        class _AckLLM:
-            def __init__(self):
-                self.ack_payload = None
-
+        class _EmptyContentLLM:
             def chat_tools_stream(self, system, messages, tools, tool_choice="auto"):
                 call = ToolCall(id="call_update", name="update_profile",
                                 arguments={"slots": {"horizon": "5 年"}})
                 yield "result", _tool_result("", calls=[call])
 
-            def chat_text_stream(self, system, messages):
-                self.ack_payload = json.loads(messages[-1]["content"])
-                yield "这笔钱大概多久不需要动用？"
-
             def chat_tools(self, system, messages, tools, tool_choice="auto"):
                 return _tool_result("")
 
-        llm = _AckLLM()
-        tokens = []
-        plan = None
-        for kind, payload in Agent(llm).stream_plan(
-                _state(slots), [], "大概 5 年不用"):
-            if kind == "token":
-                tokens.append(payload)
-            else:
-                plan = payload
-        self.assertEqual(plan.profile_delta, {"horizon": "5 年"})
-        self.assertIn("多久", "".join(tokens))
-        self.assertEqual(llm.ack_payload["tool_calls"][0]["name"], "update_profile")
-        self.assertTrue(llm.ack_payload["state"]["profile"]["complete"])
-        self.assertEqual(llm.ack_payload["state"]["profile"]["slots"]["horizon"], "5 年")
+        with self.assertRaises(AgentError) as context:
+            list(Agent(_EmptyContentLLM()).stream_plan(
+                _state(slots), [], "大概 5 年不用"))
+        self.assertEqual(str(context.exception), "模型没有给出回复文本")
 
     def test_pending_intent_executes_after_answer(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
