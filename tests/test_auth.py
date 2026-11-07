@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+from fastapi.responses import Response
+
 from backend.auth import AuthManager, hash_password, validate_password, verify_password
 from backend.store import Store
 from tests import cleanup, workdir
@@ -41,6 +43,11 @@ class AuthTests(unittest.TestCase):
         self.assertTrue(self.auth.authenticated(self._request(cookies={"zhitou_admin_session": login_token})))
         self.auth.logout(self._request(cookies={"zhitou_admin_session": login_token}))
         self.assertIsNone(self.auth.authenticated(self._request(cookies={"zhitou_admin_session": login_token})))
+
+    def test_session_cookie_is_secure_by_default(self) -> None:
+        response = Response()
+        self.auth.set_cookie(response, "session-token")
+        self.assertIn("Secure", response.headers["set-cookie"])
 
     def test_setup_only_from_loopback(self) -> None:
         with self.assertRaises(Exception):

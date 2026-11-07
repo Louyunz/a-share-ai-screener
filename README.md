@@ -78,7 +78,7 @@ LLM_MODEL=deepseek-chat
 - 所有业务 API 默认需要管理员登录；未登录访问会跳转 `/login`。
 - 密码使用 PBKDF2-HMAC-SHA256 哈希；会话 Cookie 为 HttpOnly + SameSite=Strict；登录失败有限速；写请求有同源校验。
 - 首次初始化只允许从服务器本机完成；设置完成后入口关闭。
-- 当前是单机单管理员演示，**不承诺“绝对安全”**。公网部署必须使用 HTTPS 反向代理、设置 `AUTH_COOKIE_SECURE=1`，并做好主机与数据文件保护。详见 [docs/SECURITY.md](docs/SECURITY.md)。
+- 当前是单机单管理员演示，**不承诺“绝对安全”**。管理员会话 Cookie 默认启用 `Secure`；公网部署必须使用 HTTPS 反向代理、保持 `AUTH_COOKIE_SECURE=1`，并做好主机与数据文件保护。详见 [docs/SECURITY.md](docs/SECURITY.md)。
 
 ## 构建真实行情缓存
 
