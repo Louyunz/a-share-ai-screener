@@ -213,16 +213,6 @@ strong, b { font-weight: 600; }
 .wb-item b { color: var(--text-primary); font-weight: 500; text-align: right; }
 .wb-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
 
-.activity-list { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
-.act { display: flex; gap: 8px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
-.act-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 18px; height: 18px; margin-top: 1px; border-radius: 4px; color: var(--status-success); background: var(--status-success-bg); }
-.act-icon .icon { width: 11px; height: 11px; }
-.act-icon.is-waiting { color: var(--status-warning); background: var(--status-warning-bg); }
-.act-icon.is-error { color: var(--status-danger); background: var(--status-danger-bg); }
-.act-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-.act-text { margin: 0; }
-.act-time { color: var(--text-muted); font-size: 11px; }
-
 .wb-model-top { display: flex; align-items: center; gap: 8px; }
 .wb-model-top strong { color: var(--text-primary); font-size: 14px; font-weight: 600; }
 .wb-model-desc { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }

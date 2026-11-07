@@ -7,8 +7,6 @@
 
   /* ============================== 常量 ============================== */
   var SESSION_KEY = 'zhitou.screener.session';
-  var MAX_ACTIVITY = 12;
-
   var METRIC_META = {
     cagr: { label: '年化收益', note: '历史回测：平均每年涨多少', type: 'pct', tone: 'up' },
     sharpe: { label: '夏普比率', note: '每承担一份波动获得的收益', type: 'num', tone: 'info' },
@@ -76,24 +74,6 @@
     work: '执行'
   };
 
-  var ACTIVITY_ICONS = {
-    analysis: 'pulse',
-    data: 'chart',
-    plan: 'spark',
-    code: 'code',
-    check: 'check',
-    backtest: 'chart',
-    compare: 'chart',
-    tune: 'pulse',
-    wait: 'shield',
-    version: 'layers',
-    selection: 'target',
-    profile: 'user',
-    alert: 'alert',
-    ai: 'spark',
-    work: 'spark'
-  };
-
   var STARTERS = [
     { label: '如何开始投资？', message: '如何开始投资？' },
     { label: '稳健一点，能接受 10% 左右回撤', message: '我想稳健一点，能接受 10% 左右回撤，计划投资 3 年以上。' },
@@ -114,7 +94,6 @@
     lastSelection: null,
     lastUserMessage: '',
     lastMessageId: null,
-    activity: [],
     stateError: null,
     following: true,
     pinnedOptimization: null,
@@ -230,7 +209,6 @@
     dom.workbench = $('#workbench');
     dom.wbAlert = $('#wb-alert');
     dom.profile = $('#wb-profile');
-    dom.activity = $('#wb-activity');
     dom.model = $('#wb-model');
     dom.result = $('#wb-result');
     dom.chatModelChip = $('#chat-model-chip');
@@ -682,7 +660,6 @@
     slot.innerHTML = errorCardHtml(title, message, retryEnabled === false ? null : 'retry');
     turn.cards.appendChild(slot);
     turn.cardCount += 1;
-    pushActivity('error-' + nowClock() + '-' + Math.random().toString(36).slice(2, 6), title + '：' + message, 'error', 'alert');
     scrollToBottom(true);
   }
 
@@ -1587,23 +1564,12 @@
       case 'profile':
         state.profile = normalizeProfile(block);
         renderProfileSection();
-        pushActivity('profile-' + block.id, state.profile && state.profile.confirmed ? '已确认你的投资画像' : '更新了你的投资画像', 'done', 'profile');
         break;
       case 'selection':
         state.lastSelection = normalizeSelection(block);
         renderResultSection();
-        pushActivity('selection-' + block.id,
-          '完成选股' + (state.lastSelection && state.lastSelection.top.length ? ' · Top ' + state.lastSelection.top.length : ''),
-          'done', 'selection');
-        break;
-      case 'work':
-        syncWorkActivity(block);
-        break;
-      case 'tuning':
-        syncTuningActivity(block);
         break;
       case 'approval':
-        pushActivity('approval-' + block.id, '等待用户确认：' + (block.title || '待审批方案'), 'waiting', 'wait');
         break;
       case 'version': {
         if (block.active && typeof block.active === 'object') state.activeModel = normalizeModel(block.active);
@@ -1611,7 +1577,6 @@
         if (parsedVersions.length) state.versions = parsedVersions;
         renderModelSection();
         renderChatModelChip();
-        pushActivity('version-' + block.id, '模型版本已更新' + (block.active && block.active.name ? ' · ' + block.active.name : ''), 'done', 'version');
         break;
       }
       default:
@@ -1619,51 +1584,9 @@
     }
   }
 
-  function syncWorkActivity(block) {
-    var steps = Array.isArray(block.steps) ? block.steps : [];
-    steps.forEach(function (step, index) {
-      if (!step) return;
-      var status = step.status === 'done' ? 'done'
-        : step.status === 'running' ? 'running'
-          : step.status === 'error' ? 'error' : 'pending';
-      var detail = step.detail ? ' · ' + truncate(step.detail, 44) : '';
-      pushActivity('work:' + block.id + ':' + index, (step.title || ('第 ' + (index + 1) + ' 步')) + detail, status, step.kind || 'work');
-    });
-    if (block.status === 'done') {
-      pushActivity('work:' + block.id + ':overall', (block.title || 'AI 工作') + ' · 已完成', 'done', 'check');
-    } else if (block.status === 'error') {
-      pushActivity('work:' + block.id + ':overall', (block.title || 'AI 工作') + ' · 失败', 'error', 'alert');
-    } else if (!steps.some(function (step) { return step && step.status === 'running'; })) {
-      pushActivity('work:' + block.id + ':overall', block.title || 'AI 正在工作', 'running', 'ai');
-    }
-  }
-
-  function syncTuningActivity(block) {
-    var payload = block && typeof block === 'object' ? block : {};
-    var progress = tuningProgress(payload);
-    var best = payload.best && typeof payload.best === 'object' ? payload.best : null;
-    var bestText = best ? (tuningObjectiveLabel(payload) + ' ' + formatTuningScore(payload, best.score)) : '';
-    var key = 'tuning:' + payload.id;
-    if (payload.status === 'done') {
-      pushActivity(key, '参数网格寻优完成' + (bestText ? ' · 最优' + bestText : ''), 'done', 'tune');
-      return;
-    }
-    if (payload.status === 'error') {
-      pushActivity(key, '参数网格寻优失败' + (payload.note ? ' · ' + truncate(payload.note, 36) : ''), 'error', 'tune');
-      return;
-    }
-    var text = '参数网格寻优进行中';
-    if (progress.trial !== null || progress.total !== null) {
-      text += ' · 第 ' + (progress.trial === null ? '—' : progress.trial) + ' / ' + (progress.total === null ? '—' : progress.total) + ' 组';
-    }
-    if (bestText) text += ' · 当前最优 ' + bestText;
-    pushActivity(key, text, 'running', 'tune');
-  }
-
   /* ============================== 工作台 ============================== */
   function renderAllWorkbench() {
     renderProfileSection();
-    renderActivitySection();
     renderModelSection();
     renderResultSection();
     renderChatModelChip();
@@ -1704,53 +1627,6 @@
     if (ring && typeof window.Charts !== 'undefined') {
       window.Charts.gauge(ring, { value: pct, max: 100, label: '完整度' }, { size: 66, thickness: 5, ariaLabel: '画像完整度' });
     }
-  }
-
-  function activityIcon(kind, status) {
-    if (status === 'running') return '<i class="spinner"></i>';
-    if (status === 'done') return icon('check');
-    if (status === 'error') return icon('alert');
-    if (status === 'waiting') return icon('shield');
-    return icon(ACTIVITY_ICONS[kind] || 'spark');
-  }
-
-  function renderActivitySection() {
-    var head = '<header class="wb-head"><h2>AI 活动时间线</h2></header>';
-    if (!state.activity.length) {
-      dom.activity.innerHTML = head + '<p class="wb-empty">AI 的每一步动作都会实时显示在这里。</p>';
-      return;
-    }
-    var rows = state.activity.map(function (item) {
-      return '<li class="act is-' + esc(item.status) + '"><span class="act-icon">' + activityIcon(item.kind, item.status) + '</span>'
-        + '<div class="act-body"><p class="act-text">' + esc(item.text) + '</p><time class="act-time">' + esc(item.time) + '</time></div></li>';
-    }).join('');
-    dom.activity.innerHTML = head + '<ul class="activity-list">' + rows + '</ul>';
-  }
-
-  function pushActivity(key, text, status, kind) {
-    var existing = null;
-    for (var i = 0; i < state.activity.length; i += 1) {
-      if (state.activity[i].key === key) {
-        existing = state.activity[i];
-        break;
-      }
-    }
-    if (existing) {
-      existing.text = text;
-      existing.status = status;
-      existing.kind = kind || existing.kind;
-      existing.time = nowClock();
-    } else {
-      state.activity.unshift({
-        key: key,
-        text: text,
-        status: status,
-        kind: kind || 'ai',
-        time: nowClock()
-      });
-      if (state.activity.length > MAX_ACTIVITY) state.activity.length = MAX_ACTIVITY;
-    }
-    renderActivitySection();
   }
 
   function renderModelSection() {
@@ -1897,7 +1773,6 @@
     state.lastUserMessage = content;
     updateChatSessionLabel();
     var turn = beginAssistantTurn();
-    pushActivity('turn', 'AI 正在处理你的请求…', 'running', 'ai');
     var failed = false;
     var stopped = false;
     var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -1933,7 +1808,6 @@
         failed = false;
         stopped = true;
         appendTextMessage('ai', '已停止生成。你可以修改问题后重新发送，或点击输入区的重新生成。', null);
-        pushActivity('turn', '已停止生成', 'error', 'alert');
       } else {
         showTurnError(turn, '网络异常', error && error.message ? error.message : '请检查后端服务后重试。', true);
       }
@@ -1944,7 +1818,6 @@
       setChatRunStatus(stopped ? '已停止' : failed ? '处理出错' : '就绪');
       updateComposerState();
       if (!stopped) {
-        pushActivity('turn', failed ? '本次处理未完成' : '已完成回复', failed ? 'error' : 'done', failed ? 'alert' : 'check');
       }
       checkHealth();
       dom.input.focus();
@@ -2071,7 +1944,6 @@
     saveSession(sessionId);
     updateSessionChip();
     clearChat();
-    state.activity = [];
     if (history && history.length) {
       renderHistory(history);
     } else {
@@ -2089,7 +1961,6 @@
     await loadState();
     await loadVersions();
     if (history && history.length && (state.profile || state.lastSelection || state.activeModel)) {
-      pushActivity('restore', '已恢复上次会话的画像、模型与工作台状态', 'done', 'check');
     }
     renderAllWorkbench();
     state.following = true;
@@ -2387,7 +2258,6 @@
     state.lastSelection = null;
     state.lastUserMessage = '';
     state.lastMessageId = null;
-    state.activity = [];
     state.stateError = null;
     state.following = true;
     var fetched = await fetchMessages(sessionId);
@@ -2402,7 +2272,6 @@
     await loadState();
     await loadVersions();
     renderAllWorkbench();
-    if (history.length) pushActivity('switch', '已切换到一个历史对话', 'done', 'history');
     scrollToBottom(true);
     dom.input.focus();
     return true;
@@ -2546,7 +2415,7 @@
     return '<h3>如何开始</h3><ul>'
       + '<li>在输入框用自然语言描述投资目标、期限和可接受回撤，AI 会逐步建立投资者画像。</li>'
       + '<li>画像确认后，可以让 AI 选股、解读结果或优化模型；重要操作会先请您审批。</li>'
-      + '<li>右侧投资上下文会同步显示画像、AI 活动、当前模型和最近结果。</li>'
+      + '<li>右侧投资上下文会同步显示画像、当前模型和最近结果。</li>'
       + '<li>顶栏可以打开历史记录，切换回之前的会话继续分析。</li>'
   }
 

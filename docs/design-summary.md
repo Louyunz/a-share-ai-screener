@@ -3,7 +3,7 @@
 ## 产品形态
 - **AI 对话工作区**：画像、选股、解读、模型优化、版本管理仍在一个对话流完成；外层为 Professional Financial SaaS 三栏（左侧导航、中间对话、右侧上下文）。
 - **AI 主动执行（原生 function calling）**：Planner 通过 OpenAI 兼容的 `tools/tool_calls` 调用后端工具；`content` 只输出客户可见 JSON（reply/profile_delta）。服务端校验工具参数并执行，不再从自然语言关键词推断意图。
-- **右侧投资上下文**：自动展示画像摘要、AI 活动时间线、当前会话模型/版本、最近结果；宽屏可收起，窄屏为抽屉，不取代聊天操作。
+- **右侧投资上下文**：自动展示画像摘要、当前会话模型/版本、最近结果；宽屏可收起，窄屏为抽屉，不取代聊天操作。
 
 ## AI 建模（本版核心差异）
 - **单一意图权威**：动作参数契约在 `backend/chat/action_schema.py`（Pydantic 模型 + OpenAI tools schema）。`analyze_model` 必须带 `{engine, model_type, objective, escalate, reason}`，例如“更换数学模型”必须 `engine="code"`。服务端只做 schema 校验、确定性策略与审计，不猜语义。
