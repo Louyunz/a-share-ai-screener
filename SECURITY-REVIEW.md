@@ -36,3 +36,22 @@ python -m pytest -q tests/test_agent.py tests/test_service.py tests/test_chat_co
 ```
 
 现有测试未覆盖真实 Authorization 请求头、同会话并发一致性或异常 SSE chunk。
+
+## 管理员认证与密钥暴露审查
+
+审查范围：网页前端及相关 API，重点检查无需密码绕过管理员登录和获取
+DeepSeek API key 的路径。审查过程中未读取、导出或披露任何密钥值。
+
+| # | Severity | File | Lines | Vulnerability | Confidence |
+|---|----------|------|-------|---------------|------------|
+| 1 | 🟠 HIGH | `backend/auth.py` | 134-147 | 初始管理员设置仅信任 `request.client.host` 判断本地请求。反向代理部署时，远程请求可能被应用识别为 loopback，从而调用 `/api/auth/setup` 并设置攻击者可控的管理员密码。 | 8/10 |
+| 2 | 🟠 HIGH | `backend/config.py` | 63 | `AUTH_COOKIE_SECURE` 默认关闭。若服务通过 HTTP 暴露，管理员会话 cookie 可能以明文传输并被窃取，攻击者可复用会话而无需密码。 | 9/10 |
+
+### 修复建议
+
+1. 默认关闭管理员初始化，并要求一次性 bootstrap secret 或已认证的本地
+   管理通道。若保留代理感知的 IP 判断，应显式配置并校验可信代理地址。
+2. 默认启用 `AUTH_COOKIE_SECURE`，非 loopback 部署强制 HTTPS，并拒绝或重定向
+   生产环境中的不安全请求。
+3. DeepSeek API key 仅保留在后端受保护的环境变量或密钥管理系统中，确保
+   API 响应和日志不会返回该 key。
