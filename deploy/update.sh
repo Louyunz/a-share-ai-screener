@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# 服务器端：定期拉取 GitHub master 并在代码变化时重建容器。
-# 安装：见 deploy/README.md；不要用 git pull 覆盖 .env / data（已 gitignore）。
+# 服务器端：定期拉取 GitHub master（国内通过 ghfast 镜像），有更新时按需装依赖并重启服务。
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/opt/a-share-ai-screener}"
 BRANCH="${BRANCH:-master}"
-LOG="${LOG:-/var/log/a-share-update.log}"
+PY="${PY:-$REPO_DIR/.venv/bin/python}"
+PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+SERVICE="${SERVICE:-a-share-ai}"
 
 cd "$REPO_DIR"
 before="$(git rev-parse HEAD)"
@@ -19,7 +20,8 @@ if [ "$before" = "$after" ]; then
 fi
 
 echo "$(date -Is) update $before -> $after"
-# 构建失败时保留旧容器；成功后替换。
-docker-compose build --pull
-docker-compose up -d
+if ! git diff --quiet "$before" "$after" -- requirements.txt; then
+  "$PY" -m pip install -r requirements.txt -i "$PIP_INDEX" --disable-pip-version-check
+fi
+systemctl restart "$SERVICE"
 echo "$(date -Is) deployed $after"

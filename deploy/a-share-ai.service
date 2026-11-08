@@ -1,0 +1,23 @@
+[Unit]
+Description=A-share AI investment assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ashare
+Group=ashare
+WorkingDirectory=/opt/a-share-ai-screener
+EnvironmentFile=/opt/a-share-ai-screener/.env
+ExecStart=/opt/a-share-ai-screener/.venv/bin/python -m uvicorn backend.main:app \
+  --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/a-share-ai-screener/data
+
+[Install]
+WantedBy=multi-user.target
