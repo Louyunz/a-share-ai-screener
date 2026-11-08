@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """FastAPI 入口：登录保护的单页应用 + 对话 SSE。
 
 启动：``uvicorn backend.main:app --port 8000``
@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -97,6 +98,26 @@ async def _json_body(request: Request) -> dict[str, Any]:
     return body
 
 
+def _same_origin(request: Request) -> bool:
+    """校验同源写请求，兼容 HTTPS 反向代理（Host / X-Forwarded-*）。"""
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    host = (forwarded_host or request.headers.get("host", "")).split(",")[0].strip().lower()
+    if not host or parsed.netloc.lower() != host:
+        return False
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    expected_proto = forwarded_proto or request.url.scheme
+    return parsed.scheme == expected_proto
+
+
 def create_app(service: AppService | None = None) -> FastAPI:
     global _service, _auth, _sync
     _service = service
@@ -108,11 +129,8 @@ def create_app(service: AppService | None = None) -> FastAPI:
     async def protect_api(request: Request, call_next):
         path = request.url.path
         if path.startswith("/api/") and request.method in UNSAFE_METHODS:
-            origin = request.headers.get("origin")
-            if origin:
-                expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
-                if origin.rstrip("/") != expected:
-                    return JSONResponse({"error": "跨站请求被拒绝"}, status_code=403)
+            if not _same_origin(request):
+                return JSONResponse({"error": "跨站请求被拒绝"}, status_code=403)
         if path.startswith("/api/") and not path.startswith("/api/auth/"):
             user = get_auth().authenticated(request)
             if user is None:

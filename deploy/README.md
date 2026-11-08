@@ -21,6 +21,20 @@ systemctl enable --now a-share-ai
 Nginx 反向代理到 `http://127.0.0.1:8000`，`deploy/nginx-ip.conf` 是 IP + 自签名证书模板；
 必须传递 `X-Forwarded-Proto: https`，否则服务端 Cookie 不会启用 Secure。
 
+## Nginx 反向代理头（登录/SSE 必需）
+
+宝塔等反代默认可能写死 `Host 127.0.0.1` 且不传 `X-Forwarded-Proto`，会导致登录提示“跨站请求被拒绝”。反向代理 location 必须包含：
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Host $host;
+proxy_set_header X-Forwarded-Proto https;
+proxy_buffering off;
+proxy_read_timeout 3600;
+```
+
+服务端已兼容 `X-Forwarded-Host` / `X-Forwarded-Proto` 做 Origin 校验。
+
 ## 定期拉取 GitHub 最新版
 
 服务器访问 GitHub 直连较慢，仓库 remote 使用可用镜像：
