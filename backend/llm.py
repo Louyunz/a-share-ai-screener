@@ -77,11 +77,15 @@ def extract_json(text: str) -> dict[str, Any]:
 class OpenAICompatClient:
     """OpenAI 兼容 /chat/completions 客户端（DeepSeek 等）。"""
 
-    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60) -> None:
+    def __init__(self, api_key: str, base_url: str, model: str,
+                 timeout: int | None = None) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.timeout = timeout
+        self.timeout = int(timeout if timeout is not None
+                           else os.environ.get("LLM_TIMEOUT", "180"))
+        # 生成完整模型程序可能很长，显式给足输出额度（不同兼容服务上限不同）
+        self.max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -111,6 +115,7 @@ class OpenAICompatClient:
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
             "temperature": 0.4,
+            "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
         }
         try:
@@ -126,6 +131,7 @@ class OpenAICompatClient:
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
             "temperature": 0.6,
+            "max_tokens": self.max_tokens,
         }
         message = self._post(payload)
         text = str(message.get("content", "")).strip()
@@ -139,6 +145,7 @@ class OpenAICompatClient:
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
             "temperature": 0.6,
+            "max_tokens": self.max_tokens,
             "stream": True,
         }
         request = urllib.request.Request(
@@ -221,6 +228,7 @@ class OpenAICompatClient:
             "tools": tools,
             "tool_choice": tool_choice,
             "temperature": 0.2,
+            "max_tokens": self.max_tokens,
         }
         message = self._post(payload)
         content = str(message.get("content") or "").strip()
@@ -241,6 +249,7 @@ class OpenAICompatClient:
             "tools": tools,
             "tool_choice": tool_choice,
             "temperature": 0.4,
+            "max_tokens": self.max_tokens,
             "stream": True,
         }
         request = urllib.request.Request(

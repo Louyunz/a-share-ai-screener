@@ -196,7 +196,7 @@ class AgentPlanTest(unittest.TestCase):
                 call = ToolCall(
                     id=f"call_{self.calls}",
                     name="analyze_model",
-                    arguments={"engine": "magic" if self.calls == 1 else "code"},
+                    arguments={"engine": "magic" if self.calls == 1 else "weights"},
                 )
                 return _tool_result("正在按您的要求优化模型。", calls=[call])
 
@@ -214,7 +214,7 @@ class AgentPlanTest(unittest.TestCase):
         llm = _RepairLLM()
         plan = Agent(llm).plan(_state(slots, confirmed=True), [], "更换数学模型")
         self.assertEqual(llm.calls, 2)
-        self.assertEqual(plan.action("analyze_model")["args"]["engine"], "code")
+        self.assertEqual(plan.action("analyze_model")["args"]["engine"], "weights")
 
     def test_empty_content_raises_error(self) -> None:
         slots = {"goal": "养老", "drawdown_tolerance": "10%", "loss_reaction": "先拿住"}

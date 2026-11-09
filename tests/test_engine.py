@@ -399,7 +399,8 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(np.isfinite(benchmark_nav.to_numpy()).all())
         self.assertGreater(float(nav.std()), 0.0)
 
-        self.assertEqual(set(metrics), {"cagr", "sharpe", "mdd", "ir", "win_rate"})
+        self.assertEqual(set(metrics), {"cagr", "sharpe", "mdd", "ir", "win_rate",
+                                        "calmar", "sortino"})
         for key, value in metrics.items():
             self.assertTrue(math.isfinite(float(value)), msg=key)
         self.assertLessEqual(metrics["mdd"], 0.0)

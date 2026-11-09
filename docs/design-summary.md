@@ -6,11 +6,11 @@
 - **右侧投资上下文**：自动展示画像摘要、当前会话模型/版本、最近结果；宽屏可收起，窄屏为抽屉，不取代聊天操作。
 
 ## AI 建模（本版核心差异）
-- **单一意图权威**：动作参数契约在 `backend/chat/action_schema.py`（Pydantic 模型 + OpenAI tools schema）。`analyze_model` 必须带 `{engine, model_type, objective, escalate, reason}`，例如“更换数学模型”必须 `engine="code"`。服务端只做 schema 校验、确定性策略与审计，不猜语义。
-- **AI 只写引擎 + 定范围**：`approach=weights/model_type` 给 10 因子 `search_space`；`approach=code` 给参数化引擎代码（`build_transform(params=None)`）与 1~4 个参数的 `param_space`。AI 不直接给最终参数。
-- **服务端网格寻优**：`backend/engine/tuning.py` 在 AI 给定范围内做逐轴网格搜索：当前参数基线 → 按优先级逐因子轮转 → 每轴取网格候选、其余固定 → 每组参数跑全区间回测 → 按目标指标（sharpe/cagr/mdd，支持回撤上限惩罚）保留最优。评估次数受 `max_trials` 硬约束，并可逐组推送进度。
+- **单一意图权威**：动作参数契约在 `backend/chat/action_schema.py`（Pydantic 模型 + OpenAI tools schema）。`analyze_model` 必须带 `{engine, model_type, objective, escalate, reason}`；客户要求写/改模型程序时统一调 `write_model_program`。服务端只做 schema 校验、确定性策略与审计，不猜语义。
+- **AI 自由写程序 + 定预算**：`write_model_program` 支持多文件/多级包、类/安全装饰器/生成器、context 感知 transform、返回权重的选股钩子；`param_space` 可选、参数数量不限，`max_trials` 指定预算，`config` 覆盖回测参数；旧的 `analyze_model(engine=code)` 隐藏代码生成路径已删除。
+- **服务端全组合寻优**：`backend/engine/tuning.py` 先生成所有轴的全部组合，预算内全量评估；超预算用固定种子确定性分层采样（覆盖全部轴与基线，不静默砍轴/砍候选）。目标指标扩展为 sharpe/cagr/mdd/calmar/sortino/ir/win_rate，支持回撤上限惩罚；进度逐组推送并在卡片展示全量/采样信息。
 - **实时进度**：`tuning` 卡片按同一 id upsert；前端实时显示进度条、已评估组数、当前最优指标、Top 参数、搜索范围与得分走势。进度由真实回测事件驱动，不伪造。
-- 生成的代码必须通过：长度/语法检查 → AST 白名单（math/numpy/pandas/sklearn/scipy，禁止文件/网络/系统调用/动态执行/下划线属性）→ 子进程冒烟（10s 超时）→ 全区间回测；调参方案校验失败自动修复最多 2 次。
+- 生成的程序必须通过：长度/语法检查 → AST 白名单（禁止文件/网络/系统调用/动态执行/危险 dunder）→ 入口契约校验 → 全区间回测；不做子进程冒烟；调参方案校验失败自动修复最多 3 次（可配）。
 - 任何模型变更都生成候选，用户同意后才在当前会话激活；会话各自保留版本链，聊天一句话即可回滚。
 - **会话级模型**：模型只在被启用的会话内生效，新对话自动回到默认均衡多因子；`session.active_version_id` 是唯一模型状态源，`session_state` 不再保存 active_model/metrics/version_id。
 - **换模型与调参分离**：客户明确说“换其他模型”时，AI 调 `analyze_model(engine="model_type")`，服务端切换内置模型并直接使用预设权重回测，不跑网格寻优；只有“继续优化/上一版未达预期”才进入结构性升级或参数寻优。

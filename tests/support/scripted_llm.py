@@ -450,7 +450,7 @@ class ScriptedLLM:
         directive = request.get("directive") if isinstance(request.get("directive"), dict) else {}
         engine = str(directive.get("engine") or "auto").strip().lower()
         objective = str(directive.get("objective") or "sharpe").strip().lower()
-        if objective not in ("sharpe", "cagr", "mdd"):
+        if objective not in ("sharpe", "cagr", "mdd", "calmar", "sortino", "ir", "win_rate"):
             objective = "sharpe"
         max_trials = 12
 
@@ -483,7 +483,7 @@ class ScriptedLLM:
                 "max_trials": max_trials,
             }
 
-        if engine == "weights":
+        if engine in ("weights", "auto"):
             base = dict(request.get("weights") or registry.get_model("multi_factor")["weights"])
             return {
                 "approach": "weights",

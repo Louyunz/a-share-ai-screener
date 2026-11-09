@@ -23,9 +23,9 @@ __all__ = [
 
 @dataclass(frozen=True)
 class EngineDirective:
-    engine: str          # auto | weights | model_type | code
+    engine: str          # auto | weights | model_type | code（code 仅兼容旧调用，schema 已不接受）
     model_type: str      # 仅 model_type 时有意义
-    objective: str       # sharpe | cagr | mdd
+    objective: str       # sharpe | cagr | mdd | calmar | sortino | ir | win_rate
     escalate: bool
     reason: str
 
@@ -40,7 +40,7 @@ def resolve_directive(args: dict[str, Any], *, previous_approach: str = "") -> E
     model_type = str(args.get("model_type") or "").strip()
     objective = str(args.get("objective") or "").strip().lower() or "sharpe"
     escalate = bool(args.get("escalate"))
-    reason = str(args.get("reason") or "").strip()[:120]
+    reason = str(args.get("reason") or "").strip()[:500]
 
     if engine == "code":
         return EngineDirective("code", "", objective, escalate, reason)
@@ -49,11 +49,9 @@ def resolve_directive(args: dict[str, Any], *, previous_approach: str = "") -> E
     if engine == "weights":
         return EngineDirective("weights", "", objective, escalate, reason)
 
-    # engine=auto：由服务端的确定性策略决定
+    # engine=auto：结构性升级改用内置模型方向；代码重写统一走 write_model_program
     if escalate:
-        if previous_approach == "weights":
-            return EngineDirective("model_type", "", objective, True, reason)
-        return EngineDirective("code", "", objective, True, reason)
+        return EngineDirective("model_type", "", objective, True, reason)
     return EngineDirective("auto", "", objective, False, reason)
 
 

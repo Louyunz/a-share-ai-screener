@@ -154,22 +154,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[e2e] 回滚后当前会话模型：{state['active_model']['name']}，"
               f"会话版本 {len(state['versions'])} 个")
 
-        # AI 直接写程序：更换数学模型 → LLM 二次审核 → 寻优 → 审批 → 启用
+        # AI 直接写程序：更换数学模型 → 「AI 正在优化模型」卡实时流式 → LLM 安全审核 → 寻优 → 审批 → 启用
         events = client.chat(sid, "更换数学模型")
-        program_cards = _blocks(events, "program")
-        assert program_cards, "代码生成过程中应实时推送 program 卡"
-        assert program_cards[-1]["status"] == "generated", program_cards[-1]
-        assert "main.py" in program_cards[-1]["files"], program_cards[-1]
+        preview_cards = [block for block in _blocks(events, "work")
+                         if block.get("preview")]
+        assert len(preview_cards) >= 2, "代码生成过程应在「AI 正在优化模型」卡里多次流式更新"
+        assert preview_cards[-1].get("title") == "AI 正在优化模型", preview_cards[-1]
+        preview_change = preview_cards[-1].get("code_change") or {}
+        assert "build_transform" in preview_change.get("diff", ""), preview_change
         work = _blocks(events, "work")[-1]
         tuning = _blocks(events, "tuning")[-1]
         assert work["status"] == "done", work
         assert tuning["status"] == "done", tuning
-        assert any(step.get("title") == "LLM 二次审核" for step in work["steps"]), work
+        assert any(step.get("title") == "LLM 安全审核" for step in work["steps"]), work
         code_change = work.get("code_change") or {}
         assert code_change.get("diff"), "AI 程序应按行流式输出 diff"
         assert "helpers.py" in "\n".join(code_change.get("files") or []), code_change
         print(f"[e2e] AI 直接写程序（{len(code_change.get('files') or [])} 个模块）"
-              f" + 二次审核通过")
+              f" + 安全审核通过")
         events = client.chat(sid, "同意，启用这个改进")
         state = client.get(f"/api/sessions/{sid}/state")
         assert state["active_model"]["name"] == "AI 生成模型", state["active_model"]

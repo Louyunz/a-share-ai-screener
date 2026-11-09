@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import difflib
+import math
+import os
 import time
 import uuid
 from pathlib import Path
@@ -47,6 +49,8 @@ METRIC_NOTES = {
     "mdd": "最难受的时候，从高点跌了多少",
     "ir": "相对大盘表现稳不稳",
     "win_rate": "有多少个月是赚钱的",
+    "calmar": "年化收益相对最大回撤的性价比",
+    "sortino": "只把下跌波动算作风险后的收益性价比",
 }
 
 WORK_STEP_TEMPLATES = {
@@ -64,7 +68,11 @@ TUNING_NOTE = ("网格寻优基于历史回测逐组评估，最优参数可能�
                "历史业绩不代表未来实际表现，候选方案需要您确认后才会启用。")
 
 # 一次会话内保留的候选方案上限（按出现顺序编号，供“用第一个/第二个”选择）
-MAX_PENDING_CANDIDATES = 10
+MAX_PENDING_CANDIDATES = int(os.environ.get("MAX_PENDING_CANDIDATES", "100"))
+# 程序 context 中提供给 AI 的历史行情天数（0/负数=不限制，取全部缓存）
+PROGRAM_CONTEXT_DAYS = int(os.environ.get("AI_PROGRAM_CONTEXT_DAYS", "0"))
+# 程序单次寻优的默认预算（AI 可通过 max_trials 覆盖；服务端最终上限由 tuning 控制）
+PROGRAM_DEFAULT_MAX_TRIALS = int(os.environ.get("AI_PROGRAM_DEFAULT_TRIALS", "64"))
 
 
 class ServiceError(RuntimeError):
@@ -250,13 +258,19 @@ class AppService:
         public_state = self._planner_state(session_id)
 
         plan = None
+        program_preview_id = ""
+        program_preview_change: dict[str, Any] | None = None
         try:
             for kind, payload in self.agent.stream_plan(public_state, history[:-1], content):
                 if kind == "token":
                     yield "token", {"text": payload}
                 elif kind == "program":
-                    # AI 正在生成模型程序：实时把代码流式显示到页面
-                    yield "ui", {"block": payload}
+                    # AI 正在生成模型程序：统一走「AI 正在优化模型」work 卡片实时展示
+                    block = self._program_preview_block(payload)
+                    if block:
+                        program_preview_id = block["id"]
+                        program_preview_change = block.get("code_change")
+                        yield "ui", {"block": block}
                 elif kind == "plan":
                     plan = payload
         except (ServiceError, AgentError, ValidationError) as exc:
@@ -273,6 +287,17 @@ class AppService:
         if pending_intent and plan.deferred_intent:
             plan.actions = [{"name": str(pending_intent), "args": {}}]
             plan.deferred_intent = ""
+        if program_preview_id:
+            # 让真正执行程序的动作复用实时卡片的 id，整轮只出现一张「AI 正在优化模型」卡
+            for action in plan.actions:
+                if action.get("name") == "write_model_program":
+                    args = action.get("args")
+                    if not isinstance(args, dict):
+                        args = {}
+                        action["args"] = args
+                    args["_preview_id"] = program_preview_id
+                    if program_preview_change:
+                        args["_preview_change"] = program_preview_change
 
         # 动作前置校验：只校验“当前状态是否允许执行该动作”，不做语义判断。
         state_errors = self._action_state_errors(session_id, plan)
@@ -410,19 +435,37 @@ class AppService:
             raise ConflictError("画像还没确认，先和我说清楚你的情况吧")
         model = self._session_active_model(session_id)
         weights, transform, select_hook = self._model_runtime(model)
+        cfg = self._exec_config(model.get("config"))
+        context_builder = self._context_builder(transform)
         from .engine import selection
 
-        top_df, _scores = selection.screen(self.data, weights, top_n=DEFAULT_TOP_N,
-                                           score_transform=transform,
-                                           select_hook=select_hook)
-        portfolio = selection.build_portfolio(top_df, self.data.prices,
-                                              method="equal_weight", capital=1_000_000.0)
-        start, end = self._backtest_window()
+        top_df, _scores = selection.screen(
+            self.data, weights, top_n=cfg["top_n"],
+            score_transform=transform, select_hook=select_hook,
+            context_builder=context_builder)
+        hook_weights = dict(top_df.attrs.get("weights") or {})
+        if hook_weights:
+            codes = [str(code) for code in top_df["code"].tolist()]
+            total = sum(float(hook_weights.get(code, 0.0)) for code in codes)
+            rows = []
+            for code in codes:
+                weight = (float(hook_weights.get(code, 0.0)) / total
+                          if total > 0 else 1.0 / max(1, len(codes)))
+                rows.append({"code": code, "weight_pct": weight * 100.0,
+                             "amount": weight * 1_000_000.0, "method": "program_weights"})
+            portfolio = pd.DataFrame(rows)
+        else:
+            portfolio = selection.build_portfolio(
+                top_df, self.data.prices, method=cfg["portfolio_method"],
+                capital=1_000_000.0)
+        start, end = self._backtest_window(cfg["backtest_years"])
         backtest = selection.run_backtest(
-            self.data, weights, start=start, end=end, top_n=DEFAULT_TOP_N,
-            rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY, cost_sell=COST_SELL,
+            self.data, weights, start=start, end=end, top_n=cfg["top_n"],
+            rebalance_days=cfg["rebalance_days"],
+            cost_buy=cfg["cost_buy"], cost_sell=cfg["cost_sell"],
             risk_free_rate=RISK_FREE_RATE, score_transform=transform,
-            select_hook=select_hook)
+            select_hook=select_hook, context_builder=context_builder,
+            portfolio_method=cfg["portfolio_method"])
 
         contributions: dict[str, float] = {}
         top_payload: list[dict[str, Any]] = []
@@ -513,16 +556,24 @@ class AppService:
     # 动作：AI 定引擎与调参范围 + 服务端执行网格寻优
     # ------------------------------------------------------------------
     def _analyze_model(self, session_id: str, request_text: str = "",
-                       intent: dict[str, Any] | None = None):
+                       intent: dict[str, Any] | None = None,
+                       work_id: str | None = None):
         """AI 通过 analyze_model 的 tool 参数决定引擎方向；服务端只执行指令。"""
         from .engine import selection, tuning
         from .models import custom, pipeline, registry
 
         intent = intent if isinstance(intent, dict) else {}
         preset_plan = intent.pop("_preset_plan", None)
+        preview_work_id = str(intent.pop("_work_id", "") or "")
+        preview_change = intent.pop("_preview_change", None)
+        work_id = work_id or preview_work_id or ("work-" + uuid.uuid4().hex[:8])
+        preset_config = (preset_plan.get("config")
+                         if isinstance(preset_plan, dict) else None)
+        exec_config = self._exec_config(preset_config)
         model = self._session_active_model(session_id)
         base_weights, base_transform, base_select = self._model_runtime(model)
-        base_metrics = self._current_metrics(session_id)
+        base_context = self._context_builder(base_transform)
+        base_metrics = self._current_metrics(session_id, exec_config)
 
         runtime_before = self.store.get_state(session_id)
         previous_pending = runtime_before.get("pending") or {}
@@ -554,12 +605,14 @@ class AppService:
         force_model_type = directive.model_type
         switch_only = directive.engine == "model_type" and not directive.escalate
 
-        work_id = "work-" + uuid.uuid4().hex[:8]
         tune_id = "tune-" + uuid.uuid4().hex[:8]
         steps: list[dict[str, Any]] = []
         tuning_state: dict[str, Any] = {"start": None, "history": [], "best": None,
                                         "started": time.time()}
         work_extra: dict[str, Any] = {}
+        if isinstance(preview_change, dict) and preview_change:
+            # 进入正式寻优流水线后先沿用实时预览卡里的代码改动，避免代码窗口中途消失
+            work_extra["code_change"] = preview_change
 
         def publish(status: str = "running", comparison: dict | None = None,
                     proposal: dict | None = None, extra: dict | None = None) -> dict[str, Any]:
@@ -630,14 +683,15 @@ class AppService:
                  f"夏普 {float(base_metrics.get('sharpe', 0)):.2f}。", "done", "analysis")
         yield "ui", publish()
 
-        top_df, scores = selection.screen(self.data, base_weights, top_n=DEFAULT_TOP_N,
-                                          score_transform=base_transform,
-                                          select_hook=base_select)
+        top_df, scores = selection.screen(
+            self.data, base_weights, top_n=exec_config["top_n"],
+            score_transform=base_transform, select_hook=base_select,
+            context_builder=base_context)
         focus = self._factor_focus(top_df, base_weights)
         add_step("翻数据找线索", f"最近组合更看重：{'、'.join(focus[:3]) or '均衡配置'}；"
                                  "先把偏弱的环节找出来。", "done", "data")
         factor_stats = self._factor_stats(scores, base_weights)
-        recent_metrics = self._recent_metrics(model)
+        recent_metrics = self._recent_metrics(model, exec_config)
         yield "ui", publish()
 
         # 1) AI 只产出「引擎 + 搜索范围」，不直接给参数值；
@@ -670,11 +724,16 @@ class AppService:
                     plan = plan["plan"]
             if not isinstance(plan, dict) or not plan.get("approach"):
                 raise AgentError("AI 返回的调参方案格式不对")
+        if plan.get("approach") == "code" and not isinstance(preset_plan, dict):
+            raise AgentError(
+                "自动调参不再生成代码模型：如需编写/修改模型程序，请调用 write_model_program 工具")
+        exec_config = self._exec_config(
+            plan.get("config") if isinstance(plan.get("config"), dict) else preset_config)
         program_review = (plan.get("program_review")
                           if isinstance(plan.get("program_review"), dict) else None)
         if program_review:
             add_step(
-                "LLM 二次审核",
+                "LLM 安全审核",
                 (f"审核通过（风险等级 {program_review.get('risk_level', 'medium')}）："
                  f"{str(program_review.get('summary') or '').strip()}").strip(),
                 "done", "check")
@@ -728,10 +787,6 @@ class AppService:
             pre_lines = str(pre_code_change.get("diff") or "").split("\n")
             add_step("写入 AI 重写的模型引擎",
                      "AI 已完成代码改写，正在逐行写入…", "running", "code")
-            empty_change = dict(pre_code_change)
-            empty_change.update({"diff": "", "added": 0, "removed": 0})
-            yield "ui", publish(proposal=self._proposal_public(plan),
-                                extra={"code_change": empty_change})
             for index, line in enumerate(pre_lines):
                 if not line and index == len(pre_lines) - 1:
                     continue
@@ -756,19 +811,22 @@ class AppService:
         if switch_only:
             engine_kind = "weight"
             candidate_weights = normalize_weights(plan.get("weights") or base_weights)
-            start_date, end_date = self._backtest_window()
+            start_date, end_date = self._backtest_window(exec_config["backtest_years"])
             backtest = selection.run_backtest(
                 self.data, candidate_weights, start=start_date, end=end_date,
-                top_n=DEFAULT_TOP_N, rebalance_days=REBALANCE_DAYS,
-                cost_buy=COST_BUY, cost_sell=COST_SELL,
-                risk_free_rate=RISK_FREE_RATE)
+                top_n=exec_config["top_n"],
+                rebalance_days=exec_config["rebalance_days"],
+                cost_buy=exec_config["cost_buy"], cost_sell=exec_config["cost_sell"],
+                risk_free_rate=RISK_FREE_RATE,
+                portfolio_method=exec_config["portfolio_method"])
             candidate_metrics = _json_safe(backtest["metrics"])
             candidate_nav = backtest["nav"]
             tuned_params = dict(candidate_weights)
             evaluated = total_trials = 1
+            final_tuning_block = None
             tune_public = {}
         else:
-            # 2) 服务端在 AI 给定范围内执行逐轴网格寻优
+            # 2) 服务端在 AI 给定范围内执行逐轴网格寻优（或单次回测）
             engine_kind = "param" if plan["approach"] == "code" else "weight"
             engine_weights = normalize_weights(plan.get("weights") or base_weights)
             code = str(plan.get("code") or "")
@@ -783,20 +841,32 @@ class AppService:
                 search_space = dict(plan.get("param_space") or {})
                 labels = {name: name for name in search_space}
 
-            start_date, end_date = self._backtest_window()
-            rebalance_days = REBALANCE_DAYS
-            cost_buy = COST_BUY
-            cost_sell = COST_SELL
-            risk_free_rate = RISK_FREE_RATE
+            start_date, end_date = self._backtest_window(exec_config["backtest_years"])
+            top_n = exec_config["top_n"]
+            rebalance_days = exec_config["rebalance_days"]
+            cost_buy = exec_config["cost_buy"]
+            cost_sell = exec_config["cost_sell"]
+            portfolio_method = exec_config["portfolio_method"]
+            context_cache: dict[str, dict[str, Any]] = {}
+
+            def context_for(asof) -> dict[str, Any]:
+                key = str(asof) if asof is not None else "__latest__"
+                if key not in context_cache:
+                    context_cache[key] = self._program_context(asof)
+                return context_cache[key]
 
             def evaluator(params: dict[str, Any]) -> dict[str, Any]:
                 if engine_kind == "weight":
-                    tuned_weights = normalize_weights(params)
+                    # 搜索轴只覆盖部分因子；未搜索的因子沿用当前基础权重
+                    merged = dict(engine_weights)
+                    merged.update(params)
+                    tuned_weights = normalize_weights(merged)
                     backtest = selection.run_backtest(
                         self.data, tuned_weights, start=start_date, end=end_date,
-                        top_n=DEFAULT_TOP_N, rebalance_days=rebalance_days,
+                        top_n=top_n, rebalance_days=rebalance_days,
                         cost_buy=cost_buy, cost_sell=cost_sell,
-                        risk_free_rate=risk_free_rate)
+                        risk_free_rate=RISK_FREE_RATE,
+                        portfolio_method=portfolio_method)
                     return {"metrics": backtest["metrics"],
                             "params": tuned_weights, "nav": backtest["nav"]}
                 if program_files:
@@ -806,37 +876,76 @@ class AppService:
                         extra_paths=[custom.ai_packages_dir()])
                     trial_transform = trial_runtime.transform
                     trial_select = trial_runtime.select_stocks
+                    trial_context = (context_for if getattr(
+                        trial_transform, "accepts_context", False) else None)
                 else:
                     trial_transform = custom.compile_code(  # type: ignore[attr-defined]
                         code, params, validate=False)
                     trial_select = None
+                    trial_context = None
                 backtest = selection.run_backtest(
                     self.data, engine_weights, start=start_date, end=end_date,
-                    top_n=DEFAULT_TOP_N, rebalance_days=rebalance_days,
+                    top_n=top_n, rebalance_days=rebalance_days,
                     cost_buy=cost_buy, cost_sell=cost_sell,
-                    risk_free_rate=risk_free_rate, score_transform=trial_transform,
-                    select_hook=trial_select)
+                    risk_free_rate=RISK_FREE_RATE, score_transform=trial_transform,
+                    select_hook=trial_select, context_builder=trial_context,
+                    portfolio_method=portfolio_method)
                 return {"metrics": backtest["metrics"],
                         "params": dict(params), "nav": backtest["nav"]}
 
-            step_title = "运行参数网格寻优" if engine_kind == "param" else "运行因子网格寻优"
-            add_step(step_title,
-                     (f"AI 已给出 {len(search_space)} 个参数的搜索范围，服务端逐个组合回测评估，"
-                      f"目标：{objective_label}。具体进度实时显示在寻优卡片中。"),
-                     "running", "tune")
+            final_event: dict[str, Any] | None = None
+            if not search_space:
+                # 没声明 param_space：单次回测，不做参数寻优
+                try:
+                    single = evaluator({})
+                except Exception as exc:  # noqa: BLE001
+                    raise ServiceError(f"AI 程序单次回测失败：{exc}") from exc
+                single_metrics = single.get("metrics") or {}
+                metric_value = float(single_metrics.get(objective) or 0.0)
+                single_best = {"params": {}, "metrics": single_metrics,
+                               "metric_value": metric_value, "score": metric_value,
+                               "constraint_ok": True, "nav": single.get("nav")}
+                single_method = "单次回测（无参数寻优）"
+                add_step("单次回测（无参数寻优）",
+                         "AI 程序未声明 param_space，本轮只做一次回测。",
+                         "running", "backtest")
+
+                def _single_search():
+                    yield {"event": "start", "total": 1, "method": single_method,
+                           "objective": objective,
+                           "objective_label": objective_label, "space": []}
+                    yield {"event": "trial", "trial": 1, "total": 1, "progress": 1.0,
+                           "metric_value": metric_value, "score": metric_value,
+                           "params": {}, "metrics": single_metrics,
+                           "best": single_best, "improved": True,
+                           "label": "单次回测", "constraint_ok": True}
+                    yield {"event": "done", "best": single_best, "total": 1,
+                           "evaluated": 1, "method": single_method,
+                           "objective": objective,
+                           "objective_label": objective_label, "space": [], "elapsed": 0}
+
+                search_iter = _single_search()
+            else:
+                step_title = ("运行参数网格寻优" if engine_kind == "param"
+                              else "运行因子网格寻优")
+                add_step(step_title,
+                         (f"AI 已给出 {len(search_space)} 个参数的搜索范围，"
+                          f"服务端逐个组合回测评估，目标：{objective_label}。"
+                          "具体进度实时显示在寻优卡片中。"),
+                         "running", "tune")
+                search_iter = tuning.run_search(
+                    evaluator,
+                    space=search_space,
+                    base_params=engine_weights if engine_kind == "weight" else {},
+                    objective=objective,
+                    max_trials=plan.get("max_trials"),
+                    tolerance=tolerance,
+                    kind=engine_kind,
+                    labels=labels)
             yield "ui", publish()
 
-            final_event: dict[str, Any] | None = None
             try:
-                for event in tuning.run_search(
-                        evaluator,
-                        space=search_space,
-                        base_params=engine_weights if engine_kind == "weight" else {},
-                        objective=objective,
-                        max_trials=plan.get("max_trials"),
-                        tolerance=tolerance,
-                        kind=engine_kind,
-                        labels=labels):
+                for event in search_iter:
                     event_name = event.get("event")
                     if event_name == "start":
                         tuning_state["start"] = event
@@ -967,12 +1076,7 @@ class AppService:
                 step_title = "写入寻优后的因子权重"
                 running_detail = "正在写入网格寻优得到的因子权重，改动逐行展示中…"
             add_step(step_title, running_detail, "running", "code")
-            partial_change = dict(change_preview)
-            partial_change["diff"] = ""
-            partial_change["added"] = 0
-            partial_change["removed"] = 0
-            yield "ui", publish(proposal=self._proposal_public(final_plan, model_name=model_name),
-                                extra={"code_change": partial_change})
+            yield "ui", publish(proposal=self._proposal_public(final_plan, model_name=model_name))
             for index, line in enumerate(diff_lines):
                 if not line and index == len(diff_lines) - 1:
                     continue
@@ -1112,7 +1216,7 @@ class AppService:
                          + " 您可以先不启用，或回复继续优化；我会更换基础引擎或重写打分逻辑，"
                            "再由服务端在新的参数范围内重新寻优。")
         blocks = [final_work["block"]]
-        if not switch_only:
+        if final_tuning_block is not None:
             blocks.append(final_tuning_block)
         blocks.extend([comparison_block, approval])
         return blocks, note_text, False
@@ -1120,12 +1224,62 @@ class AppService:
     # ------------------------------------------------------------------
     # 动作：AI 直接编写程序（write_model_program）
     # ------------------------------------------------------------------
+    def _program_preview_block(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """把 AI 代码生成增量包装成标准「AI 正在优化模型」work 卡片。"""
+        files = payload.get("files")
+        if not isinstance(files, dict) or not files:
+            return {}
+        generated = str(payload.get("status") or "writing") == "generated"
+        diff_lines: list[str] = []
+        added = 0
+        for path in sorted(files):
+            diff_lines.append("--- /dev/null")
+            diff_lines.append(f"+++ {path}（AI 正在编写）")
+            for line in str(files[path]).splitlines():
+                diff_lines.append("+" + line)
+                added += 1
+        steps: list[dict[str, Any]] = [{
+            "title": "AI 正在编写模型程序" if not generated else "AI 已完成模型程序",
+            "detail": (f"{len(files)} 个模块 · "
+                       f"{sum(len(str(value)) for value in files.values())} 字符"),
+            "status": "done" if generated else "running",
+            "kind": "code",
+        }]
+        if generated:
+            steps.append({"title": "等待 LLM 安全审核",
+                          "detail": "程序已生成，正在做安全检查",
+                          "status": "running", "kind": "check"})
+        return {
+            "id": str(payload.get("id") or "program-preview"),
+            "type": "work",
+            "title": "AI 正在优化模型",
+            "status": "running",
+            "steps": steps,
+            "comparison": {},
+            "proposal": {
+                "summary": ("程序已生成，等待安全审核。" if generated
+                            else "AI 正在直接编写模型程序…"),
+            },
+            "code_change": {
+                "file": "AI 程序",
+                "files": sorted(files),
+                "language": "python",
+                "kind": "code",
+                "diff": "\n".join(diff_lines),
+                "added": added,
+                "removed": 0,
+            },
+            "preview": True,
+        }
+
     def _write_model_program(self, session_id: str, request_text: str = "",
                              args: dict[str, Any] | None = None):
         from .engine import tuning
         from .models import custom
 
         args = args if isinstance(args, dict) else {}
+        preview_id = str(args.pop("_preview_id", "") or "")
+        preview_change = args.pop("_preview_change", None)
         raw_files = args.get("files")
         if isinstance(raw_files, dict):
             files = {str(path): str(content) for path, content in raw_files.items()}
@@ -1145,6 +1299,8 @@ class AppService:
         expected = str(args.get("expected_effect") or "")
         reason = str(args.get("reason") or "")
         escalate = bool(args.get("escalate"))
+        max_trials = args.get("max_trials")
+        program_config = self._normalize_program_config(args.get("config"))
 
         # 1) 基础结构与参数空间校验（不执行代码）
         try:
@@ -1156,8 +1312,6 @@ class AppService:
             raise AgentError(f"AI 程序未通过基础校验：{exc}") from exc
         except Exception as exc:  # noqa: BLE001 - 参数空间错误等
             raise AgentError(f"AI 程序参数不合法：{exc}") from exc
-        if not param_space:
-            raise AgentError("write_model_program 需要至少 1 个可寻优参数（param_space）")
 
         # 2) LLM 二次审核；不通过时自动修复一次并复审
         review = self.agent.review_program(
@@ -1170,7 +1324,7 @@ class AppService:
                     packages=packages, request_text=request_text, review=review)
             except AgentError as exc:
                 return (yield from self._program_review_failure(
-                    session_id, review, f"自动修复失败：{exc}"))
+                    session_id, review, f"自动修复失败：{exc}", preview_id))
             files = repaired.get("files") or files
             entry = str(repaired.get("entry") or entry)
             packages = list(repaired.get("packages") or [])
@@ -1178,6 +1332,10 @@ class AppService:
             expected = str(repaired.get("expected_effect") or expected)
             risks = list(repaired.get("risks") or risks)
             param_space_raw = repaired.get("param_space") or param_space_raw
+            if repaired.get("max_trials") is not None:
+                max_trials = repaired.get("max_trials")
+            if isinstance(repaired.get("config"), dict):
+                program_config = self._normalize_program_config(repaired.get("config"))
             try:
                 custom.validate_program(
                     files, entry, extra_roots=custom.package_import_roots(packages))
@@ -1185,12 +1343,13 @@ class AppService:
                                if param_space_raw else {})
             except Exception as exc:  # noqa: BLE001
                 return (yield from self._program_review_failure(
-                    session_id, review, f"修复后的程序不合法：{exc}"))
+                    session_id, review, f"修复后的程序不合法：{exc}", preview_id))
             review = self.agent.review_program(
                 files=files, entry=entry, summary=summary, objective=objective,
                 packages=packages, request_text=request_text, repair_attempt=True)
             if not self._review_passed(review, packages):
-                return (yield from self._program_review_failure(session_id, review, ""))
+                return (yield from self._program_review_failure(
+                    session_id, review, "", preview_id))
 
         # 3) 审核通过的第三方库才允许安装
         installed_roots: list[str] = []
@@ -1199,7 +1358,8 @@ class AppService:
                 installed = self._install_program_packages(session_id, packages)
                 installed_roots = list(installed.get("roots") or [])
             except AgentError as exc:
-                return (yield from self._program_review_failure(session_id, review, str(exc)))
+                return (yield from self._program_review_failure(
+                    session_id, review, str(exc), preview_id))
         allowed_roots = sorted(set(installed_roots) | set(custom.package_import_roots(packages)))
 
         # 4) 交给现有寻优/回测/审批流水线（preset plan）
@@ -1217,12 +1377,16 @@ class AppService:
             "expected_effect": expected,
             "risks": risks or list(review.get("suggestions") or []),
             "objective": objective,
-            "max_trials": 24,
+            "max_trials": (int(max_trials) if max_trials is not None
+                           else PROGRAM_DEFAULT_MAX_TRIALS),
+            "config": program_config,
             "repair_attempts": 0,
             "program_review": review,
         }
         intent = {"engine": "code", "model_type": "", "objective": objective,
-                  "escalate": escalate, "reason": reason, "_preset_plan": plan}
+                  "escalate": escalate, "reason": reason, "_preset_plan": plan,
+                  "_work_id": preview_id,
+                  "_preview_change": preview_change if isinstance(preview_change, dict) else None}
         return (yield from self._analyze_model(session_id, request_text, intent))
 
     @staticmethod
@@ -1250,6 +1414,56 @@ class AppService:
                 return False
         return True
 
+    @staticmethod
+    def _normalize_program_config(raw: Any) -> dict[str, Any]:
+        """校验 AI 程序声明的执行配置（不合法直接报错，不静默忽略）。"""
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise AgentError("程序 config 必须是 JSON 对象")
+        config: dict[str, Any] = {}
+        bounds = {
+            "top_n": (1, 200, int),
+            "backtest_years": (0.25, 20.0, float),
+            "rebalance_days": (1, 250, int),
+            "cost_buy": (0.0, 0.05, float),
+            "cost_sell": (0.0, 0.05, float),
+        }
+        for key, value in raw.items():
+            key_text = str(key)
+            if key_text not in bounds and key_text != "portfolio_method":
+                raise AgentError(f"程序 config 不支持键：{key_text}")
+            if key_text == "portfolio_method":
+                method = str(value or "").strip()
+                if method not in ("equal_weight", "risk_parity"):
+                    raise AgentError("portfolio_method 只支持 equal_weight / risk_parity")
+                config[key_text] = method
+                continue
+            minimum, maximum, kind = bounds[key_text]
+            try:
+                number = kind(float(value))
+            except (TypeError, ValueError) as exc:
+                raise AgentError(f"config.{key_text} 必须是数值") from exc
+            if not math.isfinite(float(number)) or not minimum <= float(number) <= maximum:
+                raise AgentError(
+                    f"config.{key_text} 超出范围 [{minimum}, {maximum}]")
+            config[key_text] = number
+        return config
+
+    @staticmethod
+    def _exec_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """把程序配置与默认回测配置合并。"""
+        merged = {
+            "top_n": DEFAULT_TOP_N,
+            "backtest_years": BACKTEST_YEARS,
+            "rebalance_days": REBALANCE_DAYS,
+            "cost_buy": COST_BUY,
+            "cost_sell": COST_SELL,
+            "portfolio_method": "equal_weight",
+        }
+        merged.update(config or {})
+        return merged
+
     def _install_program_packages(self, session_id: str,
                                   packages: list[str]) -> dict[str, Any]:
         from .models import custom
@@ -1264,12 +1478,25 @@ class AppService:
         return result
 
     def _program_review_failure(self, session_id: str, review: dict[str, Any],
-                                extra: str = ""):
+                                extra: str = "", preview_id: str = ""):
+        if preview_id:
+            yield "ui", {"block": {
+                "id": preview_id,
+                "type": "work",
+                "title": "AI 正在优化模型",
+                "status": "error",
+                "steps": [{"title": "程序安全审核未通过",
+                           "detail": "程序未启用，查看下方审核问题",
+                           "status": "error", "kind": "check"}],
+                "comparison": {},
+                "proposal": {},
+                "preview": True,
+            }}
         issues = [str(item).strip() for item in review.get("issues") or []
                   if str(item).strip()]
         suggestions = [str(item).strip() for item in review.get("suggestions") or []
                        if str(item).strip()]
-        note_parts = list(issues[:5])
+        note_parts = list(issues[:32])
         if not note_parts and extra:
             note_parts.append(extra)
         block = {
@@ -1280,7 +1507,7 @@ class AppService:
             "risk_level": review.get("risk_level") or "medium",
             "issues": issues,
             "suggestions": suggestions,
-            "summary": str(review.get("summary") or ""),
+            "summary": str(review.get("summary") or "")[:1000],
         }
         yield "ui", {"block": block}
         if note_parts:
@@ -1405,6 +1632,8 @@ class AppService:
                 "packages": list(plan.get("packages") or []),
                 "package_specs": list(plan.get("package_specs") or []),
                 "params": dict(tuned_params),
+                "config": dict(plan.get("config") or {}),
+                "max_trials": plan.get("max_trials"),
                 "summary": str(plan.get("summary") or ""),
             }
         if approach == "model_type":
@@ -1429,7 +1658,9 @@ class AppService:
                            candidate: dict[str, Any]) -> tuple[bool, str]:
         objective = expectation.get("objective") or "sharpe"
         tolerance = expectation.get("tolerance")
-        names = {"cagr": "年化收益", "sharpe": "夏普比率", "mdd": "最大回撤"}
+        names = {"cagr": "年化收益", "sharpe": "夏普比率", "mdd": "最大回撤",
+                 "calmar": "卡玛比率", "sortino": "索提诺比率",
+                 "ir": "信息比率", "win_rate": "月胜率"}
         try:
             base_value = float(base.get(objective) or 0.0)
             cand_value = float(candidate.get(objective) or 0.0)
@@ -2024,21 +2255,27 @@ class AppService:
                 return str(info["id"])
         return "multi_factor" if "multi_factor" not in excluded else "low_vol_quality"
 
-    def _current_metrics(self, session_id: str) -> dict[str, Any]:
+    def _current_metrics(self, session_id: str,
+                         config: dict[str, Any] | None = None) -> dict[str, Any]:
         """当前会话生效模型在同一回测窗口下的指标（用于寻优前后对比）。"""
         from .engine import selection
 
+        cfg = self._exec_config(config)
         model = self._session_active_model(session_id)
         active = self.store.session_active_version(session_id)
         if active and active.get("metrics"):
-            return _json_safe(active["metrics"])
+            if cfg == self._exec_config((model or {}).get("config")):
+                return _json_safe(active["metrics"])
         weights, transform, select_hook = self._model_runtime(model)
-        start, end = self._backtest_window()
+        context_builder = self._context_builder(transform)
+        start, end = self._backtest_window(cfg["backtest_years"])
         backtest = selection.run_backtest(
-            self.data, weights, start=start, end=end, top_n=DEFAULT_TOP_N,
-            rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY, cost_sell=COST_SELL,
+            self.data, weights, start=start, end=end, top_n=cfg["top_n"],
+            rebalance_days=cfg["rebalance_days"],
+            cost_buy=cfg["cost_buy"], cost_sell=cfg["cost_sell"],
             risk_free_rate=RISK_FREE_RATE, score_transform=transform,
-            select_hook=select_hook)
+            select_hook=select_hook, context_builder=context_builder,
+            portfolio_method=cfg["portfolio_method"])
         return _json_safe(backtest["metrics"])
 
     @staticmethod
@@ -2059,18 +2296,23 @@ class AppService:
             }
         return stats
 
-    def _recent_metrics(self, model: dict[str, Any]) -> dict[str, Any]:
+    def _recent_metrics(self, model: dict[str, Any],
+                        config: dict[str, Any] | None = None) -> dict[str, Any]:
         from .engine import selection
+        cfg = self._exec_config(config)
         weights, transform, select_hook = self._model_runtime(model)
+        context_builder = self._context_builder(transform)
         index = self.data.prices.index
         end = index[-1]
         start = max(end - pd.Timedelta(days=365), index[min(len(index) - 1, 200)])
         backtest = selection.run_backtest(
             self.data, weights, start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"), top_n=DEFAULT_TOP_N,
-            rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY, cost_sell=COST_SELL,
+            end=end.strftime("%Y-%m-%d"), top_n=cfg["top_n"],
+            rebalance_days=cfg["rebalance_days"],
+            cost_buy=cfg["cost_buy"], cost_sell=cfg["cost_sell"],
             risk_free_rate=RISK_FREE_RATE, score_transform=transform,
-            select_hook=select_hook)
+            select_hook=select_hook, context_builder=context_builder,
+            portfolio_method=cfg["portfolio_method"])
         return _json_safe(backtest["metrics"])
 
     @staticmethod
@@ -2105,15 +2347,15 @@ class AppService:
             "versions": [{"id": item["id"], "name": self._model_name(item),
                           "status": ("active" if item["id"] == active_version_id
                                      else "archived")}
-                         for item in versions[-5:]],
+                         for item in versions[-20:]],
             "pending": ({"summary": (pending.get("proposal") or {}).get("summary", ""),
                          "tuning": pending.get("tuning") or {}}
                         if pending else None),
             "pending_candidates": [self._candidate_public(item, index)
-                                    for index, item in enumerate(candidates, start=1)][-8:],
+                                    for index, item in enumerate(candidates, start=1)][-50:],
             "pending_intent": runtime.get("pending_intent"),
             "last_selection": ({"as_of": last.get("as_of"),
-                                "top": [item.get("code") for item in (last.get("top") or [])[:5]],
+                                "top": [item.get("code") for item in (last.get("top") or [])[:10]],
                                 "metrics": last.get("metrics")} if last else None),
         }
 
@@ -2174,19 +2416,58 @@ class AppService:
         if owner_id is not None and self.store.session_owner(session_id) != int(owner_id):
             raise NotFoundError(f"会话不存在：{session_id}")
 
-    def _backtest_window(self) -> tuple[str, str]:
+    def _backtest_window(self, years: float | None = None) -> tuple[str, str]:
         index = self.data.prices.index
         if len(index) == 0:
             raise ServiceError("行情数据为空，无法回测")
         end = index[-1]
-        start = end - pd.Timedelta(days=int(365 * BACKTEST_YEARS))
+        window_years = BACKTEST_YEARS if years is None else float(years)
+        start = end - pd.Timedelta(days=int(365 * window_years))
         warmup_start = index[min(len(index) - 1, 200)]
         start = max(start, warmup_start)
         if start >= end:
             raise ServiceError("可用历史数据不足，无法回测")
         return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
-    @staticmethod
+    def _program_context(self, asof: Any = None) -> dict[str, Any]:
+        """给 context 感知的 AI 程序提供截至 asof 的行情/基本面数据。"""
+        data = self.data
+        prices = data.prices
+        if len(prices.index) == 0:
+            return {"asof": "", "prices": prices, "close_raw": data.close_raw,
+                    "amount": data.amount, "fundamentals": data.fundamentals,
+                    "industry": data.industry, "universe": list(data.universe)}
+        try:
+            cut = prices.index[-1] if asof is None else pd.Timestamp(asof)
+        except (TypeError, ValueError):
+            cut = prices.index[-1]
+        history = prices.loc[:cut]
+        if PROGRAM_CONTEXT_DAYS > 0:
+            history = history.tail(PROGRAM_CONTEXT_DAYS)
+        return {
+            "asof": cut.strftime("%Y-%m-%d"),
+            "prices": history,
+            "close_raw": data.close_raw.loc[:cut],
+            "amount": data.amount.loc[:cut],
+            "fundamentals": data.fundamentals,
+            "industry": data.industry,
+            "universe": list(data.universe),
+        }
+
+    def _context_builder(self, transform: Any, cache: dict[str, Any] | None = None):
+        """程序 transform 声明了 context 参数时才构建上下文（带 asof 级缓存）。"""
+        if not getattr(transform, "accepts_context", False):
+            return None
+        cache = cache if cache is not None else {}
+
+        def builder(asof: Any) -> dict[str, Any]:
+            key = str(asof) if asof is not None else "__latest__"
+            if key not in cache:
+                cache[key] = self._program_context(asof)
+            return cache[key]
+
+        return builder
+
     @staticmethod
     def _assistant_text(reply: str, notes: list[str], extra_text: str = "") -> str:
         clean_notes = [note for note in notes if note]

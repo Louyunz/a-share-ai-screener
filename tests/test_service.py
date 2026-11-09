@@ -111,7 +111,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertGreater(first_compare_index, last_tuning_index,
                            "效果对比必须晚于网格寻优结果出现")
         step_titles = [step.get("title") for step in works[-1].get("steps", [])]
-        self.assertIn("运行参数网格寻优", step_titles)
+        self.assertIn("运行因子网格寻优", step_titles)
         self.assertIn("逐组回测", text, "对话里应说明具体如何调整模型（旁白）")
         history_after_plan = self.service.messages(self.sid)["messages"]
         self.assertTrue(any("逐组回测" in (message.get("content") or "")
@@ -146,7 +146,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertGreater(diff_lengths[-1], diff_lengths[0])
         self.assertGreaterEqual(len(set(diff_lengths)), 3, "diff 应逐行增长而不是一次性出现")
         self.assertEqual((works[-1].get("proposal") or {}).get("approach"),
-                         "服务端网格寻优（自定义程序）")
+                         "服务端网格寻优（因子权重）")
         approval_text = " ".join(str(approvals[-1].get(key, ""))
                                  for key in ("title", "summary", "risk"))
         self.assertIn("网格寻优", approval_text)
@@ -169,7 +169,7 @@ class ChatFlowTest(unittest.TestCase):
         versions = _typed(events, "version")
         self.assertTrue(versions)
         state = self.service.get_state(self.sid)
-        self.assertEqual(state["active_model"]["name"], "AI 生成模型")
+        self.assertEqual(state["active_model"]["name"], "网格寻优权重")
         self.assertTrue(state["active_model"]["version_id"])
         self.assertTrue(state["versions"])
         # 会话状态是唯一模型来源
@@ -541,7 +541,8 @@ class ModelProgramToolTest(unittest.TestCase):
         self.service.close()
         cleanup(self.dir)
 
-    def _action(self, files=None, packages=None, param_space=None) -> dict:
+    def _action(self, files=None, packages=None, param_space=None,
+                config=None, max_trials=None) -> dict:
         return {
             "name": "write_model_program",
             "args": {
@@ -549,8 +550,11 @@ class ModelProgramToolTest(unittest.TestCase):
                           for path, content in (files or SCRIPTED_PROGRAM_FILES).items()],
                 "entry": "main.py",
                 "summary": "测试：AI 编写的多文件模型程序",
-                "param_space": param_space or dict(SCRIPTED_PROGRAM_PARAM_SPACE),
+                "param_space": (dict(SCRIPTED_PROGRAM_PARAM_SPACE)
+                                if param_space is None else param_space),
                 "objective": "",
+                "max_trials": max_trials,
+                "config": dict(config or {}),
                 "packages": list(packages or []),
                 "escalate": False,
                 "reason": "test-program",
@@ -561,14 +565,76 @@ class ModelProgramToolTest(unittest.TestCase):
 
     def test_program_is_streamed_while_being_written(self) -> None:
         events = list(self.service.chat_stream(self.sid, "更换数学模型"))
-        program_blocks = [data["block"] for event, data in events
+        # 代码生成过程现在统一显示在「AI 正在优化模型」work 卡片里（preview=True）
+        preview_blocks = [data["block"] for event, data in events
                           if event == "ui"
-                          and (data.get("block") or {}).get("type") == "program"]
-        self.assertGreaterEqual(len(program_blocks), 2, "代码生成过程应多次流式更新")
-        self.assertEqual(len({block["id"] for block in program_blocks}), 1)
-        self.assertIn("main.py", program_blocks[-1]["files"])
-        self.assertIn("build_transform", program_blocks[-1]["files"]["main.py"])
-        self.assertEqual(program_blocks[-1]["status"], "generated")
+                          and (data.get("block") or {}).get("type") == "work"
+                          and (data.get("block") or {}).get("preview")]
+        self.assertGreaterEqual(len(preview_blocks), 2, "代码生成过程应多次流式更新")
+        self.assertEqual(len({block["id"] for block in preview_blocks}), 1)
+        self.assertIn("main.py", preview_blocks[-1]["code_change"]["files"])
+        self.assertIn("build_transform", preview_blocks[-1]["code_change"]["diff"])
+        titles = [step.get("title") for step in preview_blocks[-1]["steps"]]
+        self.assertIn("等待 LLM 安全审核", titles)
+
+    def test_program_without_param_space_runs_single_backtest_with_config(self) -> None:
+        """省略 param_space=单次回测；config 覆盖 top_n/年限/调仓/成本/组合方法。"""
+        config = {"top_n": 5, "backtest_years": 1.0, "rebalance_days": 10,
+                  "cost_buy": 0.0, "cost_sell": 0.0,
+                  "portfolio_method": "risk_parity"}
+        action = self._action(param_space={}, config=config)
+        events = list(self.service._run_action(self.sid, action, "写一个无参数模型程序"))
+        self.assertFalse([data for event, data in events if event == "error"])
+        tunings = [data["block"] for event, data in events
+                   if event == "ui" and data["block"]["type"] == "tuning"]
+        self.assertTrue(tunings)
+        done = [block for block in tunings if block["status"] == "done"][-1]
+        self.assertEqual(done["method"], "单次回测（无参数寻优）")
+        self.assertEqual(done["progress"]["total"], 1)
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertIsNotNone(pending)
+        self.assertEqual((pending.get("model") or {}).get("config"), config)
+
+    def test_program_context_and_custom_weights(self) -> None:
+        """context 感知 transform 能拿到 asof 数据；select_stocks 返回 {代码:权重} 生效。"""
+        files = {
+            "main.py": (
+                "import pandas as pd\n"
+                "\n"
+                "def build_transform(params=None):\n"
+                "    def transform(z, weights, context=None):\n"
+                "        if not isinstance(context, dict) or not context.get('asof'):\n"
+                "            raise ValueError('missing context')\n"
+                "        if 'prices' not in context or len(context['prices']) < 10:\n"
+                "            raise ValueError('missing prices history')\n"
+                "        return pd.to_numeric(z['z_volatility_60'], errors='coerce').fillna(0.0)\n"
+                "    return transform\n"
+                "\n"
+                "def select_stocks(scores, top_n, params=None):\n"
+                "    ordered = scores.sort_values('factor_score', ascending=False)\n"
+                "    codes = list(ordered.index[:int(top_n)])\n"
+                "    if len(codes) < 2:\n"
+                "        return {codes[0]: 1.0}\n"
+                "    return {codes[0]: 0.7, codes[1]: 0.3}\n"
+            ),
+        }
+        action = self._action(files=files, param_space={},
+                              config={"top_n": 5, "portfolio_method": "risk_parity"})
+        events = list(self.service._run_action(self.sid, action, "写一个 context 模型"))
+        self.assertFalse([data for event, data in events if event == "error"])
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertIsNotNone(pending)
+        model = pending.get("model") or {}
+        self.assertEqual(model.get("kind"), "code")
+        # 启用后选股：context + 自定义权重都应生效
+        list(self.service._apply_pending(self.sid, 0))
+        events = list(self.service._run_selection(self.sid))
+        self.assertFalse([data for event, data in events if event == "error"])
+        selection = next(data["block"] for event, data in events
+                         if event == "ui" and data["block"]["type"] == "selection")
+        self.assertTrue(selection["portfolio"])
+        self.assertTrue(any(item.get("method") == "program_weights"
+                            for item in selection["portfolio"]))
 
     def test_rejected_program_is_auto_repaired_once(self) -> None:
         files = dict(SCRIPTED_PROGRAM_FILES)
@@ -709,7 +775,7 @@ class WeightTuningTest(unittest.TestCase):
                  if event == "ui" and data["block"]["type"] == "work"]
         self.assertTrue(tunings)
         final = [block for block in tunings if block["status"] == "done"][-1]
-        self.assertEqual(final["method"], "逐因子网格搜索")
+        self.assertEqual(final["method"], "全组合网格搜索")
         self.assertEqual({item["key"] for item in final["space"]},
                          {"ep", "roe", "volatility_60"})
         self.assertGreaterEqual(final["progress"]["trial"], 3)
@@ -776,7 +842,7 @@ class WeightTuningTest(unittest.TestCase):
         self.assertEqual((works[-1].get("proposal") or {}).get("approach"),
                          "服务端网格寻优（自定义程序）")
         titles = [step.get("title") for step in works[-1]["steps"]]
-        self.assertIn("LLM 二次审核", titles)
+        self.assertIn("LLM 安全审核", titles)
         change = works[-1].get("code_change") or {}
         self.assertEqual(change.get("kind"), "code")
         self.assertIn("helpers.py", "\n".join(change.get("files") or []))

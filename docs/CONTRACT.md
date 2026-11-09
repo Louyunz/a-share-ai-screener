@@ -167,28 +167,31 @@ Planner 每轮输出：
 | `confirm_profile` | `{}` | 画像必填齐全且用户本轮明确确认 | 写入 confirmed，返回 profile 卡 |
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
-| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 只做内置模型/权重层面调整；`engine=model_type` 切换内置模型并使用预设权重，其他 engine 走服务端调参方案 → 网格寻优 → work/tuning/approval 卡，**不自动启用**。`engine="code"` 已废弃，服务端会要求改用 `write_model_program` |
-| `write_model_program` | `{files[], entry, summary, param_space, objective, packages[], escalate, reason, expected_effect, risks[]}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → LLM 二次审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端网格寻优/回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
+| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 只做内置模型/权重层面调整；`engine=model_type` 切换内置模型并使用预设权重，其他 engine 走服务端调参方案 → 网格寻优 → work/tuning/approval 卡，**不自动启用**。`engine="code"` 已删除，代码程序一律走 `write_model_program` |
+| `write_model_program` | `{files[], entry, summary, param_space?, objective?, max_trials?, config?, packages[], escalate, reason, expected_effect, risks[]}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → 生成过程实时显示在「AI 正在优化模型」work 卡 → LLM 安全审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端寻优/单次回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
 | `apply_pending_change` | `{candidate?}` | 存在待审批候选方案且用户本轮明确同意/指定 | `candidate` 为候选方案编号（按出现顺序 1..N；缺省=最新待审批方案），当前会话启用该候选模型版本，返回 version 卡 |
 | `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
 
 **AI 程序接口（write_model_program）**：
-- 程序是完整 Python 多文件模块（1~8 个顶层 `module.py`，总长 ≤20000 字符，模块间用 `import helpers` / `from helpers import x` 互相引用）；
-- 入口文件（默认 `main.py`）必须定义 `build_transform(params=None) -> transform(z, weights) -> pandas.Series`；可选定义 `select_stocks(scores, top_n, params=None) -> list[str]` 接管选股（`scores` 是 pandas.DataFrame，index=股票代码，含 `factor_score` 列与 z_* 因子列）；
-- 服务端**不做子进程冒烟测试**；执行前做 AST 白名单 / 受限 builtins / 入口契约校验，真正执行发生在网格寻优与回测阶段；
+- 程序是完整 Python 多文件/多级包结构（顶层 `module.py` 或 `pkg/helpers.py`，文件数/总字符数默认上限 64 个 / 500000 字符，可用环境变量调整；模块间用 `import helpers`、`import pkg.helpers`、`from pkg.helpers import x` 互相引用）；
+- 入口文件（默认 `main.py`）必须定义 `build_transform(params=None) -> transform(z, weights, context=None) -> pandas.Series`；可选定义 `select_stocks(scores, top_n, params=None)` 接管选股，返回代码列表或 `{代码: 权重}` 字典（权重会被归一化并用于回测/组合）；`scores` 是 pandas.DataFrame，index=股票代码，含 `factor_score` 列与 z_* 因子列；
+- `transform` 可选接收 `context`（dict）：`asof`、`prices`/`close_raw`/`amount`（截至 asof 的历史行情）、`fundamentals`、`industry`、`universe`，可用于特征计算或训练；未声明该参数的程序仍按 2 参调用；
+- `param_space` 可省略（省略则只做一次回测，不寻优），参数个数不设上限，`max_trials` 可指定寻优预算；`config` 可覆盖 `top_n/backtest_years/rebalance_days/cost_buy/cost_sell/portfolio_method(equal_weight|risk_parity)`，不声明则用系统默认；
+- 服务端**不做子进程冒烟测试**；执行前做 AST 白名单 / 受限 builtins / 入口契约校验，真正执行发生在寻优与回测阶段；
+- 支持类、`@staticmethod/@classmethod/@property` 装饰器、生成器、`self._x` 私有属性、安全 dunder（如 `__init__`）；仍禁止文件/网络/系统命令/动态执行与危险 dunder；
 - 程序生成后先经 **LLM 安全审核**（`program_review.txt`，只检查沙箱/越权/恶意行为，不评价策略逻辑与收益），审核不通过时自动修复一次并复审；仍不通过则返回 review 卡与问题清单，不生成候选、不启用；
-- 第三方库：AI 在 `packages` 里申请，LLM 审核通过后服务端用 pip `--target data/ai_packages` 安装并写入审计 `program_install`；未申请的库会被静态校验拒绝；
-- 沙箱边界：禁止文件、网络、系统命令、动态执行、下划线属性访问；只允许白名单库 + 本程序模块 + 审核通过的第三方库；
-- 程序改动沿用现有 `code_change` 卡片逐行流式输出（多文件以文件名分段），候选/审批/版本/回滚机制不变。
+- 第三方库：AI 在 `packages` 里申请（数量默认上限 16），LLM 审核通过后服务端用 pip `--target data/ai_packages` 安装并写入审计 `program_install`；未申请的库会被静态校验拒绝；
+- 沙箱边界：禁止文件、网络、系统命令、动态执行；只允许白名单库 + 本程序模块 + 审核通过的第三方库；
+- 程序改动沿用现有 `code_change` 卡片逐行流式输出（多文件以文件名为题分段），候选/审批/版本/回滚机制不变。
 
 **多候选方案**：同一会话可先后产生多个候选方案（每次 `analyze_model` 一个），服务端按出现顺序编号 1..N 并保存在 `session_state.candidates`；Planner 状态中 `pending_candidates` 给出 `index/name/summary/status/available`。客户说“用第一个/第二个/第三个方案”时通过 `apply_pending_change(candidate=N)` 指定；旧会话（升级前只存了最新 pending）会从已持久化的 work/comparison/approval 卡片中尽力还原候选列表，无法无损还原的旧代码方案标记为 `available=false`，引导客户重新优化。`rollback_version` 只适用于已启用过的版本链，与“在未启用候选之间做选择”是不同动作。
 
 **换模型与调参分离**：客户说“换其他模型/换个模型”但未点名时，AI 调用 `analyze_model(engine="model_type", model_type="", escalate=false)`；服务端选择与当前不同的内置模型，**直接使用预设权重回测**，不跑网格寻优。客户要求构建/更换/编辑模型程序、或“继续优化/上一版未达预期”的结构性升级，则通过 `write_model_program` 由 AI 直接写程序（上一版是权重/内置模型时也优先写程序）。
 
 **`analyze_model` 参数语义**（由 AI 判断，服务端只做确定性策略）：
-- `engine`: `auto`（普通优化，由 pipeline 决定） / `weights`（只调因子权重） / `model_type`（点名内置模型）；`code` 已废弃（服务端拒绝并要求使用 `write_model_program`）
+- `engine`: `auto`（普通优化，由 pipeline 决定） / `weights`（只调因子权重） / `model_type`（点名内置模型）
 - `model_type`: `engine=model_type` 时的内置模型 id（`multi_factor/low_vol_quality/momentum_growth/value_dividend/contrarian`）
-- `objective`: `sharpe|cagr|mdd`，空字符串表示默认夏普
+- `objective`: `sharpe|cagr|mdd|calmar|sortino|ir|win_rate`，空字符串表示默认夏普
 - `escalate`: 客户说继续优化/上一版未达预期时为 true；结构性升级由 `write_model_program` 完成
 - `reason`: 一句话审计原因（不参与路由）
 
@@ -197,9 +200,9 @@ Planner 每轮输出：
 **“更换数学模型”约定**：`数学模型/打分模型/引擎/程序/公式` 指底层打分逻辑，必须调用 `write_model_program` 直接写完整程序；不允许降级成切内置模型或只调权重，也不允许声称没有权限写代码；旧的 `analyze_model(engine="code")` 隐藏生成路径已删除。
 
 **AI 与服务的调参分工**：
-- AI 直接负责程序源码（`files`）与参数搜索范围（`param_space`），**不输出最终参数值**；
-- 服务端在范围内执行逐轴网格搜索，逐组回测后按目标指标保留最优（见 6.5）；
-- 最终候选的参数由服务端写回模型与改动框，并在 tuning 卡中展示搜索范围与得分走势。
+- AI 直接负责程序源码（`files`）、可选参数搜索范围（`param_space`）与预算（`max_trials`），**不输出最终参数值**；
+- 服务端在范围内执行全组合网格搜索/预算内采样，逐组回测后按目标指标保留最优（见 6.5）；
+- 最终候选的参数由服务端写回模型与改动框，并在 tuning 卡中展示搜索范围、全量/采样信息与得分走势。
 
 ## 5. 画像槽位（生活化标签）
 
@@ -237,22 +240,22 @@ AI 追问原则：一次一个问题；先回应/共情，再问；提供生活�
  "param_space":{"lookback":{"min":10,"max":60,"step":10,"type":"int","default":20}},
  "weights":{"ep":0.1,...},         // 可选：基底权重，省略时用当前权重
  "code":"python 源码（仅 code）",
- "objective":"sharpe|cagr|mdd",
- "max_trials":24,
+ "objective":"sharpe|cagr|mdd|calmar|sortino|ir|win_rate",
+ "max_trials":32,
  "why":"数据依据（引用真实指标）",
  "expected_effect":"预期改善方向",
  "risks":["..."]}
 ```
 
 校验规则：
-- `weights/model_type`：`search_space` 至少 3 个已知因子，每个 `{min,max,step}` 满足 `0<=min<=max<=0.4`、`step>0`、网格档数 >=2；键顺序即搜索优先级。
-- `code`：必须提供 `param_space`（1~4 个合法参数名，`{min,max,step,type,default}`，`type=int|float`）与参数化代码；`code` 方案不能带 `search_space`，`weights/model_type` 不能带 `param_space`。
-- `objective` 缺省 `sharpe`；`max_trials` 为整数，服务端寻优再按 4~64 收敛。
-- 校验失败时服务端把错误信息 + 原方案回传 LLM 自动修复，最多 2 次（`TUNING_REPAIR_SYSTEM`），成功返回 `repair_attempts`，work 卡展示「自动修复调参方案」。
+- `weights/model_type`：`search_space` 至少 1 个已知因子，每个 `{min,max,step}` 满足 `0<=min<=max<=0.4`、`step>0`、网格档数 >=2。
+- `code`：程序统一走 `write_model_program`；普通优化不再生成代码方案。`write_model_program` 的 `param_space` 可选、参数个数不限，`{min,max,step,type,default}`，`type=int|float`。
+- `objective` 缺省 `sharpe`；`max_trials` 为正整数，服务端默认 32、上限由 `TUNING_MAX_TRIALS` 环境变量控制（默认 1000）。
+- 校验失败时服务端把错误信息 + 原方案回传 LLM 自动修复，最多 3 次（`TUNING_REPAIR_SYSTEM`，可用 `TUNING_MAX_REPAIR_ATTEMPTS` 覆盖），成功返回 `repair_attempts`，work 卡展示「自动修复调参方案」。
 
-### 6.3 参数化自定义模型代码契约
+### 6.3 参数化自定义模型代码契约（write_model_program）
 
-AI 生成的代码必须定义：
+AI 生成的程序必须定义：
 ```python
 import numpy as np
 import pandas as pd
@@ -261,29 +264,35 @@ def build_transform(params=None):
     params = params or {}
     lookback = int(params.get("lookback", 20))
 
-    def transform(z, weights):
+    def transform(z, weights, context=None):
         # z: pandas.DataFrame，列含 z_ep/z_bp/...（10 个方向对齐后的因子 z 值）
         # weights: dict[str,float]
+        # context: 可选 dict，含 asof/prices/close_raw/amount/fundamentals/industry/universe
         # params: AI 在 param_space 中声明的参数，服务端寻优时逐组传入
         # 返回 pandas.Series（index 与 z 对齐）
         return ...
     return transform
+
+def select_stocks(scores, top_n, params=None):
+    # 可选：返回代码列表，或 {代码: 权重} 字典接管选股/仓位
+    return ...
 ```
-- `build_transform` 允许无参数，或恰好一个名为 `params` 的参数；其他签名由 entrypoint 检查拒绝。
-- 寻优循环复用已校验代码（`compile_code(code, params, validate=False)`），不重复跑子进程冒烟；候选确定后再用最终参数做一次 `validate_code(code, tuned_params)`。
-- 静态检查/AST 白名单/子进程冒烟规则不变（math/numpy/pandas/sklearn/scipy、禁止文件/网络/系统调用/动态执行/下划线属性、源码 ≤6000 字符、10s 冒烟超时）。
+- `build_transform` 允许无参数，或恰好一个名为 `params` 的参数；返回的 transform 可接收可选第三参 `context`。
+- 程序可拆成多级包/多个模块，支持类、安全装饰器、生成器、`self._x`；服务端 AST 校验危险调用/属性/导入。
+- 服务端不做子进程冒烟；候选确定后再次静态校验并用最终参数 compile；真正执行发生在寻优/回测阶段。
+- 执行环境：白名单 stdlib/numpy/pandas/sklearn/scipy + 本程序模块 + 审核通过的第三方库；禁止文件/网络/系统/动态执行。
 
 ### 6.4 预期核对与继续优化
 
-候选回测完成后，服务端根据用户本轮诉求（收益优先 / 回撤优先 / 默认夏普）与画像回撤上限核对是否达到目标，并在 work 卡新增「核对您的目标」步骤。未达预期时：审批卡标题改为「候选未达预期，是否仍要启用？」并增加「继续优化」动作；聊天回复明确差距，不会自动启用模型。用户选择「继续优化」会重新进入 analyze_model，并按结构性升级策略更换引擎或重写代码，再由服务端重新寻优。
+候选回测完成后，服务端根据用户本轮诉求（收益优先 / 回撤优先 / 默认夏普）与画像回撤上限核对是否达到目标，并在 work 卡新增「核对您的目标」步骤。未达预期时：审批卡标题改为「候选未达预期，是否仍要启用？」并增加「继续优化」动作；聊天回复明确差距，不会自动启用模型。用户选择「继续优化」时由 Planner 调用 `write_model_program(escalate=true)` 重写程序，再由服务端重新寻优。
 
 ### 6.5 服务端网格寻优（`backend/engine/tuning.py`）
 
 - 输入：AI 给出的 `search_space/param_space`、当前基底权重/参数、目标指标 `objective`、回撤上限 `tolerance`、预算 `max_trials`。
-- 算法：基线评估 → 按 search_space 顺序逐轴轮转 → 每个轴取若干网格候选（默认每轴 2~5 个）→ 其余参数固定为当前最优 → 每组跑同一区间回测 → 按目标指标保留最优；最大回撤超过画像上限时重罚（优先选不超限的组合）。
-- 事件：`run_search` 逐个 yield `start/trial/done` 事件，service 将其映射为 `tuning` 卡片进度推送；事件包含当前试次、总试次、当前参数、最优参数/指标与得分走势。
-- 评估次数硬约束在 `max_trials` 内；单组回测异常被跳过，全部失败才报错。
-- `mdd` 目标直接比较回撤值（越接近 0 越好）；`cagr/sharpe` 越大越好。
+- 算法：先生成所有轴的全部网格组合并计算 `total_combinations`；预算内**全量网格评估**，超预算时用固定种子做确定性分层采样（覆盖每个轴的所有档位且包含基线组合，不丢轴、不静默砍候选）；每组跑同一区间回测 → 按目标指标保留最优；最大回撤超过画像上限时重罚（优先选不超限的组合）。
+- 事件：`run_search` 逐个 yield `start/trial/done` 事件，start/done 含 `total_combinations/planned_trials/sampled/total/evaluated`，service 将其映射为 `tuning` 卡片进度与「全量/采样」说明。
+- 评估次数由 `max_trials` 控制，服务端上限读 `TUNING_MAX_TRIALS`（默认 1000）；单组回测异常被跳过，全部失败才报错。
+- 目标指标：`sharpe/cagr/mdd/calmar/sortino/ir/win_rate`；`mdd` 越接近 0 越好，其余越大越好。
 
 ### 6.6 pipeline 与安全模块公开函数
 
@@ -302,10 +311,15 @@ resolve_directive(args, previous_approach="") -> EngineDirective
 drawdown_tolerance_ratio(slots) -> float | None     # 画像槽位数值化，非意图识别
 
 # backend/models/custom.py
-def validate_code(code, params=None) -> dict        # AST + 冒烟；返回 takes_params 等
+def validate_code(code, params=None) -> dict        # 旧单文件代码：AST + 冒烟；返回 takes_params 等
 def compile_code(code, params=None, *, validate=True) -> transform(z, weights)
+def validate_program(files, entry, extra_roots=None) -> dict   # 多文件/多级包：AST + 入口契约，不冒烟
+def compile_program(files, entry, params=None, *, validate=True, extra_roots=None,
+                    extra_paths=None) -> ProgramRuntime  # .transform/.select_stocks/.accepts_context/.modules
+def normalize_package_specs(packages) -> list[str]              # 第三方包规格校验（数量上限可配）
+def install_packages(packages) -> dict                          # 安装到 data/ai_packages 并审计
 ```
-`backend/models/registry.py` 继续提供 5 种内置模型；`selection.screen/run_backtest` 的 `score_transform` 钩子用于接入参数化自定义引擎。
+`backend/models/registry.py` 继续提供 5 种内置模型；`selection.screen/run_backtest` 的 `score_transform`/`select_hook` 钩子用于接入 AI 程序，`context_builder` 为 context 感知程序提供截至 asof 的数据。
 
 ## 7. 前端（Professional Financial SaaS 三栏）
 

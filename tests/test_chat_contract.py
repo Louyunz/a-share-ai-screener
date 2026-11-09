@@ -30,18 +30,17 @@ class ActionSchemaTest(unittest.TestCase):
         properties = analyze["function"]["parameters"]["properties"]
         self.assertIn("engine", properties)
         self.assertEqual(
-            set(properties["engine"]["enum"]), {"auto", "weights", "model_type", "code"})
-        self.assertEqual(set(properties["objective"]["enum"]),
-                         {"", "sharpe", "cagr", "mdd"})
+            set(properties["engine"]["enum"]), {"auto", "weights", "model_type"})
+        self.assertEqual(properties["objective"].get("type"), "string")
         self.assertIn("escalate", properties)
         self.assertNotIn("actions", properties)
 
     def test_valid_analyze_args(self) -> None:
         args = validate_tool_call("analyze_model", {
-            "engine": "code", "model_type": "", "objective": "mdd",
+            "engine": "weights", "model_type": "", "objective": "mdd",
             "escalate": False, "reason": "构建新的数学模型",
         })
-        self.assertEqual(args["engine"], "code")
+        self.assertEqual(args["engine"], "weights")
         self.assertEqual(args["objective"], "mdd")
         self.assertEqual(args["reason"], "构建新的数学模型")
 
@@ -53,7 +52,7 @@ class ActionSchemaTest(unittest.TestCase):
         with self.assertRaises(ToolArgsError):
             validate_tool_call("analyze_model", {"objective": "profit"})
         with self.assertRaises(ToolArgsError):
-            validate_tool_call("analyze_model", {"reason": "x" * 200})
+            validate_tool_call("analyze_model", {"reason": "x" * 600})
 
     def test_unknown_tool_and_wrong_type(self) -> None:
         with self.assertRaises(ToolArgsError):
@@ -73,8 +72,8 @@ class ActionSchemaTest(unittest.TestCase):
                          {"candidate": 2})
         with self.assertRaises(ToolArgsError):
             validate_tool_call("apply_pending_change", {"candidate": -1})
-        with self.assertRaises(ToolArgsError):
-            validate_tool_call("apply_pending_change", {"candidate": 99})
+        self.assertEqual(validate_tool_call("apply_pending_change", {"candidate": 99}),
+                         {"candidate": 99})
         with self.assertRaises(ToolArgsError):
             validate_tool_call("apply_pending_change", {"candidate": "first"})
         with self.assertRaises(ToolArgsError):
@@ -92,7 +91,7 @@ class ActionSchemaTest(unittest.TestCase):
                             if item["function"]["name"] == "write_model_program")
         properties = program_tool["function"]["parameters"]["properties"]
         for key in ("files", "entry", "summary", "param_space", "objective",
-                    "packages", "escalate", "reason"):
+                    "max_trials", "config", "packages", "escalate", "reason"):
             self.assertIn(key, properties)
         self.assertEqual(properties["files"]["type"], "array")
         args = validate_tool_call("write_model_program", {
@@ -149,10 +148,10 @@ class DirectivePolicyTest(unittest.TestCase):
         self.assertEqual(weights_prev.engine, "model_type")
         code_prev = resolve_directive({"engine": "auto", "escalate": True},
                                       previous_approach="code")
-        self.assertEqual(code_prev.engine, "code")
+        self.assertEqual(code_prev.engine, "model_type")
         model_prev = resolve_directive({"engine": "auto", "escalate": True},
                                        previous_approach="model_type")
-        self.assertEqual(model_prev.engine, "code")
+        self.assertEqual(model_prev.engine, "model_type")
 
     def test_explicit_code_wins_over_escalation(self) -> None:
         directive = resolve_directive(

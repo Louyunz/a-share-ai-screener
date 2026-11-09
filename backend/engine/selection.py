@@ -47,7 +47,8 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def _apply_score_transform(scores: pd.DataFrame, weights: dict, score_transform) -> pd.DataFrame:
+def _apply_score_transform(scores: pd.DataFrame, weights: dict, score_transform,
+                           context: dict | None = None) -> pd.DataFrame:
     """用自定义模型（AI 生成代码）的 transform 覆盖因子综合分。"""
     if score_transform is None:
         return scores
@@ -55,8 +56,12 @@ def _apply_score_transform(scores: pd.DataFrame, weights: dict, score_transform)
     missing = [column for column in z_columns if column not in scores.columns]
     if missing:
         raise ValueError(f"因子分数缺少列：{missing}")
+    z_frame = scores.loc[:, z_columns].copy()
     try:
-        result = score_transform(scores.loc[:, z_columns].copy(), dict(weights))
+        if getattr(score_transform, "accepts_context", False):
+            result = score_transform(z_frame, dict(weights), context)
+        else:
+            result = score_transform(z_frame, dict(weights))
     except Exception as exc:  # noqa: BLE001 - 把自定义模型错误转成业务错误
         raise ValueError(f"自定义模型打分失败：{exc}") from exc
     if isinstance(result, pd.Series):
@@ -74,35 +79,83 @@ def _apply_score_transform(scores: pd.DataFrame, weights: dict, score_transform)
     return output.sort_values("factor_score", ascending=False)
 
 
-def _apply_select_hook(scores: pd.DataFrame, top_n: int, select_hook):
-    """用 AI 程序里的 select_stocks 钩子接管选股；非法返回转成业务错误。"""
-    if select_hook is None:
-        return None
-    try:
-        raw = select_hook(scores.copy(), int(top_n))
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"自定义选股程序执行失败：{exc}") from exc
-    if raw is None:
-        return None
-    try:
-        raw_codes = list(raw)
-    except TypeError as exc:
-        raise ValueError("select_stocks 必须返回股票代码列表") from exc
-    codes: list[str] = []
+def _normalize_hook_weights(raw, scores: pd.DataFrame) -> tuple[list[str], dict[str, float] | None]:
+    """把 select_stocks 返回值解析成 (代码顺序, 权重或 None)。"""
+    weights: dict[str, float] | None = None
+    if isinstance(raw, pd.Series):
+        if np.issubdtype(raw.dtype, np.number):
+            weights = {str(code).strip(): float(value) for code, value in raw.items()}
+            codes = list(weights)
+        else:
+            codes = [str(item).strip() for item in raw.tolist()]
+    elif isinstance(raw, dict):
+        weights = {}
+        codes = []
+        for code, value in raw.items():
+            key = str(code).strip()
+            codes.append(key)
+            try:
+                weights[key] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"select_stocks 权重不是数值：{code}") from exc
+    else:
+        try:
+            items = list(raw)
+        except TypeError as exc:
+            raise ValueError("select_stocks 必须返回股票代码列表或 {代码: 权重} 字典") from exc
+        codes = []
+        for item in items:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                codes.append(str(item[0]).strip())
+                weights = weights or {}
+                try:
+                    weights[str(item[0]).strip()] = float(item[1])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("select_stocks 权重不是数值") from exc
+            else:
+                codes.append(str(item).strip())
+    cleaned: list[str] = []
     seen: set[str] = set()
-    for item in raw_codes:
-        code = str(item).strip()
+    for code in codes:
         if not code or code in seen:
             continue
         if code not in scores.index:
             raise ValueError(f"select_stocks 返回了不存在的股票代码：{code}")
         seen.add(code)
-        codes.append(code)
-        if len(codes) >= top_n:
-            break
+        cleaned.append(code)
+    if weights is not None:
+        positive = {code: value for code, value in weights.items()
+                    if code in seen and value > 0 and math.isfinite(value)}
+        total = sum(positive.values())
+        weights = {code: value / total for code, value in positive.items()} if total > 0 else None
+    return cleaned, weights
+
+
+def _apply_select_hook(scores: pd.DataFrame, top_n: int, select_hook,
+                       ) -> tuple[pd.DataFrame | None, dict[str, float] | None]:
+    """用 AI 程序里的 select_stocks 钩子接管选股；返回 (选中行, 权重或 None)。"""
+    if select_hook is None:
+        return None, None
+    try:
+        raw = select_hook(scores.copy(), int(top_n))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"自定义选股程序执行失败：{exc}") from exc
+    if raw is None:
+        return None, None
+    codes, weights = _normalize_hook_weights(raw, scores)
     if not codes:
         raise ValueError("select_stocks 没有返回任何股票")
-    return scores.loc[codes]
+    if len(codes) > top_n:
+        codes = codes[:top_n]
+        if weights is not None:
+            weights = {code: value for code, value in weights.items() if code in codes}
+    if weights is not None:
+        total = sum(weights.values())
+        if total <= 0:
+            weights = None
+        else:
+            weights = {code: value / total for code, value in weights.items()}
+    return scores.loc[codes], weights
 
 
 def _get(data, name: str):
@@ -255,6 +308,7 @@ def screen(
     exclude_codes=None,
     score_transform=None,
     select_hook=None,
+    context_builder=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """按因子权重筛选 Top N 股票。
 
@@ -300,7 +354,9 @@ def screen(
         weights=weights,
         asof=asof,
     )
-    scores = _apply_score_transform(scores, weights, score_transform)
+    scores = _apply_score_transform(
+        scores, weights, score_transform,
+        context_builder(asof) if context_builder is not None else None)
 
     excluded = _normalize_exclude(exclude_codes)
     if excluded:
@@ -309,7 +365,7 @@ def screen(
     if scores.empty:
         raise ValueError("排除后没有可用股票，无法筛选")
 
-    hook_selected = _apply_select_hook(scores, top_n, select_hook)
+    hook_selected, hook_weights = _apply_select_hook(scores, top_n, select_hook)
     selected = hook_selected if hook_selected is not None else scores.head(top_n)
     industry_series = _industry_lookup(industry, scores.index)
 
@@ -324,6 +380,7 @@ def screen(
         column = f"z_{name}"
         top_df[column] = selected[column].to_numpy(dtype=float)
     top_df.index = pd.RangeIndex(len(top_df))
+    top_df.attrs["weights"] = dict(hook_weights or {})
 
     return top_df, scores.copy()
 
@@ -345,6 +402,30 @@ def _trailing_volatility(prices: pd.DataFrame, codes: pd.Index, window: int = VO
     returns = tail.pct_change(fill_method=None).iloc[1:]
     volatility = returns.std(ddof=1, skipna=True) * math.sqrt(TRADING_DAYS)
     return volatility.reindex(codes).astype(float)
+
+
+def _risk_parity_weights(prices_slice: pd.DataFrame, codes: list[str]) -> dict[str, float]:
+    """回测调仓日：按截至信号日的 60 日波动率做风险平价权重。"""
+    if not codes:
+        return {}
+    equal = {code: 1.0 / len(codes) for code in codes}
+    columns = [code for code in codes if code in prices_slice.columns]
+    if len(prices_slice) < VOL_WINDOW + 1 or len(columns) < len(codes):
+        return equal
+    tail = prices_slice.loc[:, columns].iloc[-(VOL_WINDOW + 1):]
+    returns = tail.pct_change(fill_method=None).iloc[1:]
+    volatility = returns.std(ddof=1, skipna=True) * math.sqrt(TRADING_DAYS)
+    inverse: dict[str, float] = {}
+    for code in codes:
+        try:
+            value = float(volatility.get(code, float("nan")))
+        except (TypeError, ValueError):
+            value = float("nan")
+        inverse[code] = (1.0 / value) if _finite(value) and value > 0 else 0.0
+    total = sum(inverse.values())
+    if not math.isfinite(total) or total <= 0:
+        return equal
+    return {code: value / total for code, value in inverse.items()}
 
 
 def build_portfolio(
@@ -463,6 +544,14 @@ def _compute_metrics(
     monthly_valid = monthly_returns.dropna()
     win_rate = float((monthly_valid > 0).mean()) if len(monthly_valid) else 0.0
 
+    # Sortino：只惩罚下行波动（相对无风险日收益）
+    downside = (returns - daily_rf).clip(upper=0.0)
+    downside_dev = float(np.sqrt(float((downside ** 2).mean()))) if len(downside) else 0.0
+    sortino = ((mean - daily_rf) / downside_dev * math.sqrt(TRADING_DAYS)
+               if downside_dev > 1e-12 else 0.0)
+    # Calmar：年化收益 / 最大回撤绝对值
+    calmar = (cagr / abs(mdd)) if abs(mdd) > 1e-12 else 0.0
+
     def finite(value: float) -> float:
         return float(value) if math.isfinite(float(value)) else 0.0
 
@@ -472,6 +561,8 @@ def _compute_metrics(
         "mdd": finite(mdd),
         "ir": finite(ir),
         "win_rate": finite(win_rate),
+        "calmar": finite(calmar),
+        "sortino": finite(sortino),
     }
 
 
@@ -487,6 +578,8 @@ def run_backtest(
     risk_free_rate: float = 0.02,
     score_transform=None,
     select_hook=None,
+    context_builder=None,
+    portfolio_method: str = "equal_weight",
 ) -> dict:
     """按 A 股交易规则回测因子选股策略。
 
@@ -528,6 +621,8 @@ def run_backtest(
     risk_free_rate = _finite_number(risk_free_rate, "risk_free_rate")
     if cost_buy >= 1 or cost_sell >= 1:
         raise ValueError("交易成本率必须小于 1")
+    if portfolio_method not in ("equal_weight", "risk_parity"):
+        raise ValueError(f"不支持的组合方法: {portfolio_method!r}")
 
     prices = _clean_date_frame(_get(data, "prices"), "prices")
     close_raw = _clean_date_frame(_get(data, "close_raw"), "close_raw").reindex(
@@ -667,19 +762,34 @@ def run_backtest(
             weights=weights,
             asof=all_dates[pos],
         )
-        scores = _apply_score_transform(scores, weights, score_transform)
-        hook_selected = _apply_select_hook(scores, top_n, select_hook)
-        selected_scores = hook_selected if hook_selected is not None else scores.head(top_n)
+        scores = _apply_score_transform(
+            scores, weights, score_transform,
+            context_builder(all_dates[pos]) if context_builder is not None else None)
+        selected_scores, hook_weights = _apply_select_hook(scores, top_n, select_hook)
+        if selected_scores is None:
+            selected_scores = scores.head(top_n)
         top_codes = list(selected_scores.index)
         if not top_codes:
             raise ValueError("调仓日没有可用股票，无法生成组合")
-        weight = 1.0 / len(top_codes)
         equity = current_equity(pos)
         if not math.isfinite(equity) or equity <= 0:
             raise ValueError("组合净值非正，无法继续回测")
         min_trade = max(equity * MIN_TRADE_RATIO, 1e-9)
 
-        target_value = {code: equity * weight for code in top_codes}
+        if hook_weights:
+            weights_map = {code: float(value) for code, value in hook_weights.items()
+                           if code in top_codes}
+            total = sum(weights_map.values())
+            if total <= 0:
+                weights_map = {code: 1.0 / len(top_codes) for code in top_codes}
+            else:
+                weights_map = {code: value / total for code, value in weights_map.items()}
+        elif portfolio_method == "risk_parity":
+            weights_map = _risk_parity_weights(
+                valuation_prices.iloc[: pos + 1], top_codes)
+        else:
+            weights_map = {code: 1.0 / len(top_codes) for code in top_codes}
+        target_value = {code: equity * weight for code, weight in weights_map.items()}
         orders: list[dict] = []
 
         # 先卖：清仓不在目标内的，减仓超出目标权重的

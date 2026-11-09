@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -27,6 +28,12 @@ from backend.models import (
     validate_weights,
 )
 from backend.models.pipeline import (
+    DEFAULT_TUNING_MAX_TRIALS,
+    MAX_STATE_CHARS,
+    MAX_TUNING_PARAMS,
+    MAX_TUNING_REPAIR_ATTEMPTS,
+    MIN_SEARCH_FACTORS,
+    OBJECTIVES,
     TUNING_REPAIR_SYSTEM,
     TUNING_SYSTEM,
     build_tuning_plan,
@@ -353,7 +360,9 @@ def build_transform():
         )
         with self.assertRaises(ModelCodeError) as ctx:
             validate_code(code)
-        self.assertIn("下划线属性", str(ctx.exception))
+        # 非 self/cls 根的 dunder 属性仍然拦截（错误文案由 custom 决定，断言行为）
+        self.assertEqual(ctx.exception.checks[-1]["name"], "ast_safety")
+        self.assertIn("__class__", str(ctx.exception))
 
     def test_missing_build_transform_rejected(self) -> None:
         with self.assertRaises(ModelCodeError) as ctx:
@@ -435,9 +444,11 @@ def build_transform():
         self.assertEqual(ctx.exception.checks[-1]["name"], "syntax")
 
     def test_source_too_long_rejected(self) -> None:
+        # 源码上限默认已放宽，这里用环境变量把上限调小来验证 source_size 检查仍生效
         code = "def build_transform():\n    return None\n" + "# filler\n" * 1000
-        with self.assertRaises(ModelCodeError) as ctx:
-            validate_code(code)
+        with mock.patch.dict(os.environ, {"AI_MAX_SOURCE_CHARS": "1000"}):
+            with self.assertRaises(ModelCodeError) as ctx:
+                validate_code(code)
         self.assertEqual(ctx.exception.checks[-1]["name"], "source_size")
 
     def test_non_string_code_rejected(self) -> None:
@@ -634,18 +645,25 @@ class TuningPlanTests(unittest.TestCase):
         del raw["max_trials"]
         plan = normalize_tuning_plan(raw)
         self.assertEqual(plan["objective"], "sharpe")
-        self.assertEqual(plan["max_trials"], 12)
+        self.assertEqual(plan["max_trials"], DEFAULT_TUNING_MAX_TRIALS)
+        self.assertEqual(plan["max_trials"], 32)
 
-        # 归一化不 clamp：跨出 8~48 的值留给服务端限制
+        # 归一化不 clamp 上限：大预算留给服务端按上限限制；
+        # 下限只要 >=1 即可（不再要求 8 起）
         raw = self._valid_raw("weights")
         raw["max_trials"] = 100
         self.assertEqual(normalize_tuning_plan(raw)["max_trials"], 100)
+        for value in (1, 7):
+            raw = self._valid_raw("weights")
+            raw["max_trials"] = value
+            self.assertEqual(normalize_tuning_plan(raw)["max_trials"], value)
 
         for bad in (
             {"objective": "profit"},
             {"objective": 1},
             {"max_trials": "12"},
             {"max_trials": 0},
+            {"max_trials": -3},
             {"max_trials": 12.5},
         ):
             raw = self._valid_raw("weights")
@@ -653,14 +671,41 @@ class TuningPlanTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ModelValidationError):
                 normalize_tuning_plan(raw)
 
+    def test_normalize_tuning_plan_accepts_new_objectives(self) -> None:
+        for objective in OBJECTIVES:
+            raw = self._valid_raw("weights")
+            raw["objective"] = objective.upper()
+            with self.subTest(objective=objective):
+                self.assertEqual(
+                    normalize_tuning_plan(raw)["objective"], objective)
+
+    def test_normalize_tuning_plan_accepts_single_factor(self) -> None:
+        # 至少 1 个因子（不再强制 3 个）
+        raw = self._valid_raw("weights")
+        raw["search_space"] = {
+            "volatility_60": {"min": 0.05, "max": 0.25, "step": 0.1},
+        }
+        plan = normalize_tuning_plan(raw)
+        self.assertEqual(list(plan["search_space"]), ["volatility_60"])
+        self.assertEqual(MIN_SEARCH_FACTORS, 1)
+
+    def test_normalize_tuning_plan_accepts_more_than_four_params(self) -> None:
+        # 参数个数不再有 4 个硬上限
+        raw = self._valid_raw("code")
+        raw["param_space"] = {
+            f"p{index}": {"min": 0.0, "max": 0.4, "step": 0.2}
+            for index in range(6)
+        }
+        plan = normalize_tuning_plan(raw)
+        self.assertEqual(len(plan["param_space"]), 6)
+        self.assertEqual(list(plan["param_space"]),
+                         [f"p{index}" for index in range(6)])
+
     def test_normalize_tuning_plan_rejects_bad_search_space(self) -> None:
         valid = self._search_space()
         cases = {
             "missing": None,
-            "fewer_than_3": {
-                "volatility_60": valid["volatility_60"],
-                "roe": valid["roe"],
-            },
+            "empty": {},
             "unknown_factor": {
                 **valid,
                 "unknown_factor": {"min": 0.0, "max": 0.1, "step": 0.1},
@@ -706,10 +751,6 @@ class TuningPlanTests(unittest.TestCase):
         cases = {
             "missing": None,
             "empty": {},
-            "too_many": {
-                f"p{index}": {"min": 0.0, "max": 0.1, "step": 0.1}
-                for index in range(5)
-            },
             "bad_name": {"1bad": tilt},
             "keyword": {"class": tilt},
             "min_gt_max": {"tilt": {"min": 0.5, "max": 0.1, "step": 0.1}},
@@ -779,26 +820,26 @@ class TuningPlanTests(unittest.TestCase):
             TUNING_SYSTEM,
             [{"role": "user", "content": json.dumps({"tuning_request": True})}],
         )
-        self.assertEqual(raw["approach"], "code")
-        self.assertIn("build_transform(params=None)", raw["code"])
-        self.assertIn("tilt", raw["param_space"])
-        self.assertEqual(raw["param_space"]["tilt"]["default"], 0.5)
-        self.assertEqual(raw["objective"], "sharpe")
-        self.assertEqual(raw["max_trials"], 12)
+        # ScriptedLLM 的 auto 分支可能产出 weights / model_type（code 仅兼容旧路径）
+        self.assertIn(raw["approach"], {"weights", "model_type", "code"})
+        self.assertIn(raw["objective"], OBJECTIVES)
+        self.assertIsInstance(raw["max_trials"], int)
+        self.assertGreaterEqual(raw["max_trials"], 1)
         for key in ("summary", "why", "risks"):
             self.assertTrue(raw.get(key))
         plan = normalize_tuning_plan(raw)
-        self.assertEqual(plan["approach"], "code")
-        self.assertIn("tilt", plan["param_space"])
+        self.assertEqual(plan["approach"], raw["approach"])
+        self.assertIn(plan["objective"], OBJECTIVES)
+        self.assertGreaterEqual(plan["max_trials"], 1)
 
     def test_build_tuning_plan_with_fake_llm(self) -> None:
-        plan = build_tuning_plan(ScriptedLLM(), self._state())
-        self.assertEqual(plan["approach"], "code")
-        self.assertEqual(plan["max_trials"], 12)
+        llm = FakeProposalLLM(self._valid_raw("weights"))
+        plan = build_tuning_plan(llm, self._state())
+        self.assertEqual(plan["approach"], "weights")
+        self.assertEqual(plan["max_trials"], 20)
         self.assertEqual(plan["objective"], "sharpe")
         self.assertEqual(plan["repair_attempts"], 0)
-        self.assertEqual(plan["param_space"]["tilt"]["default"], 0.5)
-        self.assertIn("build_transform(params=None)", plan["code"])
+        self.assertEqual(len(llm.calls), 1)
 
     def test_build_tuning_plan_prompt_and_state(self) -> None:
         llm = FakeProposalLLM(self._valid_raw("weights"))
@@ -814,9 +855,31 @@ class TuningPlanTests(unittest.TestCase):
         self.assertTrue(payload["tuning_request"])
         self.assertIn("current_metrics", payload)
 
+    def test_tuning_prompt_has_no_demo_limits(self) -> None:
+        # 演示型硬限制已删除：参数个数、因子数、trials 区间都不再写死
+        self.assertNotIn("1~4", TUNING_SYSTEM)
+        self.assertNotIn("1~4", TUNING_REPAIR_SYSTEM)
+        self.assertNotIn("8~48", TUNING_SYSTEM)
+        self.assertNotIn("至少 3 个因子", TUNING_SYSTEM)
+        self.assertNotIn("至少 3 个已知因子", TUNING_REPAIR_SYSTEM)
+        self.assertIn("至少 1 个因子", TUNING_SYSTEM)
+        for objective in OBJECTIVES:
+            self.assertIn(objective, TUNING_SYSTEM)
+        self.assertIn("write_model_program", TUNING_SYSTEM)
+        self.assertIn("write_model_program", TUNING_REPAIR_SYSTEM)
+
+    def test_tuning_constants_and_env_defaults(self) -> None:
+        self.assertEqual(DEFAULT_TUNING_MAX_TRIALS, 32)
+        self.assertEqual(MIN_SEARCH_FACTORS, 1)
+        self.assertIsNone(MAX_TUNING_PARAMS)
+        if "TUNING_STATE_MAX_CHARS" not in os.environ:
+            self.assertEqual(MAX_STATE_CHARS, 60000)
+        if "TUNING_MAX_REPAIR_ATTEMPTS" not in os.environ:
+            self.assertEqual(MAX_TUNING_REPAIR_ATTEMPTS, 3)
+
     def test_build_tuning_plan_auto_repair(self) -> None:
         bad = self._valid_raw("weights")
-        bad["search_space"] = {"volatility_60": {"min": 0.05, "max": 0.25, "step": 0.1}}
+        del bad["search_space"]  # 缺必填字段，必须触发一次自动修复
         llm = SequenceLLM([bad, self._valid_raw("weights")])
         plan = build_tuning_plan(llm, self._state())
         self.assertEqual(plan["repair_attempts"], 1)
@@ -828,12 +891,72 @@ class TuningPlanTests(unittest.TestCase):
 
     def test_build_tuning_plan_repair_exhausted(self) -> None:
         bad = self._valid_raw("weights")
-        bad["search_space"] = {"volatility_60": {"min": 0.05, "max": 0.25, "step": 0.1}}
-        llm = SequenceLLM([bad, bad, bad])
+        del bad["search_space"]
+        llm = SequenceLLM([bad, bad, bad, bad])
         with self.assertRaises(ModelValidationError) as ctx:
             build_tuning_plan(llm, self._state())
-        self.assertIn("自动修复 2 次", str(ctx.exception))
-        self.assertEqual(len(llm.calls), 3)
+        self.assertIn(f"自动修复 {MAX_TUNING_REPAIR_ATTEMPTS} 次", str(ctx.exception))
+        self.assertEqual(len(llm.calls), MAX_TUNING_REPAIR_ATTEMPTS + 1)
+
+    def test_build_tuning_plan_repair_attempts_env_override(self) -> None:
+        bad = self._valid_raw("weights")
+        del bad["search_space"]
+        llm = SequenceLLM([bad, bad, bad])
+        with mock.patch.dict(os.environ, {"TUNING_MAX_REPAIR_ATTEMPTS": "1"}):
+            with self.assertRaises(ModelValidationError) as ctx:
+                build_tuning_plan(llm, self._state())
+        self.assertIn("自动修复 1 次", str(ctx.exception))
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_build_tuning_plan_state_chars_env_override(self) -> None:
+        llm = FakeProposalLLM(self._valid_raw("weights"))
+        with mock.patch.dict(os.environ, {"TUNING_STATE_MAX_CHARS": "60"}):
+            build_tuning_plan(llm, self._state())
+        content = llm.calls[0][1][0]["content"]
+        self.assertTrue(content.endswith("内容过长已截断）"))
+        self.assertLessEqual(len(content), 80)
+
+    def test_build_tuning_plan_rejects_code_directive(self) -> None:
+        # engine=code 已迁移到 write_model_program：调参方案直接报错，不调用 LLM
+        state = self._state()
+        state["directive"] = {"engine": "code"}
+        llm = FakeProposalLLM(self._valid_raw("weights"))
+        with self.assertRaises(ModelValidationError) as ctx:
+            build_tuning_plan(llm, state)
+        self.assertIn("write_model_program", str(ctx.exception))
+        self.assertEqual(llm.calls, [])
+
+    def test_build_tuning_plan_rejects_structural_escalate(self) -> None:
+        # 结构性升级（重写打分引擎）同样交给 write_model_program
+        state = self._state()
+        state["directive"] = {"engine": "auto", "escalate": True,
+                              "previous_approach": "model_type"}
+        llm = FakeProposalLLM(self._valid_raw("weights"))
+        with self.assertRaises(ModelValidationError) as ctx:
+            build_tuning_plan(llm, state)
+        self.assertIn("write_model_program", str(ctx.exception))
+        self.assertEqual(llm.calls, [])
+
+    def test_build_tuning_plan_auto_rejects_code_plan(self) -> None:
+        # auto 路径若 LLM 仍给 code 方案：拒绝并提示 write_model_program，修复为 weights 后成功
+        code_raw = self._valid_raw("code")
+        llm = SequenceLLM([code_raw, self._valid_raw("weights")])
+        plan = build_tuning_plan(llm, self._state())
+        self.assertEqual(plan["approach"], "weights")
+        self.assertEqual(plan["repair_attempts"], 1)
+        self.assertEqual(len(llm.calls), 2)
+        repair_payload = json.loads(llm.calls[1][1][0]["content"])
+        self.assertIn("write_model_program", repair_payload["error"])
+
+    def test_build_tuning_plan_escalate_from_weights_requires_model_type(self) -> None:
+        state = self._state()
+        state["directive"] = {"engine": "auto", "escalate": True,
+                              "previous_approach": "weights"}
+        llm = SequenceLLM([self._valid_raw("weights")])
+        with self.assertRaises(ModelValidationError) as ctx:
+            build_tuning_plan(llm, state)
+        self.assertIn("model_type", str(ctx.exception))
+        self.assertEqual(len(llm.calls), MAX_TUNING_REPAIR_ATTEMPTS + 1)
 
     def test_build_tuning_plan_rejects_non_mapping_state(self) -> None:
         with self.assertRaises(ModelValidationError):

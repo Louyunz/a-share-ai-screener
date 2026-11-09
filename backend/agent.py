@@ -148,8 +148,8 @@ class Agent:
         # 不发给 Planner，避免上下文被大量结构化数据撑爆。
         compact_history = [
             {"role": str(item.get("role") or ""),
-             "content": str(item.get("content") or "")[:1200]}
-            for item in history[-8:]
+             "content": str(item.get("content") or "")[:8000]}
+            for item in history[-16:]
             if isinstance(item, dict)
         ]
         return json.dumps({
@@ -380,9 +380,9 @@ class Agent:
             "entry": entry,
             "repair_attempt": bool(repair_attempt),
             "contract": (
-                "入口文件定义 build_transform(params=None) -> transform(z, weights)；"
-                "可选 select_stocks(scores, top_n, params=None)；z 只含 10 个 z_* 因子列；"
-                "多文件模块按文件名互相 import；沙箱禁止文件/网络/系统/动态执行。"
+                "入口文件定义 build_transform(params=None) -> transform(z, weights, context=None)；"
+                "可选 select_stocks(scores, top_n, params=None) 接管选股/仓位；"
+                "多文件/多级包按模块名互相 import；沙箱禁止文件/网络/系统/动态执行。"
             ),
         }
         try:
@@ -406,12 +406,12 @@ class Agent:
         return {
             "approved": bool(raw.get("approved")),
             "risk_level": risk,
-            "issues": issues[:8],
-            "suggestions": suggestions[:8],
+            "issues": issues[:32],
+            "suggestions": suggestions[:32],
             "approved_packages": approved_packages,
             "package_notes": [str(item).strip() for item in raw.get("package_notes") or []
-                              if str(item).strip()][:8],
-            "summary": str(raw.get("summary") or "").strip()[:300],
+                              if str(item).strip()][:32],
+            "summary": str(raw.get("summary") or "").strip()[:1000],
         }
 
     def repair_program(self, *, files: dict[str, str], summary: str, objective: str,
@@ -441,4 +441,4 @@ class Agent:
 
 
 def safe_question(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip())[:500]
+    return re.sub(r"\s+", " ", text.strip())[:4000]

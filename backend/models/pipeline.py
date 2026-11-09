@@ -11,6 +11,7 @@ import dataclasses
 import json
 import keyword
 import math
+import os
 from collections.abc import Mapping
 from numbers import Integral, Real
 from typing import Any
@@ -42,47 +43,59 @@ __all__ = [
     "build_tuning_plan",
 ]
 
-# 允许的引擎类型
+# 允许的引擎类型（调参方案只产出 weights / model_type；code 引擎改由
+# ``write_model_program`` 工具直接编写）
 APPROACHES = ("model_type", "weights", "code")
-OBJECTIVES = ("sharpe", "cagr", "mdd")
+OBJECTIVES = ("sharpe", "cagr", "mdd", "calmar", "sortino", "ir", "win_rate")
 
-MAX_STATE_CHARS = 12000
+# 调参请求状态文本上限（默认 60000 字符），可用 TUNING_STATE_MAX_CHARS 覆盖
+MAX_STATE_CHARS = 60000
 
-MAX_TUNING_PARAMS = 4
-MIN_SEARCH_FACTORS = 3
-DEFAULT_TUNING_MAX_TRIALS = 12
-MAX_TUNING_REPAIR_ATTEMPTS = 2
+# 兼容别名：param_space 参数个数已不再设硬上限（>=1 即可），该常量仅保留给
+# ``backend.models`` 的导出/旧引用，不再参与任何校验。
+MAX_TUNING_PARAMS: int | None = None
+# 最少搜索因子数：允许只搜索 1 个因子
+MIN_SEARCH_FACTORS = 1
+# AI 未给 max_trials 时的默认评估预算
+DEFAULT_TUNING_MAX_TRIALS = 32
+# 调参方案自动修复次数上限（默认 3），可用 TUNING_MAX_REPAIR_ATTEMPTS 覆盖
+MAX_TUNING_REPAIR_ATTEMPTS = 3
 _PARAM_TYPES = ("int", "float")
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    """读取正整数环境变量；缺省/非法/<=0 时退回默认值。"""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return int(default)
+    return value if value >= 1 else int(default)
+
+
+def _state_char_limit() -> int:
+    """当前生效的状态文本上限（每次调用读取环境变量）。"""
+    return _env_positive_int("TUNING_STATE_MAX_CHARS", MAX_STATE_CHARS)
+
+
+def _repair_attempt_limit() -> int:
+    """当前生效的调参方案自动修复次数上限（每次调用读取环境变量）。"""
+    return _env_positive_int("TUNING_MAX_REPAIR_ATTEMPTS", MAX_TUNING_REPAIR_ATTEMPTS)
+
+
 _TUNING_OUTPUT_SCHEMA = """{
-  "approach": "weights | model_type | code 三选一",
+  "approach": "weights | model_type 二选一（本方案不再产出 code 方案）",
   "summary": "一句普通人能看懂的话，说明为什么这样改",
   "why": "数据依据，必须引用状态里的真实指标数字，不要编造",
   "expected_effect": "预期改善方向",
   "risks": ["2~3 条主要风险，用普通人能懂的话"],
-  "search_space": {"volatility_60": {"min": 0.05, "max": 0.2, "step": 0.05}, "...": "weights/model_type 方案必填，至少 3 个因子"},
-  "param_space": {"参数名": {"min": 0.0, "max": 0.6, "step": 0.2, "type": "float", "default": 0.5}, "...": "code 方案必填，1~4 个参数"},
+  "search_space": {"volatility_60": {"min": 0.05, "max": 0.2, "step": 0.05}, "...": "weights/model_type 方案必填，至少 1 个因子"},
   "model_type": "仅 model_type 方案必填，取内置模型 id",
-  "code": "仅 code 方案必填：参数化引擎源码",
-  "objective": "sharpe | cagr | mdd，可选，默认 sharpe",
-  "max_trials": "整数 8~48，服务端还会再限制范围"
+  "objective": "sharpe | cagr | mdd | calmar | sortino | ir | win_rate，可选，默认 sharpe",
+  "max_trials": "正整数，可选，默认 32；服务端有上限"
 }"""
-
-_TUNING_CODE_SAMPLE = """def build_transform(params=None):
-    options = params or {}
-    tilt = float(options.get("tilt", 0.5))
-
-    def transform(z, weights):
-        score = pd.Series(0.0, index=z.index, dtype=float)
-        for factor, weight in weights.items():
-            column = "z_" + factor
-            if column in z.columns:
-                values = pd.to_numeric(z[column], errors="coerce").fillna(0.0)
-                score = score + float(weight) * values
-        extra = pd.to_numeric(z["z_volatility_60"], errors="coerce").fillna(0.0)
-        return score + tilt * extra
-
-    return transform"""
 
 
 def _build_tuning_system_prompt() -> str:
@@ -107,31 +120,25 @@ def _build_tuning_system_prompt() -> str:
         "只输出一个 JSON 对象，不要输出 Markdown 代码块、前后缀说明或多余文字，字段如下：",
         _TUNING_OUTPUT_SCHEMA,
         "",
-        "## 三种方案（approach 三选一）",
-        '1. "weights"：保留当前 10 因子打分框架，只给 search_space（至少 3 个因子）。'
+        "## 两种方案（approach 二选一）",
+        '1. "weights"：保留当前 10 因子打分框架，只给 search_space（至少 1 个因子）。'
         "key 的顺序就是搜索优先级；每个因子给 {min,max,step}，满足 "
         f"0<=min<=max<={MAX_WEIGHT}、step>0，且 (max-min)/step>=1（至少 2 档）。"
         "weights 可选，作为基底权重；省略时用当前权重。",
         '2. "model_type"：切换到下方某个内置模型（model_type 必填），'
-        "并给该模型权重的微调 search_space（规则同上）。",
-        '3. "code"：写一个参数化打分引擎，让服务端用 param_space 里的参数网格寻优。'
-        "必须 def build_transform(params=None)：先 params = params or {}，"
-        '再用 params.get("参数名", 默认值) 读取；返回 transform(z, weights) -> pandas.Series。'
-        f"param_space 给 1~{MAX_TUNING_PARAMS} 个参数，每个 "
-        '{min,max,step,type:"int"|"float",default}，min<=max、step>0、(max-min)/step>=1、'
-        "default 在范围内；int 类型要求 min/max/step/default 都是整数且 step>=1。"
-        "code 方案不要给 search_space；weights 可选，作为基底权重（省略时用当前权重）。",
-        "weights/model_type 方案不要给 param_space。",
+        "并给该模型权重的微调 search_space（至少 1 个因子，规则同上）。",
+        '注意：本方案不产出 approach="code" 的自定义代码引擎；'
+        "需要重写打分程序时由 write_model_program 工具直接编写，不要在这里输出 code / param_space。",
+        "weights/model_type 方案不要给 code / param_space。",
         "",
         "## 执行指令（最高优先级，违反视为不合格）",
         "- state.directive 是 Planner 通过 tool_calls 明确给出的执行指令，必须遵守：",
-        '  - directive.engine="code" → 必须 approach="code"，写新的参数化引擎，禁止用 model_type/weights 替代；',
-        '  - directive.engine="model_type" → 必须 approach="model_type"，且 model_type 必须等于 directive.model_type；',
         '  - directive.engine="weights" → 必须 approach="weights"；',
-        '  - directive.engine="auto" → 你可以根据数据选择 weights/model_type/code，但必须符合下面的升级规则。',
+        '  - directive.engine="model_type" → 必须 approach="model_type"，且 model_type 必须等于 directive.model_type；',
+        '  - directive.engine="auto" → 你只能根据数据在 weights / model_type 中选择，禁止输出 code；',
         "- directive.escalate=true（客户说继续优化/上一版未达预期）时："
         "若 directive.previous_approach=weights，必须使用 model_type 更换基础引擎；"
-        "若 previous_approach=model_type 或 code，必须使用 code 重写参数化打分引擎；"
+        "若 previous_approach=model_type/code，说明需要重写打分引擎，本方案不再处理。"
         "禁止 only-weights 的微调方案。",
         "- directive.objective 非空时必须使用该 objective；为空时才可自行判断。",
         "",
@@ -141,20 +148,11 @@ def _build_tuning_system_prompt() -> str:
         "## 可用因子（z 列已做方向对齐，数值越大代表越优）",
         f"{factor_lines}。",
         "",
-        '## 自定义代码契约（approach="code" 时必须遵守）',
-        "- build_transform 只能无参数或带一个名为 params 的参数；推荐 def build_transform(params=None)。",
-        "- z：pandas.DataFrame，含 z_ep、z_bp、... 共 10 列，index 是股票代码；weights：dict[str, float]。",
-        "- transform 必须返回 pandas.Series，index 与 z 对齐、长度一致、不含 NaN/Inf。",
-        "- 允许 import math、numpy、pandas，以及 sklearn / scipy 的模型与预处理子模块；"
-        "禁止文件/网络/系统调用与动态执行（open/exec/eval/compile/__import__ 等）；"
-        "禁止访问下划线开头的属性（含 dunder）；源码不超过 6000 字符；不要打印、不要读写文件、不要定义类。",
-        "- 引擎会被服务端用不同参数反复调用，必须把参数真正用于打分逻辑，不要忽略 params。",
-        "- 参考写法（实际代码顶部必须补上 import numpy as np 与 import pandas as pd）：",
-        _TUNING_CODE_SAMPLE,
-        "",
         "## 其他字段",
-        '- objective："sharpe" | "cagr" | "mdd"，默认 sharpe，表示网格寻优的目标。',
-        "- max_trials：整数 8~48，表示最多回测多少组参数；服务端会再做一次范围限制。",
+        '- objective："sharpe"（夏普）| "cagr"（年化收益）| "mdd"（最大回撤）| '
+        '"calmar"（卡玛）| "sortino"（索提诺）| "ir"（信息比率）| "win_rate"（月胜率），'
+        "默认 sharpe，表示网格寻优的目标。",
+        "- max_trials：正整数，表示最多回测多少组参数；未给时默认 32，服务端还有上限。",
         "summary、why、expected_effect、risks 会直接展示给普通用户：用生活化语言，避免英文术语；"
         "why 必须引用状态中的真实数字；risks 给 2~3 条。",
     ]
@@ -168,13 +166,13 @@ TUNING_REPAIR_SYSTEM = """你是智投罗盘的调参方案修复助手。
 要求：
 1. 只输出一个 JSON 对象，不要输出 Markdown 代码块或解释文字；
 2. 保留原方案的 approach（除非错误信息表明 approach 不合法），必须修复错误信息指出的字段；
-3. weights/model_type 方案必须有 search_space：至少 3 个已知因子，每个 {min,max,step}，
+3. 方案只允许 approach="weights" 或 "model_type"；不允许输出 code / param_space
+   （自定义打分程序由 write_model_program 工具负责）；
+4. weights/model_type 方案必须有 search_space：至少 1 个已知因子，每个 {min,max,step}，
    满足 0<=min<=max<=0.4、step>0、(max-min)/step>=1；
-4. code 方案必须有 param_space（1~4 个合法标识符参数）和完整 code：
-   def build_transform(params=None)，内部用 params.get(参数名, 默认值) 兜底；
-   param_space 每个参数 {min,max,step,type,default}，范围与类型必须合法；
-5. 不得删除必需字段，不得引入文件/网络/系统调用；不要解释修改过程；
-6. repair_request.directive 是最高优先级执行指令：engine/model_type/objective/escalate
+5. max_trials 必须是正整数（服务端有上限），objective 必须是允许的目标指标；
+6. 不得删除必需字段，不得引入文件/网络/系统调用；不要解释修改过程；
+7. repair_request.directive 是最高优先级执行指令：engine/model_type/objective/escalate
    必须严格遵守；escalate=true 时禁止只调权重的 weights 方案。
 """
 
@@ -281,7 +279,7 @@ def _grid_levels(minimum: float, maximum: float, step: float) -> int:
 
 
 def _normalize_search_space(value: Any) -> dict[str, dict[str, float]]:
-    """校验权重搜索范围：{因子名: {min,max,step}}，至少 3 个因子，保留 key 顺序。"""
+    """校验权重搜索范围：{因子名: {min,max,step}}，至少 1 个因子，保留 key 顺序。"""
     if not isinstance(value, Mapping):
         raise ModelValidationError(
             "search_space 必须是对象：{因子名: {min, max, step}}"
@@ -330,15 +328,13 @@ def _normalize_search_space(value: Any) -> dict[str, dict[str, float]]:
 
 
 def _normalize_param_space(value: Any) -> dict[str, dict[str, Any]]:
-    """校验代码引擎参数范围：1~4 个合法标识符参数，保留 key 顺序。"""
+    """校验代码引擎参数范围：>=1 个合法标识符参数（不设个数上限），保留 key 顺序。"""
     if not isinstance(value, Mapping):
         raise ModelValidationError(
             "param_space 必须是对象：{参数名: {min, max, step, type, default}}"
         )
-    if not 1 <= len(value) <= MAX_TUNING_PARAMS:
-        raise ModelValidationError(
-            f"param_space 需要 1~{MAX_TUNING_PARAMS} 个参数（当前 {len(value)} 个）"
-        )
+    if len(value) < 1:
+        raise ModelValidationError("param_space 至少需要 1 个参数")
     normalized: dict[str, dict[str, Any]] = {}
     for name, spec in value.items():
         param_name = str(name)
@@ -616,7 +612,12 @@ def normalize_tuning_plan(
 
 
 def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
-    """调用 LLM 生成「引擎 + 调参范围」方案，并自动修复至多 2 次。
+    """调用 LLM 生成「引擎 + 调参范围」方案，并自动修复至多 3 次。
+
+    说明：调参方案只产出 ``weights`` / ``model_type`` 两种 approach；
+    需要重写打分引擎（``directive.engine="code"`` 或结构性升级）时直接报错，
+    引导调用方改用 ``write_model_program`` 工具，不再由本函数生成代码方案。
+    自动修复次数可用环境变量 ``TUNING_MAX_REPAIR_ATTEMPTS`` 覆盖（默认 3）。
 
     Parameters
     ----------
@@ -635,7 +636,7 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
     Raises
     ------
     ModelValidationError
-        LLM 调用失败、返回无法解析或修复 2 次后仍不合法。
+        LLM 调用失败、返回无法解析、方案不合法或修复次数用尽。
     """
     if not isinstance(state, Mapping):
         raise ModelValidationError("state 必须是 dict")
@@ -653,10 +654,22 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
     escalate = bool(directive.get("escalate"))
     previous_approach = str(directive.get("previous_approach") or "").strip()
 
+    if required_engine == "code":
+        raise ModelValidationError(
+            "调参方案不再生成 code 引擎：请改用 write_model_program 工具直接编写模型程序；"
+            "本工具只处理 weights / model_type 方案"
+        )
+    if escalate and previous_approach in ("model_type", "code"):
+        raise ModelValidationError(
+            "结构性升级需要重写打分引擎：请改用 write_model_program 工具；"
+            "调参方案只支持 weights / model_type"
+        )
+
     request_payload = {**_json_safe(state_payload), "tuning_request": True}
     state_text = json.dumps(request_payload, ensure_ascii=False)
-    if len(state_text) > MAX_STATE_CHARS:
-        state_text = _truncate(state_text, MAX_STATE_CHARS)
+    state_limit = _state_char_limit()
+    if len(state_text) > state_limit:
+        state_text = _truncate(state_text, state_limit)
     messages = [{"role": "user", "content": state_text}]
 
     try:
@@ -681,6 +694,11 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
                 base_weights=base_weights,
                 current_model=current_model,
             )
+            if plan["approach"] == "code":
+                raise ModelValidationError(
+                    'engine=auto 时不再允许 approach="code"（代码程序请改用 '
+                    "write_model_program 工具）；请改出 weights 或 model_type 方案"
+                )
             if required_engine in APPROACHES and plan["approach"] != required_engine:
                 raise ModelValidationError(
                     f"执行指令要求 approach={required_engine}，"
@@ -692,7 +710,7 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
                         f"执行指令要求 model_type={required_model_type}，"
                         f"当前为 {plan.get('model_type')!r}；请按指令重新输出"
                     )
-            if required_objective in ("sharpe", "cagr", "mdd"):
+            if required_objective in OBJECTIVES:
                 if plan["objective"] != required_objective:
                     raise ModelValidationError(
                         f"执行指令要求 objective={required_objective}，"
@@ -702,15 +720,11 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
                 if plan["approach"] == "weights":
                     raise ModelValidationError(
                         "执行指令要求结构性升级，禁止只调权重的 weights 方案；"
-                        "请按 previous_approach 规则改用 model_type 或 code"
+                        "请改用 model_type 更换基础引擎"
                     )
                 if previous_approach == "weights" and plan["approach"] != "model_type":
                     raise ModelValidationError(
                         "上一版是权重模型，继续优化时必须使用 model_type 更换基础引擎"
-                    )
-                if previous_approach in ("model_type", "code") and plan["approach"] != "code":
-                    raise ModelValidationError(
-                        "上一版是内置模型/代码引擎，继续优化时必须使用 code 重写打分引擎"
                     )
             plan["repair_attempts"] = attempts
             return plan
@@ -719,7 +733,8 @@ def build_tuning_plan(llm: Any, state: dict[str, Any]) -> dict[str, Any]:
         except ModelValidationError as exc:
             error = exc
 
-        if attempts >= MAX_TUNING_REPAIR_ATTEMPTS:
+        repair_limit = _repair_attempt_limit()
+        if attempts >= repair_limit:
             raise ModelValidationError(
                 f"AI 返回的调参方案未通过校验（自动修复 {attempts} 次）：{error}；"
                 f"原始返回：{_snippet(initial_raw)}"
