@@ -227,10 +227,12 @@ def create_app(service: AppService | None = None) -> FastAPI:
         try:
             body = await _json_body(request)
             content = str(body.get("content", ""))
+            thinking_budget = str(body.get("thinking_budget") or "medium")
             user = getattr(request.state, "user", {})
             service = get_service()
             service._require_session(sid, int(user["id"]))  # noqa: SLF001
-            return _sse(service.chat_stream(sid, content, int(user["id"])))
+            return _sse(service.chat_stream(sid, content, int(user["id"]),
+                                            thinking_budget=thinking_budget))
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 

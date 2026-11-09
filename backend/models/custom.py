@@ -1061,7 +1061,7 @@ class ProgramRuntime:
         """选股钩子：程序里定义了 select_stocks 时使用，否则 None。"""
         if self.select_stocks is None:
             return None
-        return self.select_stocks(scores, int(top_n), dict(self.params))
+        return self.select_stocks(scores, int(top_n))
 
 
 def _program_module_name(path: str) -> str:
@@ -1290,6 +1290,41 @@ def _wrap_transform_context(transform: Callable[..., Any]) -> Callable[..., Any]
     return wrapped
 
 
+def _select_accepts_params(select_hook: Callable[..., Any]) -> bool:
+    """判断 select_stocks 是否接受第三个参数 params（可选或必填均可）。"""
+    try:
+        signature = inspect.signature(select_hook)
+    except (TypeError, ValueError):
+        return False
+    try:
+        signature.bind(None, None, None)
+    except TypeError:
+        return False
+    return True
+
+
+def _wrap_select_hook(select_raw: Callable[..., Any] | None,
+                      params: Mapping[str, Any]) -> Callable[..., Any] | None:
+    """把用户的 ``select_stocks`` 统一适配成引擎可调用的 ``(scores, top_n)``。
+
+    AI 程序里常见三种写法：``(scores, top_n)``、``(scores, top_n, params=None)``、
+    ``(scores, top_n, params)``。后两种由包装器自动注入当前寻优参数，
+    避免服务端固定 2 参调用导致 “missing 1 required positional argument: 'params'”。
+    """
+    if not callable(select_raw):
+        return None
+    accepts_params = _select_accepts_params(select_raw)
+
+    @functools.wraps(select_raw)
+    def wrapped(scores, top_n):
+        if accepts_params:
+            return select_raw(scores, int(top_n), dict(params))
+        return select_raw(scores, int(top_n))
+
+    wrapped.accepts_params = accepts_params  # type: ignore[attr-defined]
+    return wrapped
+
+
 def compile_program(
     files: Mapping[str, Any] | list[Any],
     entry: str | None = None,
@@ -1453,7 +1488,7 @@ def compile_program(
         raise ModelCodeError(
             "build_transform() 必须返回可调用的 transform(z, weights, context=None)")
     select_raw = entry_module.__dict__.get("select_stocks")
-    select_hook = select_raw if callable(select_raw) else None
+    select_hook = _wrap_select_hook(select_raw, cleaned_params)
     return ProgramRuntime(
         files=normalized,
         entry=entry_name,

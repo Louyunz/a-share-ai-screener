@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#F8FAFC">
   <meta name="description" content="智投罗盘 · AI 投资助手：投资者画像、智能顾问、策略分析、组合与模型管理。">
   <title>智投罗盘 · AI 投资助手</title>
-  <link rel="stylesheet" href="style.css?v=18">
+  <link rel="stylesheet" href="style.css?v=21">
   <link rel="stylesheet" href="user-admin.css?v=20">
 </head>
 <body>
@@ -171,6 +171,15 @@
           </div>
           <div class="composer-foot">
             <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
+            <label class="thinking-budget" title="AI 思考预算：控制每轮自主执行步数与思考展示">
+              <span>AI 思考预算</span>
+              <select id="thinking-budget" aria-label="AI 思考预算">
+                <option value="off">关闭</option>
+                <option value="low">低</option>
+                <option value="medium" selected>中</option>
+                <option value="high">高</option>
+              </select>
+            </label>
           </div>
         </form>
       </section>
@@ -295,6 +304,6 @@
   </div>
 
   <script src="charts.js?v=20"></script>
-  <script src="app.js?v=20"></script>
+  <script src="app.js?v=21"></script>
 </body>
 </html>

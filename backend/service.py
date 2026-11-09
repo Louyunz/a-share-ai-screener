@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import difflib
+import json
+import logging
 import math
 import os
 import time
@@ -43,6 +45,8 @@ from .schemas import (
 )
 from .store import Store
 
+logger = logging.getLogger(__name__)
+
 METRIC_NOTES = {
     "cagr": "过去几年平均每年涨多少",
     "sharpe": "每承担一份波动，换来多少收益（越高越划算）",
@@ -73,6 +77,8 @@ MAX_PENDING_CANDIDATES = int(os.environ.get("MAX_PENDING_CANDIDATES", "100"))
 PROGRAM_CONTEXT_DAYS = int(os.environ.get("AI_PROGRAM_CONTEXT_DAYS", "0"))
 # 程序单次寻优的默认预算（AI 可通过 max_trials 覆盖；服务端最终上限由 tuning 控制）
 PROGRAM_DEFAULT_MAX_TRIALS = int(os.environ.get("AI_PROGRAM_DEFAULT_TRIALS", "64"))
+# ReAct 思考预算：off 保持单步；low/medium/high 限制每轮自主工具步数
+THINKING_BUDGET_STEPS = {"low": 3, "medium": 6, "high": 10}
 
 
 class ServiceError(RuntimeError):
@@ -248,11 +254,16 @@ class AppService:
     # 对话主流程
     # ------------------------------------------------------------------
     def chat_stream(self, session_id: str, content: str,
-                    owner_id: int | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
+                    owner_id: int | None = None,
+                    thinking_budget: str = "off") -> Iterator[tuple[str, dict[str, Any]]]:
         self._require_session(session_id, owner_id)
         content = (content or "").strip()
         if not content:
             raise ValidationError("说点什么吧")
+        react_budget = self._normalize_thinking_budget(thinking_budget)
+        if react_budget != "off":
+            yield from self._chat_stream_react(session_id, content, react_budget)
+            return
         self.store.add_message(session_id, "user", content)
         history = self.store.get_messages(session_id)
         public_state = self._planner_state(session_id)
@@ -274,10 +285,12 @@ class AppService:
                 elif kind == "plan":
                     plan = payload
         except (ServiceError, AgentError, ValidationError) as exc:
+            logger.warning("chat plan error session=%s: %s", session_id, exc)
             yield "error", {"message": str(exc), "retryable": True}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
         if plan is None:
+            logger.warning("chat plan empty session=%s", session_id)
             yield "error", {"message": "AI 没有返回规划结果", "retryable": True}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
@@ -304,6 +317,7 @@ class AppService:
         if state_errors:
             # 保留 LLM 已流式展示的回复，避免用户消息孤零零留在历史里
             self._remember_assistant(session_id, plan.reply, [])
+            logger.warning("chat state mismatch session=%s: %s", session_id, state_errors)
             yield "error", {"message": "AI 的动作与当前会话状态不一致："
                                       + "；".join(state_errors), "retryable": False}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
@@ -360,18 +374,271 @@ class AppService:
         except (ServiceError, AgentError, ValidationError) as exc:
             self._remember_assistant(session_id, plan.reply, notes,
                                      list(saved_blocks.values()), "".join(narration))
+            logger.warning("chat action error session=%s: %s", session_id, exc)
             yield "error", {"message": str(exc), "retryable": False}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
         except Exception as exc:  # noqa: BLE001
             self._remember_assistant(session_id, plan.reply, notes,
                                      list(saved_blocks.values()), "".join(narration))
+            logger.exception("chat action crash session=%s", session_id)
             yield "error", {"message": f"处理这句时出了点问题：{exc}", "retryable": True}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
             return
 
         self._remember_assistant(session_id, plan.reply, notes,
                                  list(saved_blocks.values()), "".join(narration))
+        yield "done", {"message_id": uuid.uuid4().hex[:8]}
+
+    @staticmethod
+    def _normalize_thinking_budget(value: Any) -> str:
+        text = str(value or "medium").strip().lower()
+        return text if text in ("off", "low", "medium", "high") else "medium"
+
+    def _observation_text(self, step: int, plan: Any,
+                          blocks: list[dict[str, Any]],
+                          notes: list[str]) -> str:
+        names = [str(action.get("name") or "") for action in (plan.actions or [])]
+        lines = [f"第 {step} 步已执行工具：{', '.join(name for name in names if name) or '无'}"]
+        for block in blocks:
+            kind = str(block.get("type") or "")
+            if kind == "selection":
+                top = block.get("top") or []
+                metrics = block.get("metrics") or {}
+                lines.append(
+                    f"选股结果：{len(top)} 只；年化 {metrics.get('cagr', 0):.2%}，"
+                    f"夏普 {metrics.get('sharpe', 0):.2f}，最大回撤 {metrics.get('mdd', 0):.2%}")
+            elif kind == "approval":
+                lines.append(f"审批卡：{str(block.get('title') or '')}；"
+                             f"{str(block.get('summary') or '')[:300]}")
+            elif kind == "version":
+                lines.append("已启用模型版本：" + str((block.get("active") or {}).get("name") or ""))
+            elif kind == "work":
+                proposal = block.get("proposal") or {}
+                summary = str(proposal.get("summary") or block.get("title") or "")[:300]
+                if summary:
+                    lines.append("模型工作卡：" + summary)
+            elif kind == "tuning":
+                lines.append("寻优卡：" + str(block.get("method") or "寻优")
+                             + f"，最优 {str((block.get('best') or {}).get('score') or '')[:80]}")
+            elif kind == "review":
+                lines.append("审核卡：" + str(block.get("title") or ""))
+        if notes:
+            lines.append("执行说明：" + "；".join(str(item) for item in notes)[:600])
+        return "\n".join(lines)[:1800]
+
+    def _chat_stream_react(self, session_id: str, content: str, budget: str,
+                           ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """ReAct 循环：每轮最多执行 3/6/10 步工具，观察结果回传给模型继续决策。"""
+        max_steps = THINKING_BUDGET_STEPS.get(budget, 6)
+        self.store.add_message(session_id, "user", content)
+        history = self.store.get_messages(session_id)
+        plan_history = history[:-1]
+        loop_message = content
+        notes: list[str] = []
+        narration: list[str] = []
+        reply_parts: list[str] = []
+        observations: list[str] = []
+        saved_blocks: dict[str, dict[str, Any]] = {}
+        state: dict[str, Any] = {}
+        last_had_actions = False
+        need_final = False
+        executed_signatures: set[str] = set()
+        step = 0
+
+        def persist_partial() -> None:
+            text = "".join(reply_parts).strip()
+            if text or notes or saved_blocks:
+                self._remember_assistant(session_id, text, notes,
+                                         list(saved_blocks.values()),
+                                         "".join(narration))
+
+        while step < max_steps:
+            step += 1
+            state = self._planner_state(session_id)
+            if observations:
+                state = dict(state)
+                state["react"] = {
+                    "step": step,
+                    "max_steps": max_steps,
+                    "observations": observations[-8:],
+                }
+            plan = None
+            preview_id = ""
+            preview_change: dict[str, Any] | None = None
+            try:
+                for kind, payload in self.agent.stream_plan(
+                        state, plan_history, loop_message, emit_thinking=True):
+                    if kind == "token":
+                        reply_parts.append(payload)
+                        yield "token", {"text": payload}
+                    elif kind == "thinking":
+                        text = str((payload or {}).get("text") or "") if isinstance(payload, dict) else str(payload or "")
+                        if text:
+                            yield "thinking", {"text": text, "step": step}
+                    elif kind == "program":
+                        block = self._program_preview_block(payload)
+                        if block:
+                            preview_id = str(block["id"])
+                            preview_change = block.get("code_change")
+                            yield "ui", {"block": block}
+                    elif kind == "plan":
+                        plan = payload
+            except (ServiceError, AgentError, ValidationError) as exc:
+                persist_partial()
+                logger.warning("react plan error session=%s step=%s: %s",
+                               session_id, step, exc)
+                yield "error", {"message": str(exc), "retryable": True}
+                yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                return
+            if plan is None:
+                persist_partial()
+                logger.warning("react plan empty session=%s step=%s", session_id, step)
+                yield "error", {"message": "AI 没有返回规划结果", "retryable": True}
+                yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                return
+
+            # 自主循环只允许继续做分析/建模类动作；审批、回滚、画像确认必须来自用户本轮明确指令
+            if step > 1:
+                plan.profile_delta = {}
+                plan.actions = [
+                    action for action in plan.actions
+                    if str(action.get("name") or "") not in (
+                        "apply_pending_change", "rollback_version", "confirm_profile")
+                ]
+
+            pending_intent = state.get("pending_intent")
+            if pending_intent and plan.deferred_intent:
+                plan.actions = [{"name": str(pending_intent), "args": {}}]
+                plan.deferred_intent = ""
+            if preview_id:
+                for action in plan.actions:
+                    if action.get("name") == "write_model_program":
+                        args = action.get("args")
+                        if not isinstance(args, dict):
+                            args = {}
+                            action["args"] = args
+                        args["_preview_id"] = preview_id
+                        if preview_change:
+                            args["_preview_change"] = preview_change
+
+            state_errors = self._action_state_errors(session_id, plan)
+            if state_errors:
+                persist_partial()
+                logger.warning("react state mismatch session=%s step=%s: %s",
+                               session_id, step, state_errors)
+                yield "error", {"message": "AI 的动作与当前会话状态不一致："
+                                          + "；".join(state_errors), "retryable": False}
+                yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                return
+
+            runtime = self.store.get_state(session_id)
+            deferred_request = str(runtime.get("deferred_request") or "")
+            request_text = content
+            if plan.deferred_intent:
+                self._save_runtime(session_id, pending_intent=plan.deferred_intent,
+                                   deferred_request=content)
+                persist_partial()
+                yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                return
+            if plan.actions:
+                if deferred_request:
+                    request_text = deferred_request + "；" + content
+                self._save_runtime(session_id, pending_intent=None, deferred_request=None)
+
+            profile = self._profile(session_id)
+            slots = profile["slots"] if profile else {}
+            confirmed = profile["confirmed"] if profile else False
+            if plan.profile_delta:
+                merged = merge_slots(slots, plan.profile_delta)
+                if merged != slots:
+                    slots = merged
+                    self.store.save_profile(session_id, slots, profile_summary(slots), confirmed)
+                    if (profile_complete(slots) and not confirmed
+                            and not plan.has_action("confirm_profile")):
+                        profile_block = self._profile_block(session_id)
+                        saved_blocks[profile_block["id"]] = profile_block
+                        yield "ui", {"block": profile_block}
+
+            step_blocks: list[dict[str, Any]] = []
+            should_stop = False
+            if plan.actions:
+                fresh_actions = []
+                for action in plan.actions:
+                    try:
+                        signature = json.dumps(
+                            [action.get("name"), action.get("args") or {}],
+                            ensure_ascii=False, sort_keys=True, default=str)
+                    except (TypeError, ValueError):
+                        signature = str(action.get("name"))
+                    if signature in executed_signatures:
+                        continue
+                    executed_signatures.add(signature)
+                    fresh_actions.append(action)
+                if not fresh_actions:
+                    # 模型重复调用同一动作：停止循环并生成最终答复，避免死循环
+                    need_final = True
+                    break
+                plan.actions = fresh_actions
+                last_had_actions = True
+                try:
+                    for action in plan.actions:
+                        relay = self._relay_action(
+                            self._run_action(session_id, action, request_text), narration)
+                        events, note, should_stop = yield from relay
+                        for block in events or []:
+                            if isinstance(block, dict) and block.get("id"):
+                                block_id = str(block["id"])
+                                saved_blocks[block_id] = block
+                                step_blocks.append(block)
+                        if note:
+                            notes.append(note)
+                            yield "token", {"text": "\n\n"}
+                            for piece in chunk_text(note):
+                                yield "token", {"text": piece}
+                        if should_stop:
+                            break
+                except (ServiceError, AgentError, ValidationError) as exc:
+                    persist_partial()
+                    logger.warning("react action error session=%s step=%s: %s",
+                                   session_id, step, exc)
+                    yield "error", {"message": str(exc), "retryable": False}
+                    yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    persist_partial()
+                    logger.exception("react action crash session=%s step=%s", session_id, step)
+                    yield "error", {"message": f"处理这句时出了点问题：{exc}",
+                                    "retryable": True}
+                    yield "done", {"message_id": uuid.uuid4().hex[:8]}
+                    return
+                observations.append(self._observation_text(step, plan, step_blocks, notes))
+                if should_stop:
+                    break
+                plan_history = plan_history + (
+                    [{"role": "user", "content": content}] if step == 1 else []
+                ) + [{"role": "assistant", "content": plan.reply or ""}]
+                loop_message = (
+                    "【工具执行观察】\n" + "\n".join(observations[-3:])
+                    + "\n请根据观察判断下一步：若任务已完成，直接用 content 给客户最终答复并停止调用工具；"
+                      "若还需要继续，调用必要工具并填写 thought。")
+                continue
+            break
+
+        if (last_had_actions and step >= max_steps) or need_final:
+            try:
+                for kind, payload in self.agent.stream_final(
+                        state, plan_history, loop_message, observations):
+                    if kind == "token" and payload:
+                        reply_parts.append(payload)
+                        yield "token", {"text": payload}
+            except AgentError as exc:
+                yield "thinking", {"text": f"收尾说明：{exc}", "step": step}
+
+        text = "".join(reply_parts).strip()
+        if text or notes or saved_blocks:
+            self._remember_assistant(session_id, text, notes,
+                                     list(saved_blocks.values()), "".join(narration))
         yield "done", {"message_id": uuid.uuid4().hex[:8]}
 
     @staticmethod

@@ -47,7 +47,7 @@
 | GET | `/api/health` | `{ok, source, as_of, universe, llm}`（需登录） |
 | GET | `/api/sessions` | 历史对话归档 `{sessions:[{id,title,created_at,updated_at,message_count,profile_summary,profile_confirmed}]}` |
 | POST | `/api/sessions` | `{session_id}` |
-| POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
+| POST | `/api/sessions/{sid}/chat` | `{content, thinking_budget?}` → **SSE 聊天流**（见第 3 节） |
 | GET | `/api/sessions/{sid}/messages` | 文本 + 富卡片历史 `{messages:[{role,content,blocks,created_at}]}` |
 | GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, pending_candidates, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别；`pending_proposal.candidate_count` 是待确认候选方案数量；`pending_candidates` 是候选方案列表（`index/name/summary/status/available/metrics`） |
 | POST | `/api/sessions/{sid}/candidates/{index}/apply` | 工作台「启用」按钮：直接启用第 `index` 个待确认候选方案（不经过 LLM），返回 `{ok, note, blocks, state}` |
@@ -61,9 +61,12 @@
 ## 3. 聊天 SSE 事件
 
 `event: token` → `{text}`：**LLM 流式生成的真实文本增量**（content 直接以 delta 形式转发，前端收到即渲染）。
+`event: thinking` → `{text, step}`：ReAct 每步工具调用参数 `thought` 的流式增量；仅展示，不进入执行参数、不持久化为业务消息。
 `event: ui` → `{block: {...}}`：插入或更新一个富卡片（按 `id` upsert）。
 `event: done` → `{message_id}`。
 `event: error` → `{message, retryable}`。
+
+**思考预算（thinking_budget）**：请求体可选 `off|low|medium|high`（默认 `medium`，前端会记住用户选择）。`off` 走单步规划；`low/medium/high` 分别允许每轮最多 3/6/10 个自主 ReAct 工具步骤。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。
 
 Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 实时发给浏览器；tool_calls 在本轮流结束后由服务端校验执行。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
 
@@ -168,13 +171,13 @@ Planner 每轮输出：
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
 | `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 只做内置模型/权重层面调整；`engine=model_type` 切换内置模型并使用预设权重，其他 engine 走服务端调参方案 → 网格寻优 → work/tuning/approval 卡，**不自动启用**。`engine="code"` 已删除，代码程序一律走 `write_model_program` |
-| `write_model_program` | `{files[], entry, summary, param_space?, objective?, max_trials?, config?, packages[], escalate, reason, expected_effect, risks[]}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → 生成过程实时显示在「AI 正在优化模型」work 卡 → LLM 安全审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端寻优/单次回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
+| `write_model_program` | `{files[], entry, summary, param_space?, objective?, max_trials?, config?, packages[], escalate, reason, expected_effect, risks[], thought?}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → 生成过程实时显示在「AI 正在优化模型」work 卡 → LLM 安全审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端寻优/单次回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
 | `apply_pending_change` | `{candidate?}` | 存在待审批候选方案且用户本轮明确同意/指定 | `candidate` 为候选方案编号（按出现顺序 1..N；缺省=最新待审批方案），当前会话启用该候选模型版本，返回 version 卡 |
 | `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
 
 **AI 程序接口（write_model_program）**：
 - 程序是完整 Python 多文件/多级包结构（顶层 `module.py` 或 `pkg/helpers.py`，文件数/总字符数默认上限 64 个 / 500000 字符，可用环境变量调整；模块间用 `import helpers`、`import pkg.helpers`、`from pkg.helpers import x` 互相引用）；
-- 入口文件（默认 `main.py`）必须定义 `build_transform(params=None) -> transform(z, weights, context=None) -> pandas.Series`；可选定义 `select_stocks(scores, top_n, params=None)` 接管选股，返回代码列表或 `{代码: 权重}` 字典（权重会被归一化并用于回测/组合）；`scores` 是 pandas.DataFrame，index=股票代码，含 `factor_score` 列与 z_* 因子列；
+- 入口文件（默认 `main.py`）必须定义 `build_transform(params=None) -> transform(z, weights, context=None) -> pandas.Series`；可选定义 `select_stocks(scores, top_n, params=None)` 接管选股，返回代码列表或 `{代码: 权重}` 字典（权重会被归一化并用于回测/组合）；`select_stocks` 的第三个 `params` 参数可省略、可选或必填，服务端会自动把当前寻优参数注入，不会因签名不匹配报错；`scores` 是 pandas.DataFrame，index=股票代码，含 `factor_score` 列与 z_* 因子列；
 - `transform` 可选接收 `context`（dict）：`asof`、`prices`/`close_raw`/`amount`（截至 asof 的历史行情）、`fundamentals`、`industry`、`universe`，可用于特征计算或训练；未声明该参数的程序仍按 2 参调用；
 - `param_space` 可省略（省略则只做一次回测，不寻优），参数个数不设上限，`max_trials` 可指定寻优预算；`config` 可覆盖 `top_n/backtest_years/rebalance_days/cost_buy/cost_sell/portfolio_method(equal_weight|risk_parity)`，不声明则用系统默认；
 - 服务端**不做子进程冒烟测试**；执行前做 AST 白名单 / 受限 builtins / 入口契约校验，真正执行发生在寻优与回测阶段；

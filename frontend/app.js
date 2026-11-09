@@ -97,6 +97,7 @@
     lastSelection: null,
     lastUserMessage: '',
     lastMessageId: null,
+    thinkingBudget: 'medium',
     stateError: null,
     following: true,
     pinnedOptimization: null,
@@ -202,6 +203,7 @@
     dom.scroll = $('#chat-scroll');
     dom.composer = $('#composer');
     dom.input = $('#composer-input');
+    dom.thinkingBudget = $('#thinking-budget');
     dom.sendBtn = $('#send-btn');
     dom.healthPill = $('#health-pill');
     dom.healthDot = $('#health-dot');
@@ -439,6 +441,25 @@
     }
   }
 
+  var THINKING_BUDGET_KEY = 'dsh.thinkingBudget';
+
+  function readThinkingBudget() {
+    try {
+      var value = window.localStorage.getItem(THINKING_BUDGET_KEY) || 'medium';
+      return ['off', 'low', 'medium', 'high'].indexOf(value) >= 0 ? value : 'medium';
+    } catch (err) {
+      return 'medium';
+    }
+  }
+
+  function saveThinkingBudget(value) {
+    try {
+      window.localStorage.setItem(THINKING_BUDGET_KEY, value);
+    } catch (err) {
+      /* 忽略本地存储异常 */
+    }
+  }
+
   /* ============================== 数据归一化 ============================== */
   function normalizeProfile(raw) {
     if (!raw || typeof raw !== 'object') return null;
@@ -608,6 +629,7 @@
     dom.stream.classList.remove('is-welcome');
     wrap.innerHTML = '<div class="msg-avatar">' + icon('spark') + '</div>'
       + '<div class="msg-main"><div class="msg-meta"><strong>AI 投资顾问</strong><time>' + esc(nowClock()) + '</time></div>'
+      + '<details class="thinking-box" hidden><summary>AI 思考过程</summary><div class="thinking-text"></div></details>'
       + '<div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>'
       + '<div class="cards"></div></div>';
     dom.stream.appendChild(wrap);
@@ -615,6 +637,9 @@
       node: wrap,
       bubble: wrap.querySelector('.bubble'),
       cards: wrap.querySelector('.cards'),
+      thinkingBox: wrap.querySelector('.thinking-box'),
+      thinkingText: wrap.querySelector('.thinking-text'),
+      thinking: '',
       text: '',
       cardCount: 0,
       failed: false
@@ -643,6 +668,18 @@
     if (state.following) scrollToBottom(true);
   }
 
+  function appendThinking(turn, text) {
+    if (!turn || !text || !turn.thinkingBox || !turn.thinkingText) return;
+    turn.thinkingBox.hidden = false;
+    turn.thinkingBox.open = true;
+    turn.thinking = (turn.thinking || '') + String(text);
+    turn.thinkingText.textContent = turn.thinking;
+    turn.thinkingText.scrollTop = turn.thinkingText.scrollHeight;
+    var summary = turn.thinkingBox.querySelector('summary');
+    if (summary) summary.textContent = 'AI 思考中…';
+    if (state.following) scrollToBottom(true);
+  }
+
   function flushTurnText(turn) {
     if (turn && turn.bubble && turn.bubble.isConnected) {
       turn.bubble.textContent = turn.text;
@@ -652,6 +689,10 @@
   function finalizeTurn(turn) {
     if (!turn) return;
     turn.node.classList.remove('is-streaming');
+    if (turn.thinking && turn.thinkingBox) {
+      var summary = turn.thinkingBox.querySelector('summary');
+      if (summary) summary.textContent = 'AI 思考过程（已完成）';
+    }
     if (!turn.text) {
       if (turn.bubble && turn.bubble.isConnected) turn.bubble.remove();
     }
@@ -1978,7 +2019,7 @@
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-        body: JSON.stringify({ content: content }),
+        body: JSON.stringify({ content: content, thinking_budget: state.thinkingBudget || 'medium' }),
         signal: controller ? controller.signal : undefined
       });
       if (response.status === 401) {
@@ -2092,6 +2133,9 @@
       case 'token':
         appendToken(turn, typeof payload.text === 'string' ? payload.text : '');
         break;
+      case 'thinking':
+        appendThinking(turn, typeof payload.text === 'string' ? payload.text : '');
+        break;
       case 'ui':
         try {
           if (payload.block && typeof payload.block === 'object') upsertCard(payload.block);
@@ -2114,6 +2158,8 @@
 
   /* ============================== 初始化 ============================== */
   async function bootstrap() {
+    state.thinkingBudget = readThinkingBudget();
+    if (dom.thinkingBudget) dom.thinkingBudget.value = state.thinkingBudget;
     clearChat();
     dom.stream.innerHTML = '<div class="chat-loading"><span class="spinner"></span>正在连接 AI 助手…</div>';
     setHealth('loading', '连接中', '正在检查后端服务');
@@ -2692,6 +2738,12 @@
       composing = false;
     });
     dom.input.addEventListener('input', resizeInput);
+
+    if (dom.thinkingBudget) dom.thinkingBudget.addEventListener('change', function () {
+      var value = dom.thinkingBudget.value;
+      state.thinkingBudget = ['off', 'low', 'medium', 'high'].indexOf(value) >= 0 ? value : 'medium';
+      saveThinkingBudget(state.thinkingBudget);
+    });
 
     dom.scroll.addEventListener('scroll', function () {
       state.following = isNearBottom();

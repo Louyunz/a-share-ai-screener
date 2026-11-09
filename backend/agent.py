@@ -47,7 +47,12 @@ def _planner_system() -> str:
          for item in SLOT_DEFS],
         ensure_ascii=False,
     )
-    return _load_prompt("planner.txt", SLOT_DEFS=slots)
+    try:
+        from .chat.action_schema import render_tool_docs
+        tool_docs = render_tool_docs()
+    except (ImportError, AttributeError):
+        tool_docs = ""
+    return _load_prompt("planner.txt", SLOT_DEFS=slots, TOOL_DOCS=tool_docs)
 
 
 def chunk_text(text: str, size: int = 16) -> Iterator[str]:
@@ -121,6 +126,17 @@ def preview_program_arguments(raw_arguments: str) -> dict[str, Any] | None:
     if not files:
         return None
     return {"files": files, "active": active}
+
+
+_THOUGHT_RE = re.compile(r'"thought"\s*:\s*"((?:\\.|[^"\\])*)')
+
+
+def preview_tool_thought(raw_arguments: str) -> str:
+    """从任意工具的流式参数中提取已生成的 ``thought`` 文本。"""
+    match = _THOUGHT_RE.search(str(raw_arguments or ""))
+    if not match:
+        return ""
+    return _decode_json_string_fragment(match.group(1))
 
 
 def _state_blocked_action(action: dict[str, Any], state: dict[str, Any]) -> bool:
@@ -219,11 +235,13 @@ class Agent:
                 *tool_messages, {"role": "user", "content": correction}]
 
     def stream_plan(self, state: dict[str, Any], history: list[dict[str, Any]],
-                    message: str) -> Iterator[tuple[str, Any]]:
-        """产出 ("token", 文本增量) 若干次，最后产出 ("plan", Plan)。"""
+                    message: str, emit_thinking: bool = True,
+                    _retry: bool = False) -> Iterator[tuple[str, Any]]:
+        """产出 ("token"/"thinking"/"program") 若干次，最后产出 ("plan", Plan)。"""
         user_content = self._payload(state, history, message)
         reply_parts: list[str] = []
         result: ToolChatResult | None = None
+        thought_sent: dict[int, int] = {}
         program_preview: dict[str, Any] = {"id": "", "last_total": -1,
                                            "raw": "", "active": ""}
 
@@ -253,9 +271,17 @@ class Agent:
                 elif kind == "result":
                     result = payload
                 elif kind == "tool_args":
+                    raw_arguments = str(payload.get("arguments") or "")
+                    if emit_thinking:
+                        thought = preview_tool_thought(raw_arguments)
+                        if thought:
+                            call_index = int(payload.get("index", 0))
+                            sent = thought_sent.get(call_index, 0)
+                            if len(thought) > sent:
+                                yield "thinking", {"text": thought[sent:]}
+                                thought_sent[call_index] = len(thought)
                     if str(payload.get("name") or "") != "write_model_program":
                         continue
-                    raw_arguments = str(payload.get("arguments") or "")
                     snapshot = preview_program_arguments(raw_arguments)
                     if not snapshot:
                         continue
@@ -273,6 +299,17 @@ class Agent:
                             "active": snapshot["active"],
                         }
         except LLMError as exc:
+            # 写程序时工具参数是一条很长的 JSON，容易被模型输出上限截断；
+            # 若已经流式生成了部分程序，先压缩体积重试一次，而不是直接把整轮判失败。
+            if not _retry and program_preview.get("id"):
+                retry_message = (
+                    message
+                    + "\n\n【重试】上次生成模型程序时工具调用参数不是合法 JSON（可能因输出过长被截断）。"
+                      "请减少单次程序体积（更少文件/更短代码），确保完整合法的工具调用 JSON 后重新生成。")
+                yield from self.stream_plan(
+                    state, history, retry_message,
+                    emit_thinking=emit_thinking, _retry=True)
+                return
             raise AgentError(f"AI 暂时无法理解这句话：{exc}") from exc
         if program_preview["id"] and program_preview["raw"]:
             snapshot = preview_program_arguments(program_preview["raw"])
@@ -384,6 +421,24 @@ class Agent:
         if final is None:
             raise AgentError("AI 没有返回规划结果")
         return final
+
+    def stream_final(self, state: dict[str, Any], history: list[dict[str, Any]],
+                     message: str, observations: list[str],
+                     ) -> Iterator[tuple[str, Any]]:
+        """ReAct 预算耗尽后的收尾：不再允许调工具，直接流式输出最终答复。"""
+        user_content = self._payload(state, history, message)
+        observed = "\n".join(str(item) for item in observations if item)
+        prompt = (user_content
+                  + "\n\n【本轮已执行的工具结果】\n" + (observed or "（无）")
+                  + "\n\n请基于以上真实结果，用 content 给客户一段最终答复；"
+                    "不要再调用工具，不要描述内部步骤或工具名，遵守既有表达规范。")
+        try:
+            for text in self.llm.chat_text_stream(
+                    _planner_system(), [{"role": "user", "content": prompt}]):
+                if text:
+                    yield "token", text
+        except LLMError as exc:
+            raise AgentError(f"AI 生成最终答复失败：{exc}") from exc
 
     def explain(self, facts: dict[str, Any], question: str = "") -> str:
         payload = json.dumps({"facts": facts, "question": question}, ensure_ascii=False)

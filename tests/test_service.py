@@ -595,6 +595,28 @@ class ModelProgramToolTest(unittest.TestCase):
         self.assertIsNotNone(pending)
         self.assertEqual((pending.get("model") or {}).get("config"), config)
 
+    def test_program_select_stocks_accepts_required_params_signature(self) -> None:
+        """AI 把 select_stocks 写成必需第三个参数时，服务端也要能注入 params。"""
+        files = {
+            "main.py": (
+                "import pandas as pd\n"
+                "\n"
+                "def build_transform(params=None):\n"
+                "    def transform(z, weights):\n"
+                "        return pd.to_numeric(z['z_volatility_60'], errors='coerce').fillna(0.0)\n"
+                "    return transform\n"
+                "\n"
+                "def select_stocks(scores, top_n, params):\n"
+                "    return list(scores.index[:int(top_n)])\n"
+            ),
+        }
+        action = self._action(files=files)
+        events = list(self.service._run_action(self.sid, action, "写一个带 params 选股钩子的程序"))
+        self.assertFalse([data for event, data in events if event == "error"])
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertIsNotNone(pending)
+        self.assertEqual((pending.get("model") or {}).get("kind"), "code")
+
     def test_program_context_and_custom_weights(self) -> None:
         """context 感知 transform 能拿到 asof 数据；select_stocks 返回 {代码:权重} 生效。"""
         files = {
@@ -902,6 +924,38 @@ class WeightTuningTest(unittest.TestCase):
 
         self.assertTrue(hasattr(pipeline, "build_tuning_plan"))
         self.assertTrue(hasattr(pipeline, "normalize_tuning_plan"))
+
+
+class ReactLoopTest(unittest.TestCase):
+    """思考预算开启后的多步 ReAct 循环：自主执行 + 审批必须由用户本轮明确触发。"""
+
+    def setUp(self) -> None:
+        self.dir = workdir("react_loop")
+        save_bundle(generate_bundle(n_stocks=20, n_days=300, seed=5), self.dir / "a_share")
+        self.service = AppService(data_dir=self.dir / "a_share", db_path=self.dir / "app.db",
+                                  llm=ScriptedLLM())
+        self.sid = self.service.create_session()["session_id"]
+        self.service.store.save_profile(self.sid, PROFILE_SLOTS,
+                                        profile_summary(PROFILE_SLOTS), True)
+
+    def tearDown(self) -> None:
+        self.service.close()
+        cleanup(self.dir)
+
+    def test_react_loop_runs_and_waits_for_explicit_apply(self) -> None:
+        events = list(self.service.chat_stream(
+            self.sid, "帮我优化一下模型", thinking_budget="medium"))
+        self.assertFalse([data for event, data in events if event == "error"])
+        self.assertTrue(_typed(events, "tuning"))
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertIsNotNone(pending)
+        # 自主循环不能把审批动作带进本轮；必须等用户明确同意后才启用
+        self.assertIsNone(self.service.store.session_active_version_id(self.sid))
+        events = list(self.service.chat_stream(
+            self.sid, "同意，启用这个改进", thinking_budget="medium"))
+        self.assertFalse([data for event, data in events if event == "error"])
+        self.assertTrue(_typed(events, "version"))
+        self.assertTrue(self.service.store.session_active_version_id(self.sid))
 
 
 if __name__ == "__main__":
