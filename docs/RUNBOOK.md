@@ -77,6 +77,6 @@ $node --check frontend/app.js
 $node --check frontend/charts.js
 & $py scripts\e2e_smoke.py
 
-# 真实 LLM 语义矩阵（需要 DEEPSEEK_API_KEY；10/10 才允许发版）
+# 真实 LLM 语义矩阵（需要 DEEPSEEK_API_KEY；14/14 才允许发版）
 & $py scripts\semantic_eval.py
 ```

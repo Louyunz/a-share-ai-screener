@@ -98,8 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[e2e] 会话 {sid}")
 
         events = client.chat(sid, "我想为养老攒点钱")
-        assert any(block["type"] == "profile" for block in _blocks(events))
-        print("[e2e] 画像开始:", _blocks(events, "profile")[-1]["summary"])
+        blocks = _blocks(events)
+        # 当前产品行为：逐题采集阶段只追问、不弹画像卡；画像齐全后再出现画像卡。
+        assert not any(block["type"] == "profile" for block in blocks), blocks
+        assert any(event == "token" for event, _ in events)
+        print("[e2e] 画像采集开始（逐题阶段不弹卡）")
 
         events = client.chat(sid, "大概 5 年不用这笔钱，最多能接受亏 15%，真亏了会有点慌但先不卖")
         profile = _blocks(events, "profile")[-1]

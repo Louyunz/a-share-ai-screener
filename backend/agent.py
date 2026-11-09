@@ -83,6 +83,20 @@ def asks_clarifying_question(reply: str) -> bool:
     return "？" in reply or "?" in reply
 
 
+def _state_blocked_action(action: dict[str, Any], state: dict[str, Any]) -> bool:
+    """按会话状态判断动作是否不可能执行（只做状态校验，不解析自然语言）。"""
+    name = str(action.get("name") or "")
+    if name == "rollback_version":
+        return not bool(state.get("versions"))
+    if name == "apply_pending_change":
+        candidates = state.get("pending_candidates")
+        waiting = [item for item in candidates or []
+                   if isinstance(item, dict)
+                   and str(item.get("status") or "pending") != "applied"]
+        return not (state.get("pending") or waiting)
+    return False
+
+
 class Agent:
     def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
@@ -245,6 +259,11 @@ class Agent:
         if plan.actions and asks_clarifying_question(plan.reply):
             plan.deferred_intent = plan.actions[0]["name"]
             plan.actions = []
+        # 状态兜底：模型偶尔会在“没有可回滚版本/没有待审批方案”时仍调用工具。
+        # 这类动作不可能执行，直接丢弃（服务端 chat_stream 仍会做二次校验），
+        # 避免用户只看到一条错误、却被留下一条没有回复的孤消息。
+        plan.actions = [action for action in plan.actions
+                        if not _state_blocked_action(action, state)]
         yield "plan", plan
 
     def plan(self, state: dict[str, Any], history: list[dict[str, Any]],

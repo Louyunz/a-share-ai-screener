@@ -63,6 +63,9 @@ WORK_STEP_TEMPLATES = {
 TUNING_NOTE = ("网格寻优基于历史回测逐组评估，最优参数可能存在过拟合；"
                "历史业绩不代表未来实际表现，候选方案需要您确认后才会启用。")
 
+# 一次会话内保留的候选方案上限（按出现顺序编号，供“用第一个/第二个”选择）
+MAX_PENDING_CANDIDATES = 10
+
 
 class ServiceError(RuntimeError):
     """业务错误（对话流里以 error 事件返回）。"""
@@ -178,6 +181,7 @@ class AppService:
     def get_state(self, session_id: str, owner_id: int | None = None) -> dict[str, Any]:
         self._require_session(session_id, owner_id)
         profile = self._profile(session_id)
+        candidates = self._candidates(session_id)
         runtime = self.store.get_state(session_id)
         active_version = self.store.session_active_version(session_id)
         model = self._session_active_model(session_id)
@@ -190,7 +194,7 @@ class AppService:
                 model, version_id=active_version_id,
                 metrics=(active_version or {}).get("metrics") or {}),
             "versions": [self._version_public(item, active_version_id) for item in versions],
-            "pending_proposal": self._pending_public(runtime.get("pending")),
+            "pending_proposal": self._pending_public(runtime.get("pending"), candidates),
             "last_selection": runtime.get("last_selection"),
             "model_scope": "session",
             "default_model": self._model_public(self._default_model()),
@@ -209,6 +213,7 @@ class AppService:
         history = self.store.get_messages(session_id)
         public_state = self._planner_state(session_id)
 
+        plan = None
         try:
             for kind, payload in self.agent.stream_plan(public_state, history[:-1], content):
                 if kind == "token":
@@ -233,6 +238,8 @@ class AppService:
         # 动作前置校验：只校验“当前状态是否允许执行该动作”，不做语义判断。
         state_errors = self._action_state_errors(session_id, plan)
         if state_errors:
+            # 保留 LLM 已流式展示的回复，避免用户消息孤零零留在历史里
+            self._remember_assistant(session_id, plan.reply, [])
             yield "error", {"message": "AI 的动作与当前会话状态不一致："
                                       + "；".join(state_errors), "retryable": False}
             yield "done", {"message_id": uuid.uuid4().hex[:8]}
@@ -331,7 +338,8 @@ class AppService:
             return (yield from self._analyze_model(session_id, request_text,
                                                    action.get("args") or {}))
         if name == "apply_pending_change":
-            return (yield from self._apply_pending(session_id))
+            candidate = int((action.get("args") or {}).get("candidate") or 0)
+            return (yield from self._apply_pending(session_id, candidate))
         if name == "rollback_version":
             return (yield from self._rollback(session_id))
         return [], "", False
@@ -443,7 +451,7 @@ class AppService:
         planned_selection = "run_selection" in names
         errors: list[str] = []
         for name in names:
-            if name == "apply_pending_change" and not runtime.get("pending"):
+            if name == "apply_pending_change" and not self._has_pending_candidates(session_id):
                 errors.append("当前会话没有待审批模型方案，不能调用 apply_pending_change")
             elif name == "rollback_version" and not self._can_rollback(session_id):
                 errors.append("当前会话没有可回滚的历史模型版本，不能调用 rollback_version")
@@ -942,7 +950,13 @@ class AppService:
             "tuning": tune_public,
             "created_at": pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        self._save_runtime(session_id, pending=pending)
+        # 多个候选方案按出现顺序保留，客户可以说“用第一个/第二个”来指定
+        candidates = self._candidates(session_id)
+        candidates.append(pending)
+        if len(candidates) > MAX_PENDING_CANDIDATES:
+            candidates = candidates[-MAX_PENDING_CANDIDATES:]
+        candidate_index = len(candidates)
+        self._save_runtime(session_id, pending=pending, candidates=candidates)
         final_extra = {"code_change": change_preview, "tuning": tune_public}
         final_work = publish(status="done", proposal=proposal_public,
                              extra=final_extra)
@@ -959,8 +973,10 @@ class AppService:
         yield "ui", {"block": comparison_block}
 
         approval_actions = [
-            {"label": "同意", "message": "同意启用这个改进"},
-            {"label": "暂存", "message": "先别启用，我再想想"},
+            {"label": "同意",
+             "message": f"同意启用第 {candidate_index} 个候选方案"},
+            {"label": "暂存",
+             "message": f"先别启用第 {candidate_index} 个候选方案，我再想想"},
         ]
         if not expectation_met:
             approval_actions.append(
@@ -993,6 +1009,7 @@ class AppService:
         approval = {
             "id": "approval-" + uuid.uuid4().hex[:8],
             "type": "approval",
+            "candidate": candidate_index,
             "title": approval_title,
             "summary": approval_summary,
             "risk": approval_risk,
@@ -1270,37 +1287,64 @@ class AppService:
     # ------------------------------------------------------------------
     # 动作：应用/回滚（模型只在当前会话内生效，新对话回到默认模型）
     # ------------------------------------------------------------------
-    def _apply_pending(self, session_id: str):
-        runtime = self.store.get_state(session_id)
-        pending = runtime.get("pending")
-        if not pending:
+    def _apply_pending(self, session_id: str, candidate_index: int = 0):
+        candidates = self._candidates(session_id)
+        if not candidates:
             raise ConflictError("没有等你确认的改进方案")
+        pending_indexes = [index for index, item in enumerate(candidates, start=1)
+                           if item.get("status", "pending") != "applied"]
+        if not pending_indexes:
+            raise ConflictError("这个会话的候选方案都已经启用过了")
+        if candidate_index:
+            index = int(candidate_index)
+            if index < 1 or index > len(candidates):
+                raise ConflictError(
+                    f"候选方案序号超出范围：当前会话共有 {len(candidates)} 个候选方案")
+        else:
+            index = pending_indexes[-1]
+        candidate = candidates[index - 1]
+        if candidate.get("status", "pending") == "applied":
+            raise ConflictError(f"第 {index} 个候选方案已经启用过了")
+        if not candidate.get("model"):
+            raise ConflictError(
+                f"第 {index} 个候选方案是旧会话记录，缺少完整模型数据，无法直接启用；"
+                "请重新提出优化需求，我会生成新的候选方案")
         active_version_id = self.store.session_active_version_id(session_id)
         previous = self.store.get_version(active_version_id) if active_version_id else None
         if previous is None:
             # 第一次应用 AI 改动前，先登记当前默认模型为基线，保证随时可以回滚
             baseline_id = self.store.create_version(
                 model=self._default_model(),
-                metrics=pending.get("base_metrics") or {},
+                metrics=candidate.get("base_metrics") or {},
                 status="baseline", parent_id=None, source="baseline",
                 summary="初始模型", session_id=session_id)
             previous = self.store.get_version(baseline_id)
+        proposal = candidate.get("proposal") or {}
         version_id = self.store.create_version(
-            model=pending["model"], metrics=pending["metrics"],
+            model=candidate["model"], metrics=candidate.get("metrics") or {},
             status="applied", parent_id=previous["id"] if previous else None,
-            source="ai_optimize", summary=pending["proposal"].get("summary", ""),
+            source="ai_optimize", summary=proposal.get("summary", ""),
             session_id=session_id)
         self.store.set_session_active_version(session_id, version_id)
         self.store.audit(
             "ai_apply", from_version=previous["id"] if previous else None,
             to_version=version_id, reason="user_approved_in_chat",
-            payload={"model_id": pending["model"].get("model_id"),
-                     "tuning": (pending.get("tuning") or {}).get("method", "")})
-        self._save_runtime(session_id, pending=None)
+            payload={"model_id": (candidate.get("model") or {}).get("model_id"),
+                     "tuning": (candidate.get("tuning") or {}).get("method", ""),
+                     "candidate_index": index})
+        updated = dict(candidate)
+        updated["status"] = "applied"
+        updated["applied_at"] = pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S")
+        candidates[index - 1] = updated
+        latest_pending = next(
+            (item for item in reversed(candidates)
+             if item.get("status", "pending") != "applied"), None)
+        self._save_runtime(session_id, candidates=candidates, pending=latest_pending)
         version_block = self._version_block(session_id)
         yield "ui", {"block": version_block}
-        metrics = pending.get("metrics") or {}
-        return [version_block], (f"已启用 {self._model_name_from_model(pending['model'])}；回测夏普 "
+        metrics = candidate.get("metrics") or {}
+        model_name = self._model_name_from_model(candidate.get("model"))
+        return [version_block], (f"已启用第 {index} 个候选方案：{model_name}；回测夏普 "
                     f"{float(metrics.get('sharpe', 0)):.2f}，之后当前会话的选股会用这个新模型"
                     "（新建对话将回到默认模型）。"), False
 
@@ -1327,6 +1371,166 @@ class AppService:
         version_block = self._version_block(session_id)
         yield "ui", {"block": version_block}
         return [version_block], f"已切回{self._model_name_from_model(model)}（仅当前会话生效）。", False
+
+    # ------------------------------------------------------------------
+    # 候选方案：同一会话可能先后产生多版方案，按出现顺序编号 1..N
+    # ------------------------------------------------------------------
+    def _candidates(self, session_id: str) -> list[dict[str, Any]]:
+        """读取会话候选方案；旧会话没有列表时从已持久化的卡片还原一次并落库。"""
+        runtime = self.store.get_state(session_id)
+        stored = runtime.get("candidates")
+        if isinstance(stored, list):
+            cleaned = [item for item in stored if isinstance(item, dict)]
+            if cleaned:
+                return cleaned
+        candidates = self._legacy_candidates(session_id)
+        if not candidates:
+            return []
+        self._save_runtime(session_id, candidates=candidates,
+                           pending=self._latest_pending(candidates))
+        return candidates
+
+    @staticmethod
+    def _latest_pending(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for item in reversed(candidates):
+            if item.get("status", "pending") != "applied":
+                return item
+        return None
+
+    def _has_pending_candidates(self, session_id: str) -> bool:
+        return self._latest_pending(self._candidates(session_id)) is not None
+
+    @staticmethod
+    def _candidate_public(candidate: dict[str, Any], index: int) -> dict[str, Any]:
+        """给 Planner 看的候选方案摘要：只给编号、名称、状态和关键指标。"""
+        proposal = candidate.get("proposal") or {}
+        model = candidate.get("model") or {}
+        metrics = candidate.get("metrics") or {}
+        return {
+            "index": index,
+            "name": str(model.get("name") or proposal.get("model_name") or "候选方案"),
+            "summary": str(proposal.get("summary") or ""),
+            "status": str(candidate.get("status") or "pending"),
+            "available": bool(model),
+            "created_at": str(candidate.get("created_at") or ""),
+            "metrics": {key: _json_safe(metrics.get(key))
+                        for key in ("cagr", "sharpe", "mdd")
+                        if metrics.get(key) is not None},
+        }
+
+    def _legacy_candidates(self, session_id: str) -> list[dict[str, Any]]:
+        """旧会话兼容：修复前只保存了最新 pending，历史候选在消息卡片里。
+
+        逐条扫描带审批卡的优化消息，尽量无损还原候选方案；代码方案缺少基底
+        权重无法还原，会标记为不可直接启用，用户重新发起优化即可。
+        """
+        candidates: list[dict[str, Any]] = []
+        for message in self.store.get_messages(session_id, limit=200):
+            if str(message.get("role")) != "assistant":
+                continue
+            blocks = message.get("blocks") or []
+            if not isinstance(blocks, list):
+                continue
+            work = next((block for block in blocks if isinstance(block, dict)
+                         and block.get("type") == "work"
+                         and isinstance(block.get("proposal"), dict)
+                         and block["proposal"].get("summary")), None)
+            approval = next((block for block in blocks if isinstance(block, dict)
+                             and block.get("type") == "approval"), None)
+            if work is None or approval is None:
+                continue
+            comparison = next((block for block in blocks if isinstance(block, dict)
+                               and block.get("type") == "comparison"), None)
+            candidate = self._legacy_candidate(
+                work, comparison or {}, str(message.get("created_at") or ""))
+            if candidate:
+                candidates.append(candidate)
+        runtime = self.store.get_state(session_id)
+        pending = runtime.get("pending")
+        if isinstance(pending, dict) and pending.get("model"):
+            if candidates:
+                merged = dict(pending)
+                merged.setdefault("created_at", candidates[-1].get("created_at", ""))
+                candidates[-1] = merged
+            else:
+                candidates.append(dict(pending))
+        active = self.store.session_active_version(session_id)
+        active_model = (active or {}).get("model") or {}
+        if active_model:
+            active_name = self._model_name_from_model(active_model)
+            for candidate in candidates:
+                model = candidate.get("model") or {}
+                if model and self._model_name_from_model(model) == active_name:
+                    candidate.setdefault("status", "applied")
+        return candidates
+
+    def _legacy_candidate(self, work: dict[str, Any], comparison_block: dict[str, Any],
+                          created_at: str) -> dict[str, Any] | None:
+        proposal = work.get("proposal") or {}
+        tuning = work.get("tuning") or {}
+        comparison = comparison_block.get("comparison") or {}
+        approach = str(proposal.get("approach") or "")
+        model_name = str(proposal.get("model_name") or "")
+        model = self._legacy_candidate_model(proposal, tuning)
+        public_proposal = {
+            "summary": str(proposal.get("summary") or ""),
+            "approach": approach,
+            "model_name": model_name,
+            "diff": str(proposal.get("diff") or ""),
+            "why": str(proposal.get("why") or ""),
+            "expected_effect": str(proposal.get("expected_effect") or ""),
+            "risks": list(proposal.get("risks") or []),
+        }
+        return {
+            "id": "pending-" + uuid.uuid4().hex[:8],
+            "proposal": public_proposal,
+            "model": model,
+            "metrics": _json_safe(comparison.get("candidate") or {}),
+            "base_metrics": _json_safe(comparison.get("current") or {}),
+            "tuning": tuning if isinstance(tuning, dict) else {},
+            "created_at": created_at,
+            "status": "pending",
+            "legacy": True,
+        }
+
+    @staticmethod
+    def _legacy_candidate_model(proposal: dict[str, Any],
+                                tuning: dict[str, Any]) -> dict[str, Any]:
+        """从旧卡片还原模型；无法无损还原时返回空 dict（标记不可直接启用）。"""
+        from .models import registry
+
+        approach = str(proposal.get("approach") or "")
+        model_name = str(proposal.get("model_name") or "")
+        best = tuning.get("best_params") if isinstance(tuning, dict) else {}
+        best = best if isinstance(best, dict) else {}
+        try:
+            if "自定义引擎" in approach:
+                # 旧代码方案只保存了源码/参数，基底权重未落库，无法无损还原
+                return {}
+            if "切换基础模型" in approach:
+                model_id = ""
+                for key, info in registry.MODEL_TYPES.items():
+                    if key in model_name or str(info.name) in model_name:
+                        model_id = key
+                        break
+                if not model_id:
+                    return {}
+                info = registry.get_model(model_id)
+                weights = dict(best) if best else dict(info["weights"])
+                return {"kind": "builtin", "model_id": model_id,
+                        "name": model_name or info["name"],
+                        "description": info.get("description", ""),
+                        "weights": normalize_weights(weights)}
+            if "因子权重" in approach or approach in ("网格寻优", "网格寻优权重"):
+                if not best:
+                    return {}
+                return {"kind": "builtin", "model_id": "ai_tuned_weights",
+                        "name": model_name or "网格寻优权重",
+                        "description": str(proposal.get("summary") or ""),
+                        "weights": normalize_weights(best)}
+        except (ValueError, TypeError):
+            return {}
+        return {}
 
     # ------------------------------------------------------------------
     # 状态与模型
@@ -1486,6 +1690,7 @@ class AppService:
 
     def _planner_state(self, session_id: str) -> dict[str, Any]:
         profile = self._profile(session_id)
+        candidates = self._candidates(session_id)
         runtime = self.store.get_state(session_id)
         model = self._session_active_model(session_id)
         active_version = self.store.session_active_version(session_id)
@@ -1508,6 +1713,8 @@ class AppService:
             "pending": ({"summary": (pending.get("proposal") or {}).get("summary", ""),
                          "tuning": pending.get("tuning") or {}}
                         if pending else None),
+            "pending_candidates": [self._candidate_public(item, index)
+                                    for index, item in enumerate(candidates, start=1)][-8:],
             "pending_intent": runtime.get("pending_intent"),
             "last_selection": ({"as_of": last.get("as_of"),
                                 "top": [item.get("code") for item in (last.get("top") or [])[:5]],
@@ -1548,14 +1755,19 @@ class AppService:
                 "versions": versions[-6:]}
 
     @staticmethod
-    def _pending_public(pending: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not pending:
+    def _pending_public(pending: dict[str, Any] | None,
+                        candidates: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+        waiting = [item for item in (candidates or [])
+                   if item.get("status", "pending") != "applied"]
+        if not pending and not waiting:
             return None
-        return {"summary": (pending.get("proposal") or {}).get("summary", ""),
-                "metrics": pending.get("metrics") or {},
-                "base_metrics": pending.get("base_metrics") or {},
-                "model_name": (pending.get("model") or {}).get("name", ""),
-                "tuning": pending.get("tuning") or {}}
+        latest = pending or waiting[-1]
+        return {"summary": (latest.get("proposal") or {}).get("summary", ""),
+                "metrics": latest.get("metrics") or {},
+                "base_metrics": latest.get("base_metrics") or {},
+                "model_name": (latest.get("model") or {}).get("name", ""),
+                "tuning": latest.get("tuning") or {},
+                "candidate_count": len(waiting)}
 
     # ------------------------------------------------------------------
     # 工具

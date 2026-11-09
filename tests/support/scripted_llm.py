@@ -180,7 +180,8 @@ class ScriptedLLM:
 
     @staticmethod
     def _agree(text: str) -> bool:
-        return any(word in text for word in ("同意", "启用", "应用", "换上", "就这样", "可以"))
+        return any(word in text for word in (
+            "同意", "启用", "应用", "换上", "就这样", "可以", "就按", "最新", "用这个"))
 
     @staticmethod
     def _wants_optimize(text: str) -> bool:
@@ -189,6 +190,18 @@ class ScriptedLLM:
     @staticmethod
     def _wants_rollback(text: str) -> bool:
         return any(word in text for word in ("回滚", "退回", "恢复上一个", "换回之前"))
+
+    @staticmethod
+    def _candidate_choice(text: str) -> int:
+        """测试替身：把“第一个/第二个/第 3 个”映射成候选方案编号。"""
+        for token, index in (
+                ("第一", 1), ("第 1", 1), ("第1", 1),
+                ("第二", 2), ("第 2", 2), ("第2", 2),
+                ("第三", 3), ("第 3", 3), ("第3", 3),
+                ("第四", 4), ("第 4", 4), ("第4", 4)):
+            if token in text:
+                return index
+        return 0
 
     @staticmethod
     def _is_question(text: str) -> bool:
@@ -249,7 +262,10 @@ class ScriptedLLM:
         slots.update(delta)
         complete = all(slots.get(key) for key in ("goal", "horizon", "drawdown_tolerance", "loss_reaction"))
         pending = state.get("pending")
+        candidates = state.get("pending_candidates")
+        candidates = candidates if isinstance(candidates, list) else []
         pending_intent = state.get("pending_intent")
+        choice = self._candidate_choice(message)
         analyze_intent = self._analyze_intent(message)
         actions: list[dict[str, Any]] = []
 
@@ -257,10 +273,13 @@ class ScriptedLLM:
             actions = [{"name": str(pending_intent), "args": {}}]
             reply = ("已记录您的补充信息。我将按此执行模型优化，分析与回测过程会逐步展示，"
                      "方案不会自动启用，需经您确认。")
+        elif candidates and choice:
+            actions = [{"name": "apply_pending_change", "args": {"candidate": int(choice)}}]
+            reply = f"收到。我将启用第 {choice} 个候选方案并切换模型版本，随后给出对比结果。"
         elif self._wants_rollback(message) and state.get("versions"):
             actions = [{"name": "rollback_version", "args": {}}]
             reply = "收到。我将为您切换回上一版本，随后提供当前生效的模型信息。"
-        elif pending and self._agree(message):
+        elif (pending or candidates) and self._agree(message):
             actions = [{"name": "apply_pending_change", "args": {}}]
             reply = "收到。我将应用该改进方案并切换模型版本，随后给出对比结果。"
         elif (self._wants_optimize(message)

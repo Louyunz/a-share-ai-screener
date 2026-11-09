@@ -66,6 +66,27 @@ class ActionSchemaTest(unittest.TestCase):
         with self.assertRaises(ToolArgsError):
             validate_tool_call("confirm_profile", {"force": True})
 
+    def test_apply_pending_change_args(self) -> None:
+        self.assertEqual(validate_tool_call("apply_pending_change", {}),
+                         {"candidate": 0})
+        self.assertEqual(validate_tool_call("apply_pending_change", {"candidate": 2}),
+                         {"candidate": 2})
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("apply_pending_change", {"candidate": -1})
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("apply_pending_change", {"candidate": 99})
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("apply_pending_change", {"candidate": "first"})
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("apply_pending_change", {"force": True})
+
+    def test_apply_pending_tool_schema_exposes_candidate(self) -> None:
+        apply_tool = next(item for item in TOOL_DEFINITIONS
+                          if item["function"]["name"] == "apply_pending_change")
+        properties = apply_tool["function"]["parameters"]["properties"]
+        self.assertIn("candidate", properties)
+        self.assertEqual(properties["candidate"].get("type"), "integer")
+
     def test_explain_results_args(self) -> None:
         args = validate_tool_call("explain_results", {"question": "为什么回撤大"})
         self.assertEqual(args["question"], "为什么回撤大")

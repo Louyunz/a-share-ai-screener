@@ -243,6 +243,37 @@ class AgentPlanTest(unittest.TestCase):
                                [], "同意，启用吧")
         self.assertIn("apply_pending_change", plan.action_names())
 
+    def test_candidate_choice_by_ordinal_selects_first(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        candidates = [
+            {"index": 1, "name": "低波质量（网格寻优）", "summary": "第一版",
+             "status": "pending", "available": True},
+            {"index": 2, "name": "AI 生成模型", "summary": "第二版",
+             "status": "pending", "available": True},
+        ]
+        state = _state(slots, confirmed=True,
+                       pending={"summary": "第二版"}, pending_candidates=candidates)
+        plan = self.agent.plan(state, [], "我觉得还是第一个好，用第一个")
+        action = plan.action("apply_pending_change")
+        self.assertIsNotNone(action)
+        self.assertEqual(action["args"]["candidate"], 1)
+        self.assertNotIn("rollback_version", plan.action_names())
+
+    def test_candidate_no_ordinal_uses_latest(self) -> None:
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        candidates = [
+            {"index": 1, "name": "第一版", "status": "pending", "available": True},
+            {"index": 2, "name": "第二版", "status": "pending", "available": True},
+        ]
+        state = _state(slots, confirmed=True,
+                       pending={"summary": "第二版"}, pending_candidates=candidates)
+        plan = self.agent.plan(state, [], "同意，启用这个改进")
+        action = plan.action("apply_pending_change")
+        self.assertIsNotNone(action)
+        self.assertEqual(int(action["args"].get("candidate") or 0), 0)
+
     def test_rollback(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
                  "loss_reaction": "会有点慌，但先不卖"}
@@ -263,6 +294,46 @@ class AgentPlanTest(unittest.TestCase):
         self.assertIn("不构成投资建议", text)
         self.assertIn("结论", text)
         self.assertIn("依据", text)
+
+    def test_state_invalid_rollback_action_is_dropped(self) -> None:
+        class _RollbackLLM:
+            def chat_tools(self, system, messages, tools, tool_choice="auto"):
+                return _tool_result("当前会话还没有启用过模型版本，暂时无法回滚。")
+
+            def chat_tools_stream(self, system, messages, tools, tool_choice="auto"):
+                call = ToolCall(id="call_1", name="rollback_version", arguments={})
+                yield from _stream_result(
+                    _tool_result("当前会话还没有启用过模型版本，暂时无法回滚。", calls=[call]))
+
+            def chat_text(self, system, messages):
+                return ""
+
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = Agent(_RollbackLLM()).plan(
+            _state(slots, confirmed=True, versions=[]), [], "回滚到上一个版本")
+        self.assertEqual(plan.actions, [])
+        self.assertIn("无法回滚", plan.reply)
+
+    def test_state_invalid_apply_action_is_dropped(self) -> None:
+        class _ApplyLLM:
+            def chat_tools(self, system, messages, tools, tool_choice="auto"):
+                return _tool_result("当前没有待确认的模型方案。")
+
+            def chat_tools_stream(self, system, messages, tools, tool_choice="auto"):
+                call = ToolCall(id="call_1", name="apply_pending_change", arguments={})
+                yield from _stream_result(
+                    _tool_result("当前没有待确认的模型方案。", calls=[call]))
+
+            def chat_text(self, system, messages):
+                return ""
+
+        slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
+                 "loss_reaction": "会有点慌，但先不卖"}
+        plan = Agent(_ApplyLLM()).plan(
+            _state(slots, confirmed=True), [], "同意，启用这个改进")
+        self.assertEqual(plan.actions, [])
+        self.assertIn("没有待确认", plan.reply)
 
 
 class ComplianceTest(unittest.TestCase):

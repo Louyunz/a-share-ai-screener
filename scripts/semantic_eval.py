@@ -25,6 +25,7 @@ from backend.schemas import profile_payload  # noqa: E402
 
 
 def _state(*, confirmed: bool = True, pending: dict[str, Any] | None = None,
+           pending_candidates: list[dict[str, Any]] | None = None,
            versions: list[dict[str, Any]] | None = None,
            last_selection: dict[str, Any] | None = None) -> dict[str, Any]:
     slots = {
@@ -42,6 +43,7 @@ def _state(*, confirmed: bool = True, pending: dict[str, Any] | None = None,
         "model_scope": "session",
         "versions": versions or [],
         "pending": pending,
+        "pending_candidates": pending_candidates or [],
         "pending_intent": None,
         "last_selection": last_selection,
     }
@@ -123,6 +125,47 @@ CASES: list[dict[str, Any]] = [
         "state": _state(versions=[
             {"id": "v1", "name": "旧模型", "status": "archived"},
             {"id": "v2", "name": "当前模型", "status": "active"},
+        ]),
+    },
+    {
+        "name": "多个候选方案中选第一个 → candidate=1",
+        "message": "我觉得还是第一个好，用第一个",
+        "check": lambda action, reply: (
+            action is not None
+            and action["name"] == "apply_pending_change"
+            and int(action["args"].get("candidate") or 0) == 1
+        ),
+        "state": _state(pending={"summary": "第二版方案"}, pending_candidates=[
+            {"index": 1, "name": "低波质量（网格寻优）", "summary": "第一版",
+             "status": "pending", "available": True, "metrics": {"sharpe": 0.69}},
+            {"index": 2, "name": "AI 生成模型", "summary": "第二版",
+             "status": "pending", "available": True, "metrics": {"sharpe": 0.73}},
+        ]),
+    },
+    {
+        "name": "同意启用（未指定编号）→ 默认最新候选",
+        "message": "同意，启用这个改进",
+        "check": lambda action, reply: (
+            action is not None
+            and action["name"] == "apply_pending_change"
+            and int(action["args"].get("candidate") or 0) == 0
+        ),
+        "state": _state(pending={"summary": "第二版方案"}, pending_candidates=[
+            {"index": 1, "name": "低波质量（网格寻优）", "summary": "第一版",
+             "status": "pending", "available": True},
+            {"index": 2, "name": "AI 生成模型", "summary": "第二版",
+             "status": "pending", "available": True},
+        ]),
+    },
+    {
+        "name": "没有已启用版本时不得回滚",
+        "message": "回滚到上一个版本",
+        "check": lambda action, reply: (
+            action is None or action["name"] != "rollback_version"
+        ),
+        "state": _state(pending_candidates=[
+            {"index": 1, "name": "低波质量（网格寻优）", "summary": "第一版",
+             "status": "pending", "available": True},
         ]),
     },
 ]

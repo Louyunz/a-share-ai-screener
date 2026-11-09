@@ -64,6 +64,20 @@ class ExplainResultsArgs(_StrictModel):
         return {"question": self.question.strip()[:500]}
 
 
+class ApplyPendingChangeArgs(_StrictModel):
+    """启用待审批的候选方案。
+
+    ``candidate`` 是候选方案编号（按方案出现顺序从 1 开始）；0 表示不指定，
+    默认启用最新的待审批方案。客户在一轮里生成了多个候选方案时，需要靠这个
+    参数区分“用第一个/第二个”，服务端不解析自然语言。
+    """
+
+    candidate: int = Field(default=0, ge=0, le=20)
+
+    def clean(self) -> dict[str, Any]:
+        return {"candidate": int(self.candidate)}
+
+
 class UpdateProfileArgs(_StrictModel):
     """客户本轮新提供的画像信息（工具调用，不再混在回复 JSON 里）。"""
 
@@ -117,7 +131,7 @@ _TOOL_MODELS: dict[str, type[BaseModel]] = {
     "run_selection": EmptyArgs,
     "explain_results": ExplainResultsArgs,
     "analyze_model": AnalyzeModelArgs,
-    "apply_pending_change": EmptyArgs,
+    "apply_pending_change": ApplyPendingChangeArgs,
     "rollback_version": EmptyArgs,
 }
 
@@ -135,7 +149,11 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
         "客户说继续优化/上一版未达预期时 escalate=true；普通优化 engine=auto。"
         "objective 取值来自客户本轮诉求，不确定留空。"
     ),
-    "apply_pending_change": "存在待审批模型方案且客户本轮明确同意启用时调用。",
+    "apply_pending_change": (
+        "存在待审批模型方案且客户本轮明确同意启用时调用。"
+        "客户指定第 N 个候选方案（如“用第一个/第二个方案”）时传 candidate=N"
+        "（按方案出现顺序从 1 开始）；未指定则留空，默认启用最新的待审批方案。"
+    ),
     "rollback_version": "客户明确要求回退到当前会话上一版模型时调用。",
 }
 
@@ -183,6 +201,8 @@ def validate_tool_call(name: str, arguments: Any) -> dict[str, Any]:
     if isinstance(model, AnalyzeModelArgs):
         return model.clean()
     if isinstance(model, ExplainResultsArgs):
+        return model.clean()
+    if isinstance(model, ApplyPendingChangeArgs):
         return model.clean()
     if isinstance(model, UpdateProfileArgs):
         return {"slots": dict(model.slots)}

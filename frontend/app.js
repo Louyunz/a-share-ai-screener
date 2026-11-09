@@ -1086,6 +1086,8 @@
   /* ---------------------------------------------------------- 审批卡 */
   function approvalCardHtml(block) {
     var actions = Array.isArray(block.actions) ? block.actions : [];
+    var candidate = Number(block.candidate) || 0;
+    var statusText = '等待确认' + (candidate ? ' · 方案 ' + candidate : '');
     var buttons = actions.map(function (action, index) {
       if (!action || !action.message) return '';
       return '<button class="btn ' + (index === 0 ? 'btn-primary' : 'btn-ghost') + '" type="button" data-action="quick" data-message="' + esc(action.message) + '">'
@@ -1097,7 +1099,7 @@
     return '<article class="card card-approval">'
       + '<header class="card-head">'
       + '<div class="card-title"><h3>' + esc(block.title || '需要用户确认') + '</h3></div>'
-      + '<span class="status-pill is-warn">等待确认</span></header>'
+      + '<span class="status-pill is-warn">' + esc(statusText) + '</span></header>'
       + '<div class="card-body">'
       + (block.summary ? '<p class="card-summary">' + esc(block.summary) + '</p>' : '')
       + riskHtml
@@ -1655,7 +1657,11 @@
       }).join('') + '</ul>';
     }
     if (state.pendingProposal) {
-      html += '<div class="wb-pending-box"><strong>有一个待确认的改进方案</strong><br>AI 会在聊天里等你确认，不会自动启用。'
+      var pendingCount = Number(state.pendingProposal.candidate_count) || 1;
+      var pendingTitle = pendingCount > 1
+        ? '有 ' + pendingCount + ' 个待确认的改进方案'
+        : '有一个待确认的改进方案';
+      html += '<div class="wb-pending-box"><strong>' + esc(pendingTitle) + '</strong><br>AI 会在聊天里等你确认，不会自动启用。'
         + '<br><button class="btn btn-sm" type="button" data-action="quick" data-message="展开说说待审批方案的细节">展开说说方案</button></div>';
     }
     dom.model.innerHTML = html;

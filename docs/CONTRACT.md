@@ -49,7 +49,7 @@
 | POST | `/api/sessions` | `{session_id}` |
 | POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
 | GET | `/api/sessions/{sid}/messages` | 文本 + 富卡片历史 `{messages:[{role,content,blocks,created_at}]}` |
-| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别 |
+| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别；`pending_proposal.candidate_count` 是待确认候选方案数量 |
 | GET | `/api/versions?session={sid}` | 版本列表；带 `session` 时只返回该会话版本链（`model_scope=session`），不带时返回全局归档 |
 
 不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
@@ -166,8 +166,10 @@ Planner 每轮输出：
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
 | `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | `engine=model_type` 时切换内置模型并使用其预设权重（不寻优）；其他 engine 执行调参方案 → 服务端网格寻优（实时 tuning 卡）→ 改动 diff → 回测 → work/tuning/approval 卡，**不自动启用** |
-| `apply_pending_change` | `{}` | 存在待审批方案且用户本轮明确同意 | 当前会话启用新模型版本，返回 version 卡 |
+| `apply_pending_change` | `{candidate?}` | 存在待审批候选方案且用户本轮明确同意/指定 | `candidate` 为候选方案编号（按出现顺序 1..N；缺省=最新待审批方案），当前会话启用该候选模型版本，返回 version 卡 |
 | `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
+
+**多候选方案**：同一会话可先后产生多个候选方案（每次 `analyze_model` 一个），服务端按出现顺序编号 1..N 并保存在 `session_state.candidates`；Planner 状态中 `pending_candidates` 给出 `index/name/summary/status/available`。客户说“用第一个/第二个/第三个方案”时通过 `apply_pending_change(candidate=N)` 指定；旧会话（升级前只存了最新 pending）会从已持久化的 work/comparison/approval 卡片中尽力还原候选列表，无法无损还原的旧代码方案标记为 `available=false`，引导客户重新优化。`rollback_version` 只适用于已启用过的版本链，与“在未启用候选之间做选择”是不同动作。
 
 **换模型与调参分离**：客户说“换其他模型/换个模型”但未点名时，AI 调用 `analyze_model(engine="model_type", model_type="", escalate=false)`；服务端选择与当前不同的内置模型，**直接使用预设权重回测**，不跑网格寻优。只有“继续优化/上一版未达预期”才 `escalate=true` 进入结构性升级或参数寻优。
 
@@ -178,7 +180,7 @@ Planner 每轮输出：
 - `escalate`: 客户说继续优化/上一版未达预期时为 true；服务端按上一版结构做升级（上一版权重→换基础模型；上一版模型/代码→写 code），禁止只调权重
 - `reason`: 一句话审计原因（不参与路由）
 
-**动作前置校验**：服务端校验“当前状态是否允许该动作”（apply 需要 pending、rollback 需要可回滚版本、选股需要已确认画像等）；不合法时不猜意图，而是把结构化错误回传 LLM，让它重新调用工具（最多一次）。仍不合法则返回明确错误。
+**动作前置校验**：服务端校验“当前状态是否允许该动作”（apply 需要存在待审批候选方案、rollback 需要可回滚版本、选股需要已确认画像等）；不合法时不猜意图，而是把结构化错误回传 LLM，让它重新调用工具（最多一次）。仍不合法则返回明确错误。
 
 **“更换数学模型”约定**：`数学模型/打分模型/引擎/公式` 指底层打分逻辑，必须 `engine=code`；不允许降级成切内置模型或只调权重，也不允许声称没有权限写代码。
 

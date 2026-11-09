@@ -214,20 +214,22 @@ class ChatFlowTest(unittest.TestCase):
         self.assertTrue((works[-1].get("code_change") or {}).get("diff"))
         self.assertTrue(_typed(events, "tuning"))
 
-        # 9) 没有 pending 时模型仍要求“同意启用”：不报错、不误执行，交给 LLM 重新规划
+        # 9) 只清除 pending 指针时仍有候选方案：同意应启用最新候选，不再报错
+        runtime = self.service.store.get_state(self.sid)
+        self.assertIsNotNone(runtime.get("pending"))
         self.service._save_runtime(self.sid, pending=None)
-        original_plan = self.service.agent.plan
-        try:
-            self.service.agent.plan = lambda state, history, message: Plan(
-                reply="已按您的确认启用模型改进方案：提高盈利质量。",
-                actions=[{"name": "apply_pending_change", "args": {}}],
-            )
-            events, text = self.chat("同意")
-        finally:
-            self.service.agent.plan = original_plan
+        events, text = self.chat("同意，启用这个改进")
         self.assertFalse([data for event, data in events if event == "error"])
-        # 动作与状态不一致时，服务端把错误回传 LLM 重新规划，不会误用旧方案
-        self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
+        self.assertTrue(self.service.store.session_active_version_id(self.sid))
+        self.assertIn("已启用", text)
+
+        # 10) 完全没有任何候选方案的会话：apply 动作会被前置校验拦截
+        empty_sid = self.service.create_session()["session_id"]
+        guard = Plan(reply="已按您的确认启用模型改进方案：提高盈利质量。",
+                     actions=[{"name": "apply_pending_change", "args": {}}])
+        errors = self.service._action_state_errors(empty_sid, guard)
+        self.assertTrue(errors)
+        self.assertIn("没有待审批", errors[0])
 
     # ------------------------------------------------------------------
     def test_code_preview_works_when_current_model_has_code(self) -> None:
@@ -343,6 +345,126 @@ class SessionModelScopeTest(unittest.TestCase):
         self.assertEqual(model["name"], "均衡多因子")
         # 回滚后也没有可继续回滚的版本
         self.assertFalse(self.service._can_rollback(first))
+
+
+class PendingCandidateSelectionTest(unittest.TestCase):
+    """多候选方案：客户可以指定“用第一个/最新的”，不会被误判为回滚。"""
+
+    def setUp(self) -> None:
+        self.dir = workdir("candidate_choice")
+        save_bundle(generate_bundle(n_stocks=20, n_days=300, seed=9), self.dir / "a_share")
+        self.service = AppService(data_dir=self.dir / "a_share", db_path=self.dir / "app.db",
+                                  llm=ScriptedLLM())
+        self.sid = self.service.create_session()["session_id"]
+        self.service.store.save_profile(self.sid, PROFILE_SLOTS,
+                                        profile_summary(PROFILE_SLOTS), True)
+
+    def tearDown(self) -> None:
+        self.service.close()
+        cleanup(self.dir)
+
+    def _chat(self, message: str) -> list[tuple[str, dict]]:
+        events = list(self.service.chat_stream(self.sid, message))
+        self.assertFalse([data for event, data in events if event == "error"], events)
+        return events
+
+    def _candidates(self) -> list[dict]:
+        return self.service._planner_state(self.sid)["pending_candidates"]
+
+    def test_choose_first_candidate_after_multiple_optimizations(self) -> None:
+        self._chat("帮我优化一下模型")
+        self._chat("继续优化模型，上一版未达到我的预期")
+        self._chat("继续优化模型，上一版未达到我的预期")
+        candidates = self._candidates()
+        self.assertEqual([item["index"] for item in candidates], [1, 2, 3])
+        self.assertTrue(candidates[0]["name"])
+        first_name = candidates[0]["name"]
+
+        events = self._chat("我觉得还是第一个好，用第一个")
+        versions = _typed(events, "version")
+        self.assertTrue(versions)
+        self.assertEqual(self.service._session_active_model(self.sid)["name"], first_name)
+        runtime = self.service.store.get_state(self.sid)
+        self.assertEqual(runtime["candidates"][0]["status"], "applied")
+        self.assertTrue(self.service.store.session_active_version_id(self.sid))
+        # 剩余候选方案仍可继续选择
+        remaining = [item for item in runtime["candidates"]
+                     if item.get("status", "pending") != "applied"]
+        self.assertEqual(len(remaining), 2)
+
+    def test_agree_uses_latest_candidate_by_default(self) -> None:
+        self._chat("帮我优化一下模型")
+        self._chat("继续优化模型，上一版未达到我的预期")
+        latest_name = self._candidates()[-1]["name"]
+        self._chat("就按最新这个来")
+        self.assertEqual(self.service._session_active_model(self.sid)["name"], latest_name)
+
+    def test_invalid_candidate_index_is_reported_and_reply_persisted(self) -> None:
+        self._chat("帮我优化一下模型")
+        original = self.service.agent.stream_plan
+
+        def fake_stream(state, history, message):
+            yield "token", {"text": "收到。"}
+            yield "plan", Plan(
+                reply="收到，正在启用您指定的候选方案。",
+                actions=[{"name": "apply_pending_change", "args": {"candidate": 9}}])
+
+        self.service.agent.stream_plan = fake_stream
+        try:
+            events = list(self.service.chat_stream(self.sid, "用第九个方案"))
+        finally:
+            self.service.agent.stream_plan = original
+        errors = [data for event, data in events if event == "error"]
+        self.assertTrue(errors)
+        self.assertIn("候选方案序号超出范围", errors[0]["message"])
+        messages = self.service.messages(self.sid)["messages"]
+        self.assertTrue(any(message.get("role") == "assistant"
+                            and "正在启用您指定的候选方案" in (message.get("content") or "")
+                            for message in messages),
+                        "动作失败时也要持久化助手回复，不能只留下用户消息")
+
+    def test_state_invalid_action_keeps_assistant_reply(self) -> None:
+        sid = self.service.create_session()["session_id"]
+        original = self.service.agent.stream_plan
+
+        def fake_stream(state, history, message):
+            yield "token", {"text": "当前会话还没有可回滚的模型版本。"}
+            yield "plan", Plan(
+                reply="当前会话还没有可回滚的模型版本。",
+                actions=[{"name": "rollback_version", "args": {}}])
+
+        self.service.agent.stream_plan = fake_stream
+        try:
+            events = list(self.service.chat_stream(sid, "回滚到上一个版本"))
+        finally:
+            self.service.agent.stream_plan = original
+        self.assertTrue([data for event, data in events if event == "error"])
+        messages = self.service.messages(sid)["messages"]
+        self.assertTrue(any(message.get("role") == "assistant"
+                            and "可回滚" in (message.get("content") or "")
+                            for message in messages),
+                        "状态校验失败时也要持久化助手回复")
+
+    def test_legacy_session_backfills_candidates_from_stored_cards(self) -> None:
+        self._chat("换成低波质量")
+        self._chat("继续优化模型，上一版未达到我的预期")
+        # 模拟修复前的数据：只有最新 pending，没有 candidates 列表
+        runtime = self.service.store.get_state(self.sid)
+        self.service.store.save_state(self.sid, {
+            "pending": runtime["pending"],
+            "last_selection": runtime.get("last_selection"),
+        })
+        candidates = self._candidates()
+        self.assertEqual([item["index"] for item in candidates], [1, 2])
+        self.assertTrue(candidates[0]["available"],
+                        "旧卡片里的内置模型方案应能从 best_params 无损还原")
+        self.assertEqual(candidates[0]["status"], "pending")
+        # 还原结果应落库，后续读取不再重复扫描
+        persisted = self.service.store.get_state(self.sid).get("candidates")
+        self.assertEqual(len(persisted), 2)
+        first_name = candidates[0]["name"]
+        self._chat("我觉得还是第一个好，用第一个")
+        self.assertEqual(self.service._session_active_model(self.sid)["name"], first_name)
 
 
 class WeightTuningTest(unittest.TestCase):
