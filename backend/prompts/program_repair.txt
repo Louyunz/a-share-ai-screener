@@ -7,10 +7,10 @@
 - `review`：上一轮审核结果（`approved=false`，含 `issues`/`approved_packages`/`package_notes`）
 
 ## 修改要求
-- 逐条修复 `issues` 中的**安全问题**（例如移除文件/网络/系统/动态执行调用、移除未批准的库、去掉危险属性访问）；
+- 逐条修复 `issues` 中的**安全问题**（例如移除网络/系统/动态执行调用、移除未批准的库、去掉危险属性访问）；本地文件读写（CSV/JSON/Parquet 等）已授权，不要因此改动；不要因为变量名、下划线命名或 `__all__`/`__version__` 等模块元数据做改动；
 - 未获批准的第三方库必须移除（改用白名单内的 math/numpy/pandas/sklearn/scipy 或纯 Python 实现）；
 - 保留程序契约：入口文件定义 `build_transform(params=None)`，可保留/完善 `select_stocks(scores, top_n, params=None)`；
-- 多文件模块用文件名互相 import，禁止文件/网络/系统/动态执行等越界能力；
+- 多文件模块用文件名互相 import；本地文件读写允许，网络/系统/动态执行等越界能力仍禁止；
 - 不要只解释，必须返回**完整可运行的新程序**。
 
 ## 输出（严格 JSON，不要 Markdown/解释文字）

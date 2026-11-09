@@ -77,8 +77,8 @@ MAX_PENDING_CANDIDATES = int(os.environ.get("MAX_PENDING_CANDIDATES", "100"))
 PROGRAM_CONTEXT_DAYS = int(os.environ.get("AI_PROGRAM_CONTEXT_DAYS", "0"))
 # 程序单次寻优的默认预算（AI 可通过 max_trials 覆盖；服务端最终上限由 tuning 控制）
 PROGRAM_DEFAULT_MAX_TRIALS = int(os.environ.get("AI_PROGRAM_DEFAULT_TRIALS", "64"))
-# ReAct 思考预算：off 保持单步；low/medium/high 限制每轮自主工具步数
-THINKING_BUDGET_STEPS = {"low": 3, "medium": 6, "high": 10}
+# ReAct 思考预算：所有请求都走同一 ReAct 循环；off=1 步，其余限制最大自主步数
+THINKING_BUDGET_STEPS = {"off": 1, "low": 3, "medium": 6, "high": 10}
 
 
 class ServiceError(RuntimeError):
@@ -256,139 +256,13 @@ class AppService:
     def chat_stream(self, session_id: str, content: str,
                     owner_id: int | None = None,
                     thinking_budget: str = "off") -> Iterator[tuple[str, dict[str, Any]]]:
+        """所有请求统一走多步 ReAct 循环（旧单步工作流已删除）。"""
         self._require_session(session_id, owner_id)
         content = (content or "").strip()
         if not content:
             raise ValidationError("说点什么吧")
-        react_budget = self._normalize_thinking_budget(thinking_budget)
-        if react_budget != "off":
-            yield from self._chat_stream_react(session_id, content, react_budget)
-            return
-        self.store.add_message(session_id, "user", content)
-        history = self.store.get_messages(session_id)
-        public_state = self._planner_state(session_id)
-
-        plan = None
-        program_preview_id = ""
-        program_preview_change: dict[str, Any] | None = None
-        try:
-            for kind, payload in self.agent.stream_plan(public_state, history[:-1], content):
-                if kind == "token":
-                    yield "token", {"text": payload}
-                elif kind == "program":
-                    # AI 正在生成模型程序：统一走「AI 正在优化模型」work 卡片实时展示
-                    block = self._program_preview_block(payload)
-                    if block:
-                        program_preview_id = block["id"]
-                        program_preview_change = block.get("code_change")
-                        yield "ui", {"block": block}
-                elif kind == "plan":
-                    plan = payload
-        except (ServiceError, AgentError, ValidationError) as exc:
-            logger.warning("chat plan error session=%s: %s", session_id, exc)
-            yield "error", {"message": str(exc), "retryable": True}
-            yield "done", {"message_id": uuid.uuid4().hex[:8]}
-            return
-        if plan is None:
-            logger.warning("chat plan empty session=%s", session_id)
-            yield "error", {"message": "AI 没有返回规划结果", "retryable": True}
-            yield "done", {"message_id": uuid.uuid4().hex[:8]}
-            return
-
-        # 同一待执行动作最多澄清一次：客户已回答后直接执行，避免无限追问
-        pending_intent = public_state.get("pending_intent")
-        if pending_intent and plan.deferred_intent:
-            plan.actions = [{"name": str(pending_intent), "args": {}}]
-            plan.deferred_intent = ""
-        if program_preview_id:
-            # 让真正执行程序的动作复用实时卡片的 id，整轮只出现一张「AI 正在优化模型」卡
-            for action in plan.actions:
-                if action.get("name") == "write_model_program":
-                    args = action.get("args")
-                    if not isinstance(args, dict):
-                        args = {}
-                        action["args"] = args
-                    args["_preview_id"] = program_preview_id
-                    if program_preview_change:
-                        args["_preview_change"] = program_preview_change
-
-        # 动作前置校验：只校验“当前状态是否允许执行该动作”，不做语义判断。
-        state_errors = self._action_state_errors(session_id, plan)
-        if state_errors:
-            # 保留 LLM 已流式展示的回复，避免用户消息孤零零留在历史里
-            self._remember_assistant(session_id, plan.reply, [])
-            logger.warning("chat state mismatch session=%s: %s", session_id, state_errors)
-            yield "error", {"message": "AI 的动作与当前会话状态不一致："
-                                      + "；".join(state_errors), "retryable": False}
-            yield "done", {"message_id": uuid.uuid4().hex[:8]}
-            return
-
-        # 澄清与执行分离：提问轮只记录待执行意图与客户原始诉求，等客户回答后再执行
-        runtime_before = self.store.get_state(session_id)
-        deferred_request = str(runtime_before.get("deferred_request") or "")
-        request_text = content
-        if plan.deferred_intent:
-            self._save_runtime(session_id, pending_intent=plan.deferred_intent,
-                               deferred_request=content)
-        elif plan.actions:
-            if deferred_request:
-                request_text = deferred_request + "；" + content
-            self._save_runtime(session_id, pending_intent=None, deferred_request=None)
-
-        saved_blocks: dict[str, dict[str, Any]] = {}
-
-        # 1) 更新画像（由 update_profile 工具携带），卡片在回复流之后补上
-        profile = self._profile(session_id)
-        slots = profile["slots"] if profile else {}
-        confirmed = profile["confirmed"] if profile else False
-        if plan.profile_delta:
-            merged = merge_slots(slots, plan.profile_delta)
-            if merged != slots:
-                slots = merged
-                self.store.save_profile(session_id, slots, profile_summary(slots), confirmed)
-                # 画像卡只在信息齐全、进入最终确认时出现；逐题作答不弹卡。
-                if (profile_complete(slots) and not confirmed
-                        and not plan.has_action("confirm_profile")):
-                    profile_block = self._profile_block(session_id)
-                    saved_blocks[profile_block["id"]] = profile_block
-                    yield "ui", {"block": profile_block}
-
-        # 2) 执行工具调用，并把服务端动作结果作为备注追加
-        notes: list[str] = []
-        narration: list[str] = []
-        try:
-            for action in plan.actions:
-                relay = self._relay_action(
-                    self._run_action(session_id, action, request_text), narration)
-                events, note, should_stop = yield from relay
-                for block in events or []:
-                    if isinstance(block, dict) and block.get("id"):
-                        saved_blocks[str(block["id"])] = block
-                if note:
-                    notes.append(note)
-                    yield "token", {"text": "\n\n"}
-                    for piece in chunk_text(note):
-                        yield "token", {"text": piece}
-                if should_stop:
-                    break
-        except (ServiceError, AgentError, ValidationError) as exc:
-            self._remember_assistant(session_id, plan.reply, notes,
-                                     list(saved_blocks.values()), "".join(narration))
-            logger.warning("chat action error session=%s: %s", session_id, exc)
-            yield "error", {"message": str(exc), "retryable": False}
-            yield "done", {"message_id": uuid.uuid4().hex[:8]}
-            return
-        except Exception as exc:  # noqa: BLE001
-            self._remember_assistant(session_id, plan.reply, notes,
-                                     list(saved_blocks.values()), "".join(narration))
-            logger.exception("chat action crash session=%s", session_id)
-            yield "error", {"message": f"处理这句时出了点问题：{exc}", "retryable": True}
-            yield "done", {"message_id": uuid.uuid4().hex[:8]}
-            return
-
-        self._remember_assistant(session_id, plan.reply, notes,
-                                 list(saved_blocks.values()), "".join(narration))
-        yield "done", {"message_id": uuid.uuid4().hex[:8]}
+        budget = self._normalize_thinking_budget(thinking_budget)
+        yield from self._chat_stream_react(session_id, content, budget)
 
     @staticmethod
     def _normalize_thinking_budget(value: Any) -> str:
@@ -439,6 +313,7 @@ class AppService:
         narration: list[str] = []
         reply_parts: list[str] = []
         observations: list[str] = []
+        plan_replies: list[str] = []
         saved_blocks: dict[str, dict[str, Any]] = {}
         state: dict[str, Any] = {}
         last_had_actions = False
@@ -470,8 +345,11 @@ class AppService:
                 for kind, payload in self.agent.stream_plan(
                         state, plan_history, loop_message, emit_thinking=True):
                     if kind == "token":
-                        reply_parts.append(payload)
-                        yield "token", {"text": payload}
+                        text = (payload if isinstance(payload, str)
+                                else str((payload or {}).get("text") or ""))
+                        if text:
+                            reply_parts.append(text)
+                            yield "token", {"text": text}
                     elif kind == "thinking":
                         text = str((payload or {}).get("text") or "") if isinstance(payload, dict) else str(payload or "")
                         if text:
@@ -497,6 +375,8 @@ class AppService:
                 yield "error", {"message": "AI 没有返回规划结果", "retryable": True}
                 yield "done", {"message_id": uuid.uuid4().hex[:8]}
                 return
+            if plan.reply:
+                plan_replies.append(str(plan.reply))
 
             # 自主循环只允许继续做分析/建模类动作；审批、回滚、画像确认必须来自用户本轮明确指令
             if step > 1:
@@ -564,6 +444,7 @@ class AppService:
             should_stop = False
             if plan.actions:
                 fresh_actions = []
+                step_signatures: list[str] = []
                 for action in plan.actions:
                     try:
                         signature = json.dumps(
@@ -574,6 +455,7 @@ class AppService:
                     if signature in executed_signatures:
                         continue
                     executed_signatures.add(signature)
+                    step_signatures.append(signature)
                     fresh_actions.append(action)
                 if not fresh_actions:
                     # 模型重复调用同一动作：停止循环并生成最终答复，避免死循环
@@ -581,6 +463,7 @@ class AppService:
                     break
                 plan.actions = fresh_actions
                 last_had_actions = True
+                action_error = ""
                 try:
                     for action in plan.actions:
                         relay = self._relay_action(
@@ -599,19 +482,31 @@ class AppService:
                         if should_stop:
                             break
                 except (ServiceError, AgentError, ValidationError) as exc:
-                    persist_partial()
-                    logger.warning("react action error session=%s step=%s: %s",
+                    action_error = str(exc)
+                    logger.warning("react action recoverable error session=%s step=%s: %s",
                                    session_id, step, exc)
-                    yield "error", {"message": str(exc), "retryable": False}
-                    yield "done", {"message_id": uuid.uuid4().hex[:8]}
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    persist_partial()
+                except Exception as exc:  # noqa: BLE001 - 交给 ReAct 观察，不直接抛给客户
+                    action_error = f"{type(exc).__name__}: {exc}"
                     logger.exception("react action crash session=%s step=%s", session_id, step)
-                    yield "error", {"message": f"处理这句时出了点问题：{exc}",
-                                    "retryable": True}
-                    yield "done", {"message_id": uuid.uuid4().hex[:8]}
-                    return
+                if action_error:
+                    # 失败的调用不应占用“防重复”签名：允许 AI 修正参数后重新调用
+                    for signature in step_signatures:
+                        executed_signatures.discard(signature)
+                    failure = (f"第 {step} 步工具执行失败：{action_error}。"
+                               "请分析错误、修改参数/程序后重新调用工具；"
+                               "不要向客户输出技术错误。")
+                    observations.append(failure)
+                    if step >= max_steps:
+                        need_final = True
+                        break
+                    plan_history = plan_history + (
+                        [{"role": "user", "content": content}] if step == 1 else []
+                    ) + [{"role": "assistant", "content": plan.reply or ""}]
+                    loop_message = (
+                        "【工具执行失败观察】\n" + failure
+                        + "\n请修正后重新调用工具；若判断无法完成，直接用 content 向客户说明，"
+                          "不要复述内部错误。")
+                    continue
                 observations.append(self._observation_text(step, plan, step_blocks, notes))
                 if should_stop:
                     break
@@ -625,7 +520,7 @@ class AppService:
                 continue
             break
 
-        if (last_had_actions and step >= max_steps) or need_final:
+        if max_steps > 1 and ((last_had_actions and step >= max_steps) or need_final):
             try:
                 for kind, payload in self.agent.stream_final(
                         state, plan_history, loop_message, observations):
@@ -636,6 +531,9 @@ class AppService:
                 yield "thinking", {"text": f"收尾说明：{exc}", "step": step}
 
         text = "".join(reply_parts).strip()
+        missing = [reply for reply in plan_replies if reply and reply not in text]
+        if missing:
+            text = (text + "\n\n" + "\n\n".join(missing)).strip()
         if text or notes or saved_blocks:
             self._remember_assistant(session_id, text, notes,
                                      list(saved_blocks.values()), "".join(narration))
@@ -1569,7 +1467,9 @@ class AppService:
         max_trials = args.get("max_trials")
         program_config = self._normalize_program_config(args.get("config"))
 
-        # 1) 基础结构与参数空间校验（不执行代码）
+        # 1) 基础结构与参数空间校验（不执行代码）。
+        # 不在这里做“服务端本地自动修复”：交给外层 ReAct 循环把错误作为观察回传模型，
+        # 由同一个 Agent 决定如何修改并重新调用工具。
         try:
             requested_roots = custom.package_import_roots(packages)
             custom.validate_program(files, entry, extra_roots=requested_roots)

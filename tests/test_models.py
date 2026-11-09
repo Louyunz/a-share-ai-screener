@@ -322,24 +322,30 @@ def build_transform():
         )
         np.testing.assert_allclose(values, expected.to_numpy(dtype=float), rtol=1e-12)
 
-    def test_import_os_rejected(self) -> None:
-        code = "import os\n\n\ndef build_transform():\n    return None\n"
-        with self.assertRaises(ModelCodeError) as ctx:
-            validate_code(code)
-        self.assertEqual(ctx.exception.checks[-1]["name"], "imports")
-        self.assertIn("os", str(ctx.exception))
-
-    def test_open_rejected(self) -> None:
+    def test_import_os_allowed(self) -> None:
         code = (
+            "import os\n"
+            "\n"
             "def build_transform():\n"
             "    def transform(z, weights):\n"
-            "        return open('secret.txt')\n"
+            "        return z.iloc[:, 0]\n"
             "    return transform\n"
         )
-        with self.assertRaises(ModelCodeError) as ctx:
-            validate_code(code)
-        self.assertEqual(ctx.exception.checks[-1]["name"], "ast_safety")
-        self.assertIn("open", str(ctx.exception))
+        result = validate_code(code)
+        self.assertTrue(result)
+
+    def test_open_and_file_io_allowed(self) -> None:
+        code = (
+            "def helper():\n"
+            "    return open('data.csv')\n"
+            "\n"
+            "def build_transform():\n"
+            "    def transform(z, weights):\n"
+            "        return z.iloc[:, 0]\n"
+            "    return transform\n"
+        )
+        result = validate_code(code)
+        self.assertTrue(result)
 
     def test_eval_rejected(self) -> None:
         code = (

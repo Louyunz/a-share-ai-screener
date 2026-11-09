@@ -70,7 +70,7 @@ class ProgramValidationTest(unittest.TestCase):
     def test_forbidden_import_rejected(self) -> None:
         with self.assertRaises(custom.ModelCodeError):
             custom.validate_program(
-                {"main.py": "import os\n\ndef build_transform():\n    return None\n"})
+                {"main.py": "import socket\n\ndef build_transform():\n    return None\n"})
         with self.assertRaises(custom.ModelCodeError):
             custom.validate_program(
                 {"main.py": (
@@ -490,6 +490,20 @@ class ProgramValidationTest(unittest.TestCase):
             with self.subTest(source=source.splitlines()[-2]):
                 with self.assertRaises(custom.ModelCodeError):
                     custom.validate_program({"main.py": source}, "main.py")
+
+    def test_module_dunder_metadata_is_allowed(self) -> None:
+        """__all__/__version__ 等模块元数据不应再被 AST 当成危险变量名拦截。"""
+        files = {
+            "main.py": (
+                "__all__ = ['build_transform']\n"
+                "__version__ = '1.0'\n"
+                "\n"
+                "def build_transform():\n"
+                "    return lambda z, weights: z.iloc[:, 0]\n"
+            ),
+        }
+        result = custom.validate_program(files, "main.py")
+        self.assertTrue(result)
 
     def test_private_attr_on_other_object_rejected(self) -> None:
         files = {"main.py": (

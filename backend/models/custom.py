@@ -6,8 +6,8 @@
 
 1. 规模与语法：源码不超过 ``MAX_SOURCE_CHARS``（默认 60000，环境变量
    ``AI_MAX_SOURCE_CHARS`` 可配），且能被 ``ast.parse`` 解析；
-2. AST 白名单：只允许纯计算模块（``math`` / ``numpy`` / ``pandas`` / ``sklearn`` /
-   ``scipy`` 与安全的 stdlib）导入，禁止文件、网络、系统调用与动态执行；允许类、
+2. AST 白名单：允许纯计算模块与本地文件读写模块（``os``/``pathlib``/``csv``/``io``/
+   ``tempfile`` 等），禁止网络、系统命令/子进程与动态执行；允许类、
    ``@staticmethod`` / ``@classmethod`` / ``@property``、生成器与 self/cls 私有属性，
    但禁止 ``__class__`` 等危险 dunder；顶层只允许 import、函数/类定义与常量赋值；
 3. 子进程冒烟：在临时目录、独立 Python 子进程中把 10 列 ``z_*`` 与权重喂给
@@ -97,7 +97,7 @@ SMOKE_TIMEOUT_SECONDS = 10
 _SMOKE_ROWS = 8
 _SMOKE_SEED = 20240601
 
-# 允许导入的模块根名（只放纯计算模块；文件/网络/系统/动态执行一律不在此列）
+# 允许导入的模块根名（AI 可完全读写本地/CSV 文件；网络/系统执行/动态执行仍受限）
 ALLOWED_IMPORT_ROOTS = (
     "math", "numpy", "pandas", "sklearn", "scipy",
     # 纯计算 stdlib：AI 编写程序/模型代码时可自由使用
@@ -105,6 +105,8 @@ ALLOWED_IMPORT_ROOTS = (
     "re", "random", "datetime", "typing", "decimal", "fractions", "operator",
     "json", "dataclasses", "enum", "abc", "copy", "heapq", "bisect",
     "string", "textwrap", "types",
+    # 文件读写（CSV/JSON/Parquet 等）：按产品要求完全放开本地文件访问
+    "os", "pathlib", "csv", "io", "tempfile", "shutil", "glob",
 )
 
 # AI 程序（write_model_program）的上限：多文件、多级包、更长源码（环境变量可配）
@@ -171,6 +173,8 @@ SAFE_BUILTIN_NAMES = frozenset(
         "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min", "next",
         "oct", "ord", "pow", "range", "repr", "reversed", "round", "set", "slice",
         "sorted", "str", "sum", "tuple", "zip",
+        # 文件读写放开：open/print 是正常程序能力
+        "open", "print",
         # 类/装饰器/生成器等写法需要的内建
         "super", "object", "property", "staticmethod", "classmethod", "NotImplemented",
         "__build_class__",
@@ -180,46 +184,39 @@ SAFE_BUILTIN_NAMES = frozenset(
     }
 )
 
-# 禁止出现的名字：文件/网络/系统/动态执行相关
+# 禁止出现的名字：只保留系统/网络/动态执行相关；本地文件读写已放开
 FORBIDDEN_NAMES = frozenset(
     {
-        "open", "exec", "eval", "compile", "__import__", "input", "breakpoint",
+        "exec", "eval", "compile", "__import__", "breakpoint",
         "globals", "locals", "vars", "dir", "getattr", "setattr", "delattr", "hasattr",
-        "os", "sys", "subprocess", "importlib", "pathlib", "shutil", "socket", "urllib",
-        "requests", "ctypes", "builtins", "io", "tempfile", "threading", "multiprocessing",
+        "subprocess", "sys", "importlib", "socket", "urllib",
+        "requests", "ctypes", "builtins", "threading", "multiprocessing",
         "signal", "pickle", "marshal", "shelve", "sqlite3", "http", "ftplib", "runpy",
-        "code", "codeop", "gc", "inspect", "dis", "tokenize", "zipfile", "tarfile",
-        "gzip", "bz2", "lzma", "logging", "platform", "resource", "pty", "webbrowser",
+        "codeop", "gc", "inspect", "dis", "tokenize",
+        "platform", "resource", "pty", "webbrowser",
     }
 )
 
-# 禁止访问/调用的属性：落盘、网络、系统、动态执行
+# 仅拦截可能用于逃逸的 dunder 名称；__all__ / __version__ 等模块元数据不扣变量名。
+DANGEROUS_DUNDER_NAMES = frozenset(
+    {
+        "__import__", "__builtins__", "__class__", "__bases__", "__subclasses__",
+        "__mro__", "__globals__", "__code__", "__closure__", "__dict__",
+        "__loader__", "__spec__", "__file__", "__path__", "__package__",
+        "__getattribute__", "__getattr__", "__setattr__", "__delattr__",
+    }
+)
+
+# 禁止访问/调用的属性：仅保留系统/网络/动态执行相关；本地文件读写已放开
 FORBIDDEN_ATTRS = frozenset(
     {
         "system", "popen", "spawn", "spawnl", "spawnv", "fork", "exec", "execl",
-        "execv", "execve", "kill", "open", "remove", "unlink", "rmdir", "mkdir",
-        "makedirs", "chmod", "chown", "write", "writelines", "read", "readline",
-        "readlines", "load", "dump", "save", "savez",
-        "savez_compressed", "environ",
-        # 数组/第三方库的文件 IO 与动态库加载（open/read_csv 之外的常见绕过）
-        "fromfile", "tofile", "memmap", "open_memmap", "genfromtxt", "loadtxt",
-        "savetxt", "load_npz", "save_npz", "fromregex", "load_library",
-        "ctypeslib", "f2py", "datasets", "externals",
-        "loadmat", "savemat", "mmread", "mmwrite", "whosmat", "loadarff",
-        "readsav", "imread", "imsave", "netcdf_file", "netcdf_variable",
-        "exec_command", "distutils",
-        "to_csv", "to_excel", "to_json", "to_parquet", "to_pickle", "to_sql",
-        "to_html", "to_clipboard", "to_feather", "to_hdf", "to_stata", "to_markdown",
-        "to_latex", "to_xml", "to_orc",
-        "read_csv", "read_excel", "read_json", "read_parquet", "read_pickle",
-        "read_sql", "read_table", "read_html", "read_clipboard", "read_feather",
-        "read_hdf", "read_stata", "read_xml", "read_fwf", "read_sas", "read_spss",
-        "read_orc",
+        "execv", "execve", "kill",
         "import_module", "load_module", "spec_from_file_location", "exec_module",
         "urlopen", "urlretrieve", "socket", "connect", "send", "sendall", "recv",
-        "os", "sys", "subprocess", "importlib", "pathlib", "shutil", "ctypes",
-        "builtins", "pickle", "marshal", "tempfile", "threading", "multiprocessing",
-        "signal", "io",
+        "os", "sys", "subprocess", "importlib", "ctypes",
+        "builtins", "pickle", "marshal", "threading", "multiprocessing",
+        "signal",
         # types 的动态构造能力（CodeType/FunctionType 可绕过受限执行）；types 本身仍可用于
         # SimpleNamespace/MappingProxyType 等安全工具。
         "CodeType", "FunctionType", "LambdaType", "new_class", "prepare_class",
@@ -609,14 +606,14 @@ def _check_ast_safety(tree: ast.Module) -> None:
       ``self`` / ``cls`` / ``super()``；
     - 允许生成器（``yield`` / ``yield from``），仍禁止 async。
 
-    保留：危险导入/调用/属性/名称拦截（文件、网络、系统、动态执行）、
+    保留：网络/系统命令/动态执行相关导入、调用与属性拦截；
     ``__class__`` 等危险 dunder、``global`` / ``nonlocal``。
     """
     defined_functions = _collect_defined_functions(tree)
     bound_names = _collect_bound_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
-            if node.id.startswith("__"):
+            if node.id in DANGEROUS_DUNDER_NAMES:
                 raise _RuleViolation(
                     "ast_safety", f"第 {node.lineno} 行禁止使用名称 {node.id}"
                 )

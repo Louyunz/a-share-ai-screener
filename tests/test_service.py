@@ -457,35 +457,42 @@ class PendingCandidateSelectionTest(unittest.TestCase):
         with self.assertRaises(NotFoundError):
             self.service.activate_version(self.sid, other_version)
 
-    def test_invalid_candidate_index_is_reported_and_reply_persisted(self) -> None:
+    def test_invalid_candidate_index_is_fed_back_and_reply_persisted(self) -> None:
         self._chat("帮我优化一下模型")
         original = self.service.agent.stream_plan
+        calls = {"count": 0}
 
-        def fake_stream(state, history, message):
-            yield "token", {"text": "收到。"}
-            yield "plan", Plan(
-                reply="收到，正在启用您指定的候选方案。",
-                actions=[{"name": "apply_pending_change", "args": {"candidate": 9}}])
+        def fake_stream(state, history, message, emit_thinking=True, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield "token", "收到，正在启用您指定的候选方案。"
+                yield "plan", Plan(
+                    reply="收到，正在启用您指定的候选方案。",
+                    actions=[{"name": "apply_pending_change", "args": {"candidate": 9}}])
+                return
+            yield "token", "候选方案序号无效，本轮未启用任何方案。"
+            yield "plan", Plan(reply="候选方案序号无效，本轮未启用任何方案。",
+                               actions=[])
 
         self.service.agent.stream_plan = fake_stream
         try:
-            events = list(self.service.chat_stream(self.sid, "用第九个方案"))
+            events = list(self.service.chat_stream(
+                self.sid, "用第九个方案", thinking_budget="medium"))
         finally:
             self.service.agent.stream_plan = original
-        errors = [data for event, data in events if event == "error"]
-        self.assertTrue(errors)
-        self.assertIn("候选方案序号超出范围", errors[0]["message"])
+        # ReAct 架构：工具报错作为观察回传给模型继续处理，不把内部错误直接抛给用户
+        self.assertFalse([data for event, data in events if event == "error"])
         messages = self.service.messages(self.sid)["messages"]
         self.assertTrue(any(message.get("role") == "assistant"
-                            and "正在启用您指定的候选方案" in (message.get("content") or "")
+                            and "序号无效" in (message.get("content") or "")
                             for message in messages),
-                        "动作失败时也要持久化助手回复，不能只留下用户消息")
+                        "工具失败后仍应由模型给出客户可见的最终答复")
 
     def test_state_invalid_action_keeps_assistant_reply(self) -> None:
         sid = self.service.create_session()["session_id"]
         original = self.service.agent.stream_plan
 
-        def fake_stream(state, history, message):
+        def fake_stream(state, history, message, emit_thinking=True, **kwargs):
             yield "token", {"text": "当前会话还没有可回滚的模型版本。"}
             yield "plan", Plan(
                 reply="当前会话还没有可回滚的模型版本。",
@@ -697,7 +704,7 @@ class ModelProgramToolTest(unittest.TestCase):
 
     def test_forbidden_import_rejected_before_generation(self) -> None:
         files = {"main.py": (
-            "import os\n"
+            "import socket\n"
             "def build_transform():\n"
             "    def transform(z, weights):\n"
             "        return z.iloc[:, 0]\n"
@@ -707,7 +714,7 @@ class ModelProgramToolTest(unittest.TestCase):
                 self.sid, self._action(files=files), "更换数学模型"))
         self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
 
-    def test_missing_param_space_rejected(self) -> None:
+    def test_invalid_param_space_rejected_in_single_action(self) -> None:
         with self.assertRaises(AgentError):
             list(self.service._run_action(
                 self.sid, self._action(param_space={"tilt": {}}), "更换数学模型"))

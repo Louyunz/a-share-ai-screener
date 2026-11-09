@@ -66,9 +66,9 @@
 `event: done` → `{message_id}`。
 `event: error` → `{message, retryable}`。
 
-**思考预算（thinking_budget）**：请求体可选 `off|low|medium|high`（默认 `medium`，前端会记住用户选择）。`off` 走单步规划；`low/medium/high` 分别允许每轮最多 3/6/10 个自主 ReAct 工具步骤。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。
+**思考预算（thinking_budget）**：请求体可选 `off|low|medium|high`（默认 `medium`，前端会记住用户选择）。**所有请求统一走同一个多步 ReAct 循环**（旧单步工作流已删除）：`off` 表示本轮只执行 1 步，`low/medium/high` 分别允许每轮最多 3/6/10 个自主工具步骤。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；工具执行失败会作为 observation 回传模型继续修正，不直接把内部技术错误抛给用户。审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。程序沙箱允许本地文件读写（CSV/JSON/Parquet 等），仍禁止网络、系统命令/子进程与动态执行。
 
-Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 实时发给浏览器；tool_calls 在本轮流结束后由服务端校验执行。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
+Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 与 thought 增量实时发给浏览器；tool_calls 执行后结果回到 ReAct 循环，由模型决定下一步或给最终答复。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
 
 ### 3.1 卡片（block）
 
@@ -181,10 +181,10 @@ Planner 每轮输出：
 - `transform` 可选接收 `context`（dict）：`asof`、`prices`/`close_raw`/`amount`（截至 asof 的历史行情）、`fundamentals`、`industry`、`universe`，可用于特征计算或训练；未声明该参数的程序仍按 2 参调用；
 - `param_space` 可省略（省略则只做一次回测，不寻优），参数个数不设上限，`max_trials` 可指定寻优预算；`config` 可覆盖 `top_n/backtest_years/rebalance_days/cost_buy/cost_sell/portfolio_method(equal_weight|risk_parity)`，不声明则用系统默认；
 - 服务端**不做子进程冒烟测试**；执行前做 AST 白名单 / 受限 builtins / 入口契约校验，真正执行发生在寻优与回测阶段；
-- 支持类、`@staticmethod/@classmethod/@property` 装饰器、生成器、`self._x` 私有属性、安全 dunder（如 `__init__`）；仍禁止文件/网络/系统命令/动态执行与危险 dunder；
+- 支持类、`@staticmethod/@classmethod/@property` 装饰器、生成器、`self._x` 私有属性、安全 dunder（如 `__init__`）；**本地文件读写（CSV/JSON/Parquet 等）完全放开**；仍禁止网络/系统命令/子进程/动态执行与危险 dunder；
 - 程序生成后先经 **LLM 安全审核**（`program_review.txt`，只检查沙箱/越权/恶意行为，不评价策略逻辑与收益），审核不通过时自动修复一次并复审；仍不通过则返回 review 卡与问题清单，不生成候选、不启用；
 - 第三方库：AI 在 `packages` 里申请（数量默认上限 16），LLM 审核通过后服务端用 pip `--target data/ai_packages` 安装并写入审计 `program_install`；未申请的库会被静态校验拒绝；
-- 沙箱边界：禁止文件、网络、系统命令、动态执行；只允许白名单库 + 本程序模块 + 审核通过的第三方库；
+- 执行边界：**允许本地文件读写（CSV/JSON/Parquet 等，open/os/pathlib/csv/io/tempfile 等）**；禁止网络、系统命令/子进程、动态执行；只允许白名单库 + 本程序模块 + 审核通过的第三方库；
 - 程序改动沿用现有 `code_change` 卡片逐行流式输出（多文件以文件名为题分段），候选/审批/版本/回滚机制不变。
 
 **多候选方案**：同一会话可先后产生多个候选方案（每次 `analyze_model` 一个），服务端按出现顺序编号 1..N 并保存在 `session_state.candidates`；Planner 状态中 `pending_candidates` 给出 `index/name/summary/status/available`。客户说“用第一个/第二个/第三个方案”时通过 `apply_pending_change(candidate=N)` 指定；旧会话（升级前只存了最新 pending）会从已持久化的 work/comparison/approval 卡片中尽力还原候选列表，无法无损还原的旧代码方案标记为 `available=false`，引导客户重新优化。`rollback_version` 只适用于已启用过的版本链，与“在未启用候选之间做选择”是不同动作。
@@ -283,7 +283,7 @@ def select_stocks(scores, top_n, params=None):
 - `build_transform` 允许无参数，或恰好一个名为 `params` 的参数；返回的 transform 可接收可选第三参 `context`。
 - 程序可拆成多级包/多个模块，支持类、安全装饰器、生成器、`self._x`；服务端 AST 校验危险调用/属性/导入。
 - 服务端不做子进程冒烟；候选确定后再次静态校验并用最终参数 compile；真正执行发生在寻优/回测阶段。
-- 执行环境：白名单 stdlib/numpy/pandas/sklearn/scipy + 本程序模块 + 审核通过的第三方库；禁止文件/网络/系统/动态执行。
+- 执行环境：白名单 stdlib/numpy/pandas/sklearn/scipy + 本程序模块 + 审核通过的第三方库；本地文件读写允许；禁止网络/系统/动态执行。
 
 ### 6.4 预期核对与继续优化
 

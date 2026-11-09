@@ -466,7 +466,8 @@ class Agent:
             "contract": (
                 "入口文件定义 build_transform(params=None) -> transform(z, weights, context=None)；"
                 "可选 select_stocks(scores, top_n, params=None) 接管选股/仓位；"
-                "多文件/多级包按模块名互相 import；沙箱禁止文件/网络/系统/动态执行。"
+                "多文件/多级包按模块名互相 import；本地文件读写（CSV/JSON/Parquet 等）已放开；"
+                "仍禁止网络/系统命令/子进程/动态执行。"
             ),
         }
         try:
