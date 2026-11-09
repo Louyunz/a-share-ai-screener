@@ -250,6 +250,23 @@ def create_app(service: AppService | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
+    @app.post("/api/sessions/{sid}/candidates/{index}/apply")
+    def apply_candidate(sid: str, index: int, request: Request) -> Any:
+        try:
+            user = getattr(request.state, "user", {})
+            return get_service().apply_candidate(sid, index, owner_id=int(user["id"]))
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @app.post("/api/sessions/{sid}/versions/{version_id}/activate")
+    def activate_version(sid: str, version_id: str, request: Request) -> Any:
+        try:
+            user = getattr(request.state, "user", {})
+            return get_service().activate_version(
+                sid, version_id, owner_id=int(user["id"]))
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
     @app.get("/api/versions")
     def versions(request: Request) -> Any:
         try:

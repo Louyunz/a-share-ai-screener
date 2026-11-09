@@ -509,6 +509,21 @@ body.history-open, body.info-open { overflow: hidden; }
 .wb-pending-box strong { display: block; margin-bottom: 2px; }
 .wb-pending-box .btn { margin-top: 8px; }
 
+.wb-pending-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.wb-pending-head strong { display: inline; margin: 0; }
+.wb-pending-head .btn { margin-top: 0; }
+.wb-pending-note { margin: 0; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
+.wb-candidate-list { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 0; padding: 0; list-style: none; }
+.wb-candidate { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-button); background: var(--bg-surface); }
+.wb-candidate-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.wb-candidate-main b { color: var(--text-primary); font-size: 12px; font-weight: 600; }
+.wb-candidate-summary { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.wb-candidate-metrics { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px; }
+.wb-candidate .btn { flex: 0 0 auto; padding: 3px 10px; font-size: 11px; }
+.wb-candidate .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.wb-version .btn { flex: 0 0 auto; padding: 2px 8px; font-size: 11px; }
+.wb-version time { flex: 0 0 auto; }
+
 .wb-profile-copy .wb-pending { align-self: flex-start; }
 
 @media (min-width: 1200px) {

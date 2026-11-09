@@ -195,10 +195,46 @@ class AppService:
                 metrics=(active_version or {}).get("metrics") or {}),
             "versions": [self._version_public(item, active_version_id) for item in versions],
             "pending_proposal": self._pending_public(runtime.get("pending"), candidates),
+            "pending_candidates": [self._candidate_public(item, index)
+                                    for index, item in enumerate(candidates, start=1)],
             "last_selection": runtime.get("last_selection"),
             "model_scope": "session",
             "default_model": self._model_public(self._default_model()),
         }
+
+    # ------------------------------------------------------------------
+    # 工作台直连动作：前端按钮直接启用候选/历史版本（不经过 LLM）
+    # ------------------------------------------------------------------
+    def apply_candidate(self, session_id: str, candidate_index: int,
+                        owner_id: int | None = None) -> dict[str, Any]:
+        """工作台「启用」按钮：直接启用指定候选方案并返回刷新后的会话状态。"""
+        self._require_session(session_id, owner_id)
+        blocks, note = self._collect_action(
+            self._apply_pending(session_id, int(candidate_index)))
+        return {"ok": True, "note": note, "blocks": blocks,
+                "state": self.get_state(session_id)}
+
+    def activate_version(self, session_id: str, version_id: str,
+                         owner_id: int | None = None) -> dict[str, Any]:
+        """工作台「启用」按钮：把当前会话切到指定历史版本（含默认基线）。"""
+        self._require_session(session_id, owner_id)
+        version = self.store.get_version(str(version_id))
+        if version is None or version.get("session_id") != session_id:
+            raise NotFoundError("模型版本不存在或不属于当前会话")
+        current_id = self.store.session_active_version_id(session_id)
+        if current_id == version["id"]:
+            return {"ok": True, "note": "该模型版本已经启用", "blocks": [],
+                    "state": self.get_state(session_id)}
+        self.store.set_session_active_version(session_id, version["id"])
+        self.store.audit(
+            "ui_activate_version", from_version=current_id, to_version=version["id"],
+            reason="workbench_button",
+            payload={"model_id": (version.get("model") or {}).get("model_id"),
+                     "model_name": self._model_name(version)})
+        block = self._version_block(session_id)
+        note = f"已启用 {self._model_name(version)}（仅当前会话生效）。"
+        return {"ok": True, "note": note, "blocks": [block],
+                "state": self.get_state(session_id)}
 
     # ------------------------------------------------------------------
     # 对话主流程
@@ -1399,6 +1435,26 @@ class AppService:
 
     def _has_pending_candidates(self, session_id: str) -> bool:
         return self._latest_pending(self._candidates(session_id)) is not None
+
+    @staticmethod
+    def _collect_action(generator) -> tuple[list[dict[str, Any]], str]:
+        """消费动作生成器，收集 UI 卡片与最终旁白（工作台按钮直连动作复用）。"""
+        blocks: list[dict[str, Any]] = []
+        note = ""
+        while True:
+            try:
+                event, payload = next(generator)
+            except StopIteration as stop:
+                returned = stop.value
+                if isinstance(returned, tuple) and len(returned) >= 2:
+                    blocks = [block for block in (returned[0] or [])
+                              if isinstance(block, dict)]
+                    note = str(returned[1] or "")
+                break
+            if (event == "ui" and isinstance(payload, dict)
+                    and isinstance(payload.get("block"), dict)):
+                blocks.append(payload["block"])
+        return blocks, note
 
     @staticmethod
     def _candidate_public(candidate: dict[str, Any], index: int) -> dict[str, Any]:

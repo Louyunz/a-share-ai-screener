@@ -49,10 +49,12 @@
 | POST | `/api/sessions` | `{session_id}` |
 | POST | `/api/sessions/{sid}/chat` | `{content, client_action?}` → **SSE 聊天流**（见第 3 节） |
 | GET | `/api/sessions/{sid}/messages` | 文本 + 富卡片历史 `{messages:[{role,content,blocks,created_at}]}` |
-| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别；`pending_proposal.candidate_count` 是待确认候选方案数量 |
+| GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, pending_candidates, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别；`pending_proposal.candidate_count` 是待确认候选方案数量；`pending_candidates` 是候选方案列表（`index/name/summary/status/available/metrics`） |
+| POST | `/api/sessions/{sid}/candidates/{index}/apply` | 工作台「启用」按钮：直接启用第 `index` 个待确认候选方案（不经过 LLM），返回 `{ok, note, blocks, state}` |
+| POST | `/api/sessions/{sid}/versions/{vid}/activate` | 工作台「启用」按钮：把当前会话切到该会话的任意历史模型版本（含 baseline），返回 `{ok, note, blocks, state}` |
 | GET | `/api/versions?session={sid}` | 版本列表；带 `session` 时只返回该会话版本链（`model_scope=session`），不带时返回全局归档 |
 
-不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。
+不提供独立的 profile/selection/tune 动作接口——这些动作只能由聊天流里的 AI 触发。模型候选方案与历史版本额外提供工作台直连「启用」接口（仅做状态校验与执行，不做语义判断），审计记为 `ai_apply` / `ui_activate_version`。
 
 **状态单一来源（SCHEMA_VERSION=7）**：会话当前模型 = `session.active_version_id` 指向的 `version` 行（为空则默认「均衡多因子」）；`session_state` 只保存 pending/待执行意图/最近结果，不再保存 active_model/metrics/version_id。旧的全局 `store.active_version/activate/parent_version` 接口已删除，版本链按 `session_id` 隔离。`auth_account` / `auth_session` 保存多用户账号与会话令牌哈希；`session.owner_id` 用于用户数据隔离，第一次初始化管理员时接管历史无主会话。
 

@@ -91,6 +91,9 @@
     activeModel: null,
     versions: [],
     pendingProposal: null,
+    pendingCandidates: [],
+    pendingSignature: '',
+    pendingDismissed: '',
     lastSelection: null,
     lastUserMessage: '',
     lastMessageId: null,
@@ -356,17 +359,36 @@
   async function loadState() {
     try {
       var data = await apiGet('/api/sessions/' + encodeURIComponent(state.sessionId) + '/state', 2);
-      state.profile = normalizeProfile(data.profile);
-      state.activeModel = normalizeModel(data.active_model);
-      state.versions = normalizeVersions(data.versions);
-      state.pendingProposal = data.pending_proposal || null;
-      state.lastSelection = normalizeSelection(data.last_selection);
+      applySessionState(data);
       state.stateError = null;
       setWorkbenchAlert('');
     } catch (error) {
       state.stateError = error.message || '会话状态加载失败';
       setWorkbenchAlert('会话状态加载失败：' + state.stateError);
     }
+  }
+
+  function pendingCandidateSignature(candidates) {
+    return (candidates || []).map(function (item) {
+      return String(item.index) + ':' + String(item.status || 'pending');
+    }).join('|');
+  }
+
+  /* 把 /state（或启用按钮返回值里的 state）应用到工作台状态。 */
+  function applySessionState(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.profile !== undefined) state.profile = normalizeProfile(data.profile);
+    if (data.active_model !== undefined) state.activeModel = normalizeModel(data.active_model);
+    if (data.versions !== undefined) state.versions = normalizeVersions(data.versions);
+    if (data.pending_proposal !== undefined) state.pendingProposal = data.pending_proposal || null;
+    if (data.last_selection !== undefined) state.lastSelection = normalizeSelection(data.last_selection);
+    var candidates = Array.isArray(data.pending_candidates) ? data.pending_candidates : [];
+    var signature = pendingCandidateSignature(candidates);
+    if (signature !== state.pendingSignature) {
+      state.pendingSignature = signature;
+      state.pendingDismissed = '';
+    }
+    state.pendingCandidates = candidates;
   }
 
   async function loadVersions() {
@@ -1096,7 +1118,8 @@
     var riskHtml = block.risk
       ? '<div class="approval-risk">'  + '<span>' + esc(block.risk) + '</span></div>'
       : '';
-    return '<article class="card card-approval">'
+    return '<article class="card card-approval"'
+      + (candidate ? ' data-candidate="' + esc(candidate) + '"' : '') + '>'
       + '<header class="card-head">'
       + '<div class="card-title"><h3>' + esc(block.title || '需要用户确认') + '</h3></div>'
       + '<span class="status-pill is-warn">' + esc(statusText) + '</span></header>'
@@ -1631,6 +1654,15 @@
     }
   }
 
+  function candidateMetricsHtml(metrics) {
+    var chips = ['sharpe', 'mdd'].map(function (key) {
+      var value = num(metrics ? metrics[key] : null);
+      return value === null ? ''
+        : '<span class="version-metric">' + metricMeta(key).label + ' ' + formatMetric(key, value) + '</span>';
+    }).join('');
+    return chips ? '<div class="wb-candidate-metrics">' + chips + '</div>' : '';
+  }
+
   function renderModelSection() {
     var head = '<header class="wb-head"><h2>当前模型与版本</h2></header>';
     var html = head;
@@ -1645,23 +1677,51 @@
     } else {
       html += '<p class="wb-empty">还没有启用的自定义模型。跟 AI 说帮我优化模型，它会先给你方案，再等你确认。</p>';
     }
-    var versions = state.versions.slice(0, 6);
+    var versions = state.versions.slice(0, 8);
     if (versions.length) {
       html += '<ul class="wb-version-list">' + versions.map(function (version) {
-        var dotClass = version.status === 'active' ? ' is-active' : version.status === 'candidate' ? ' is-candidate' : '';
-        return '<li class="wb-version"><span class="version-dot' + dotClass + '"></span>'
+        var active = version.status === 'active';
+        var dotClass = active ? ' is-active' : version.status === 'candidate' ? ' is-candidate' : '';
+        return '<li class="wb-version' + (active ? ' is-active' : '') + '">'
+          + '<span class="version-dot' + dotClass + '"></span>'
           + '<span class="wb-version-name">' + esc(version.name) + '</span>'
           + '<span class="status-pill ' + versionStatusClass(version.status) + '">' + esc(versionStatusText(version.status)) + '</span>'
+          + (active || !version.id ? ''
+            : '<button class="btn btn-sm btn-ghost" type="button" data-action="activate-version" data-version-id="' + esc(version.id) + '">启用</button>')
           + (version.created_at ? '<time>' + esc(shortDate(version.created_at)) + '</time>' : '')
           + '</li>';
       }).join('') + '</ul>';
     }
-    if (state.pendingProposal) {
+    var pending = (state.pendingCandidates || []).filter(function (item) {
+      return item && item.status !== 'applied';
+    });
+    if (pending.length && state.pendingDismissed !== state.pendingSignature) {
+      html += '<div class="wb-pending-box">'
+        + '<div class="wb-pending-head"><strong>有 ' + pending.length + ' 个待确认的方案</strong>'
+        + '<button class="btn btn-sm btn-ghost" type="button" data-action="dismiss-pending">确定</button></div>'
+        + '<p class="wb-pending-note">可以直接点“启用”使用某个方案，也可以在聊天里继续确认；AI 不会自动启用。</p>'
+        + '<ul class="wb-candidate-list">'
+        + pending.map(function (item) {
+          var disabled = item.available === false;
+          var summary = String(item.summary || '');
+          if (summary.length > 72) summary = summary.slice(0, 72) + '…';
+          return '<li class="wb-candidate">'
+            + '<div class="wb-candidate-main"><b>方案 ' + esc(item.index) + '：' + esc(item.name || '候选方案') + '</b>'
+            + (summary ? '<span class="wb-candidate-summary">' + esc(summary) + '</span>' : '')
+            + candidateMetricsHtml(item.metrics || {})
+            + '</div>'
+            + '<button class="btn btn-sm ' + (disabled ? 'btn-ghost' : 'btn-primary') + '" type="button"'
+            + ' data-action="apply-candidate" data-index="' + esc(item.index) + '"'
+            + (disabled ? ' disabled title="旧会话记录缺少完整模型数据，请重新发起优化"' : '')
+            + '>' + (disabled ? '不可启用' : '启用') + '</button>'
+            + '</li>';
+        }).join('')
+        + '</ul></div>';
+    } else if (state.pendingProposal && !pending.length) {
+      // 兼容旧版 state：没有候选列表时回退到聊天确认入口
       var pendingCount = Number(state.pendingProposal.candidate_count) || 1;
-      var pendingTitle = pendingCount > 1
-        ? '有 ' + pendingCount + ' 个待确认的改进方案'
-        : '有一个待确认的改进方案';
-      html += '<div class="wb-pending-box"><strong>' + esc(pendingTitle) + '</strong><br>AI 会在聊天里等你确认，不会自动启用。'
+      html += '<div class="wb-pending-box"><strong>有 ' + pendingCount + ' 个待确认的方案</strong>'
+        + '<br>AI 会在聊天里等你确认，不会自动启用。'
         + '<br><button class="btn btn-sm" type="button" data-action="quick" data-message="展开说说待审批方案的细节">展开说说方案</button></div>';
     }
     dom.model.innerHTML = html;
@@ -1706,6 +1766,70 @@
     dom.chatModelChip.textContent = state.activeModel && state.activeModel.name
       ? '模型 · ' + state.activeModel.name
       : 'AI · 助手';
+  }
+
+  /* 工作台按钮：直接启用某个待确认候选方案 / 某个历史模型版本 */
+  function markCandidateCardsApplied(index) {
+    if (!index || !dom.stream) return;
+    var selector = '.card-approval[data-candidate="' + String(index) + '"]';
+    Array.prototype.forEach.call(dom.stream.querySelectorAll(selector), function (card) {
+      card.classList.add('is-answered');
+      var pill = card.querySelector('.card-head .status-pill');
+      if (pill) {
+        pill.className = 'status-pill is-ok';
+        pill.textContent = '已启用';
+      }
+      Array.prototype.forEach.call(card.querySelectorAll('button'), function (item) {
+        item.disabled = true;
+      });
+    });
+  }
+
+  async function applyCandidate(index, button) {
+    if (!index || !state.sessionId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = '启用中…';
+    }
+    try {
+      var data = await api(
+        '/api/sessions/' + encodeURIComponent(state.sessionId) + '/candidates/'
+          + encodeURIComponent(index) + '/apply',
+        { method: 'POST', body: {} });
+      if (data && data.state) applySessionState(data.state);
+      renderAllWorkbench();
+      markCandidateCardsApplied(index);
+      setWorkbenchAlert(data && data.note ? data.note : '');
+    } catch (error) {
+      setWorkbenchAlert('启用失败：' + (error && error.message ? error.message : '请稍后重试'));
+      if (button) {
+        button.disabled = false;
+        button.textContent = '启用';
+      }
+    }
+  }
+
+  async function activateVersion(versionId, button) {
+    if (!versionId || !state.sessionId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = '启用中…';
+    }
+    try {
+      var data = await api(
+        '/api/sessions/' + encodeURIComponent(state.sessionId) + '/versions/'
+          + encodeURIComponent(versionId) + '/activate',
+        { method: 'POST', body: {} });
+      if (data && data.state) applySessionState(data.state);
+      renderAllWorkbench();
+      setWorkbenchAlert(data && data.note ? data.note : '');
+    } catch (error) {
+      setWorkbenchAlert('启用失败：' + (error && error.message ? error.message : '请稍后重试'));
+      if (button) {
+        button.disabled = false;
+        button.textContent = '启用';
+      }
+    }
   }
 
   function setChatRunStatus(text) {
@@ -1824,6 +1948,9 @@
       setChatRunStatus(stopped ? '已停止' : failed ? '处理出错' : '就绪');
       updateComposerState();
       if (!stopped) {
+        // 每轮对话后刷新工作台：新的候选方案/版本/待确认数量要及时出现
+        await loadState();
+        renderAllWorkbench();
       }
       checkHealth();
       dom.input.focus();
@@ -2430,6 +2557,19 @@
     var button = event.target.closest ? event.target.closest('[data-action]') : null;
     if (!button || button.disabled) return;
     var action = button.getAttribute('data-action');
+    if (action === 'dismiss-pending') {
+      state.pendingDismissed = state.pendingSignature;
+      renderModelSection();
+      return;
+    }
+    if (action === 'apply-candidate') {
+      applyCandidate(Number(button.getAttribute('data-index')), button);
+      return;
+    }
+    if (action === 'activate-version') {
+      activateVersion(button.getAttribute('data-version-id'), button);
+      return;
+    }
     if (action === 'quick') {
       var message = button.getAttribute('data-message');
       var approval = button.closest('.card-approval');

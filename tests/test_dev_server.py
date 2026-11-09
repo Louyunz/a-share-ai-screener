@@ -102,6 +102,44 @@ class DevServerTest(unittest.TestCase):
         status, body = self._request("GET", f"/api/sessions/{sid}/messages")
         self.assertGreaterEqual(len(json.loads(body)["messages"]), 2)
 
+    def _confirmed_session_with_candidate(self) -> str:
+        status, body = self._request("POST", "/api/sessions")
+        sid = json.loads(body)["session_id"]
+        self._request("POST", f"/api/sessions/{sid}/chat", {"content": (
+            "我想为养老攒点钱，大概 5 年不用，最多能接受亏 15%，真亏了会有点慌但先不卖")})
+        self._request("POST", f"/api/sessions/{sid}/chat", {"content": "可以，就按这个来"})
+        self._request("POST", f"/api/sessions/{sid}/chat", {"content": "帮我优化一下模型"})
+        return sid
+
+    def test_workbench_apply_candidate_and_activate_version(self) -> None:
+        sid = self._confirmed_session_with_candidate()
+        status, body = self._request("GET", f"/api/sessions/{sid}/state")
+        state = json.loads(body)
+        self.assertIn("pending_candidates", state)
+        pending = [item for item in state["pending_candidates"]
+                   if item["status"] == "pending"]
+        self.assertTrue(pending)
+        target = pending[-1]
+        status, body = self._request(
+            "POST", f"/api/sessions/{sid}/candidates/{target['index']}/apply")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"]["active_model"]["name"], target["name"])
+        archived = [item for item in result["state"]["versions"]
+                    if item["status"] != "active"]
+        self.assertTrue(archived)
+        target_version = archived[0]
+        status, body = self._request(
+            "POST", f"/api/sessions/{sid}/versions/{target_version['id']}/activate")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["state"]["active_model"]["name"],
+                         target_version["name"])
+        status, _ = self._request("POST", f"/api/sessions/{sid}/candidates/99/apply")
+        self.assertIn(status, (400, 404, 409))
+        status, _ = self._request("POST", f"/api/sessions/{sid}/versions/v-missing/activate")
+        self.assertEqual(status, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

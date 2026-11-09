@@ -13,7 +13,7 @@ from backend.data.sample import generate_bundle
 from tests.support.scripted_llm import ScriptedLLM
 from backend.models import registry
 from backend.schemas import Plan, profile_summary
-from backend.service import AppService
+from backend.service import AppService, ConflictError, NotFoundError
 from tests import cleanup, workdir
 
 PROFILE_SLOTS = {
@@ -398,6 +398,57 @@ class PendingCandidateSelectionTest(unittest.TestCase):
         latest_name = self._candidates()[-1]["name"]
         self._chat("就按最新这个来")
         self.assertEqual(self.service._session_active_model(self.sid)["name"], latest_name)
+
+    def test_state_exposes_pending_candidates_for_workbench(self) -> None:
+        self._chat("帮我优化一下模型")
+        self._chat("继续优化模型，上一版未达到我的预期")
+        state = self.service.get_state(self.sid)
+        pending = state["pending_candidates"]
+        self.assertEqual([item["index"] for item in pending], [1, 2])
+        self.assertEqual([item["status"] for item in pending], ["pending", "pending"])
+        self.assertEqual(state["pending_proposal"]["candidate_count"], 2)
+
+    def test_workbench_apply_candidate_directly(self) -> None:
+        self._chat("帮我优化一下模型")
+        self._chat("继续优化模型，上一版未达到我的预期")
+        target_name = self._candidates()[0]["name"]
+        result = self.service.apply_candidate(self.sid, 1)
+        self.assertTrue(result["ok"])
+        self.assertIn("已启用第 1 个候选方案", result["note"])
+        self.assertEqual(result["state"]["active_model"]["name"], target_name)
+        self.assertEqual(
+            [(item["index"], item["status"]) for item in result["state"]["pending_candidates"]],
+            [(1, "applied"), (2, "pending")])
+        self.assertTrue(result["blocks"])
+        self.assertTrue(any(item["action"] == "ai_apply"
+                            for item in self.service.store.list_audit(limit=5)))
+
+    def test_workbench_apply_invalid_candidate_raises(self) -> None:
+        self._chat("帮我优化一下模型")
+        with self.assertRaises(ConflictError):
+            self.service.apply_candidate(self.sid, 9)
+        with self.assertRaises(NotFoundError):
+            self.service.apply_candidate(self.sid, 1, owner_id=999)
+
+    def test_workbench_activate_version_directly(self) -> None:
+        self._chat("帮我优化一下模型")
+        self.service.apply_candidate(self.sid, 1)
+        state = self.service.get_state(self.sid)
+        target = next(item for item in state["versions"] if item["status"] != "active")
+        result = self.service.activate_version(self.sid, target["id"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"]["active_model"]["name"], target["name"])
+        self.assertTrue(result["blocks"])
+        self.assertTrue(any(item["action"] == "ui_activate_version"
+                            for item in self.service.store.list_audit(limit=5)))
+        with self.assertRaises(NotFoundError):
+            self.service.activate_version(self.sid, "v-not-exists")
+        other_sid = self.service.create_session()["session_id"]
+        other_version = self.service.store.create_version(
+            model=self.service._default_model(), metrics={}, status="applied",
+            source="ai_optimize", summary="其他会话版本", session_id=other_sid)
+        with self.assertRaises(NotFoundError):
+            self.service.activate_version(self.sid, other_version)
 
     def test_invalid_candidate_index_is_reported_and_reply_persisted(self) -> None:
         self._chat("帮我优化一下模型")

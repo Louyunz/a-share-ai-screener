@@ -134,6 +134,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 content = str(body.get("content", ""))
                 self.service._require_session(session_id)  # noqa: SLF001
                 return self._stream_sse(self.service.chat_stream(session_id, content))
+            match = re.match(r"^/api/sessions/([^/]+)/candidates/(\d+)/apply$", path)
+            if match:
+                return self._send_json(200, self.service.apply_candidate(
+                    match.group(1), int(match.group(2))))
+            match = re.match(r"^/api/sessions/([^/]+)/versions/([^/]+)/activate$", path)
+            if match:
+                return self._send_json(200, self.service.activate_version(
+                    match.group(1), match.group(2)))
             raise NotFoundError(f"未知接口：{path}")
         except Exception as exc:  # noqa: BLE001
             return self._send_error(exc)
