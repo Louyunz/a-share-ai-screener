@@ -211,7 +211,7 @@ DANGEROUS_DUNDER_NAMES = frozenset(
 FORBIDDEN_ATTRS = frozenset(
     {
         "system", "popen", "spawn", "spawnl", "spawnv", "fork", "exec", "execl",
-        "execv", "execve", "kill",
+        "execv", "execve", "kill","os"
         "import_module", "load_module", "spec_from_file_location", "exec_module",
         "urlopen", "urlretrieve", "socket", "connect", "send", "sendall", "recv",
         "os", "sys", "subprocess", "importlib", "ctypes",
