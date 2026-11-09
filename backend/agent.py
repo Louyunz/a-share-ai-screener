@@ -226,6 +226,23 @@ class Agent:
         result: ToolChatResult | None = None
         program_preview: dict[str, Any] = {"id": "", "last_total": -1,
                                            "raw": "", "active": ""}
+
+        def stream_secondary(messages: list[dict[str, str]], emit_tokens: bool = True):
+            """二次模型调用也走流式，避免“消息最后一次性蹦出来”。"""
+            holder: dict[str, ToolChatResult | None] = {"result": None}
+
+            def generator():
+                for kind, payload in self.llm.chat_tools_stream(
+                        _planner_system(), messages, TOOL_DEFINITIONS):
+                    if kind == "content":
+                        reply_parts.append(payload)
+                        if emit_tokens:
+                            yield "token", payload
+                    elif kind == "result":
+                        holder["result"] = payload
+
+            return generator(), holder
+
         try:
             for kind, payload in self.llm.chat_tools_stream(
                     _planner_system(), [{"role": "user", "content": user_content}],
@@ -273,13 +290,16 @@ class Agent:
         actions, profile_delta, errors = self._actions_from_result(result)
         if errors:
             try:
-                repaired = self.llm.chat_tools(
-                    _planner_system(),
+                repair_gen, repair_state = stream_secondary(
                     self._repair_messages(user_content, result, errors),
-                    TOOL_DEFINITIONS,
-                )
+                    emit_tokens=not reply_parts)
+                for item in repair_gen:
+                    yield item
+                repaired = repair_state["result"]
             except LLMError as exc:
                 raise AgentError(f"AI 工具参数修复失败：{exc}") from exc
+            if repaired is None:
+                raise AgentError("AI 工具参数修复失败：没有返回结果")
             actions, profile_delta, errors = self._actions_from_result(repaired)
             if errors:
                 raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
@@ -295,14 +315,21 @@ class Agent:
                     "则不要调用工具。不要修改 content 文案。")},
             ]
             try:
-                reviewed = self.llm.chat_tools(
-                    _planner_system(), review_messages, TOOL_DEFINITIONS)
+                if reply_parts:
+                    reviewed = self.llm.chat_tools(
+                        _planner_system(), review_messages, TOOL_DEFINITIONS)
+                else:
+                    review_gen, review_state = stream_secondary(review_messages)
+                    for item in review_gen:
+                        yield item
+                    reviewed = review_state["result"]
             except LLMError:
                 reviewed = None
-            if reviewed is not None and reviewed.tool_calls:
-                actions, profile_delta, errors = self._actions_from_result(reviewed)
-                if errors:
-                    raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
+            if reviewed is not None:
+                if reviewed.tool_calls:
+                    actions, profile_delta, errors = self._actions_from_result(reviewed)
+                    if errors:
+                        raise AgentError("AI 工具参数校验失败：" + "；".join(errors))
                 result = reviewed
 
         if not reply_parts and result.content:
@@ -311,13 +338,15 @@ class Agent:
 
         if not reply_parts and result.tool_calls:
             try:
-                repaired = self.llm.chat_tools(
-                    _planner_system(),
-                    self._content_repair_messages(user_content, result),
-                    TOOL_DEFINITIONS,
-                )
+                repair_gen, repair_state = stream_secondary(
+                    self._content_repair_messages(user_content, result))
+                for item in repair_gen:
+                    yield item
+                repaired = repair_state["result"]
             except LLMError as exc:
                 raise AgentError(f"AI 回复修复失败：{exc}") from exc
+            if repaired is None:
+                raise AgentError("AI 回复修复失败：没有返回结果")
             repaired_actions, repaired_profile_delta, errors = (
                 self._actions_from_result(repaired))
             if errors:
@@ -326,7 +355,7 @@ class Agent:
                 actions = repaired_actions
                 profile_delta = repaired_profile_delta
             result = repaired
-            if result.content:
+            if not reply_parts and result.content:
                 reply_parts.append(result.content)
                 yield "token", result.content
 

@@ -2093,7 +2093,12 @@
         appendToken(turn, typeof payload.text === 'string' ? payload.text : '');
         break;
       case 'ui':
-        if (payload.block && typeof payload.block === 'object') upsertCard(payload.block);
+        try {
+          if (payload.block && typeof payload.block === 'object') upsertCard(payload.block);
+        } catch (err) {
+          // 单张卡片渲染失败不能中断后续 token 的流式输出
+          if (window.console && console.error) console.error('card render failed', err);
+        }
         break;
       case 'done':
         if (payload.message_id) state.lastMessageId = payload.message_id;
