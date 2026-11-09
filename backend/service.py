@@ -254,6 +254,9 @@ class AppService:
             for kind, payload in self.agent.stream_plan(public_state, history[:-1], content):
                 if kind == "token":
                     yield "token", {"text": payload}
+                elif kind == "program":
+                    # AI 正在生成模型程序：实时把代码流式显示到页面
+                    yield "ui", {"block": payload}
                 elif kind == "plan":
                     plan = payload
         except (ServiceError, AgentError, ValidationError) as exc:

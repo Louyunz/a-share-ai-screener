@@ -429,9 +429,14 @@ def _check_call(
     func = node.func
     if isinstance(func, ast.Name):
         name = func.id
-        if name.startswith("__") or name in FORBIDDEN_NAMES:
+        if name.startswith("__"):
             raise _RuleViolation("ast_safety", f"第 {node.lineno} 行禁止调用 {name}()")
-        if name in SAFE_BUILTIN_NAMES or name in defined_functions or name in bound_names:
+        # 程序自己定义的函数优先放行（允许命名为 code 等普通名字）
+        if name in defined_functions:
+            return
+        if name in FORBIDDEN_NAMES:
+            raise _RuleViolation("ast_safety", f"第 {node.lineno} 行禁止调用 {name}()")
+        if name in SAFE_BUILTIN_NAMES or name in bound_names:
             return
         raise _RuleViolation(
             "ast_safety", f"第 {node.lineno} 行调用了未定义的函数 {name}()"
@@ -443,9 +448,7 @@ def _check_call(
         root: ast.expr = func.value
         while isinstance(root, ast.Attribute):
             root = root.value
-        if isinstance(root, ast.Name) and (
-            root.id.startswith("__") or root.id in FORBIDDEN_NAMES
-        ):
+        if isinstance(root, ast.Name) and root.id.startswith("__"):
             raise _RuleViolation(
                 "ast_safety", f"第 {node.lineno} 行禁止通过 {root.id} 调用方法"
             )
@@ -458,12 +461,16 @@ def _check_call(
 
 
 def _check_ast_safety(tree: ast.Module) -> None:
-    """遍历整棵 AST：禁止危险名字、下划线属性、危险方法调用与异步/类定义。"""
+    """遍历整棵 AST：禁止危险调用、下划线属性、危险方法调用与异步语法。
+
+    普通变量名（如 ``code``/``result``）不再被当成危险名字——文件/网络/系统
+    能力由 import 白名单与调用/属性检查兜住，避免误杀正常程序。
+    """
     defined_functions = _collect_defined_functions(tree)
     bound_names = _collect_bound_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
-            if node.id.startswith("__") or node.id in FORBIDDEN_NAMES:
+            if node.id.startswith("__"):
                 raise _RuleViolation(
                     "ast_safety", f"第 {node.lineno} 行禁止使用名称 {node.id}"
                 )

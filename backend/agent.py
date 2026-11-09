@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -81,6 +82,45 @@ def ensure_compliance(text: str) -> str:
 
 def asks_clarifying_question(reply: str) -> bool:
     return "？" in reply or "?" in reply
+
+
+# 从流式 tool_call 参数 JSON 中尽力恢复 write_model_program 的文件内容，用于边生成边展示
+_JSON_PATH_RE = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_JSON_CONTENT_RE = re.compile(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)')
+
+
+def _decode_json_string_fragment(fragment: str) -> str:
+    """解码 JSON 字符串片段（允许尾部是尚未写完的转义序列）。"""
+    for cut in range(len(fragment), max(-1, len(fragment) - 16), -1):
+        try:
+            return json.loads('"' + fragment[:cut] + '"')
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return ""
+
+
+def preview_program_arguments(raw_arguments: str) -> dict[str, Any] | None:
+    """从 write_model_program 的流式参数里提取当前已生成的文件快照。"""
+    raw = str(raw_arguments or "")
+    if '"content"' not in raw:
+        return None
+    paths = [(match.start(), _decode_json_string_fragment(match.group(1)))
+             for match in _JSON_PATH_RE.finditer(raw)]
+    files: dict[str, str] = {}
+    active = ""
+    for match in _JSON_CONTENT_RE.finditer(raw):
+        path = "main.py"
+        for position, candidate in paths:
+            if position >= match.start():
+                break
+            if candidate:
+                path = candidate
+        content = _decode_json_string_fragment(match.group(1))
+        files[path] = content
+        active = path
+    if not files:
+        return None
+    return {"files": files, "active": active}
 
 
 def _state_blocked_action(action: dict[str, Any], state: dict[str, Any]) -> bool:
@@ -184,6 +224,8 @@ class Agent:
         user_content = self._payload(state, history, message)
         reply_parts: list[str] = []
         result: ToolChatResult | None = None
+        program_preview: dict[str, Any] = {"id": "", "last_total": -1,
+                                           "raw": "", "active": ""}
         try:
             for kind, payload in self.llm.chat_tools_stream(
                     _planner_system(), [{"role": "user", "content": user_content}],
@@ -193,8 +235,38 @@ class Agent:
                     yield "token", payload
                 elif kind == "result":
                     result = payload
+                elif kind == "tool_args":
+                    if str(payload.get("name") or "") != "write_model_program":
+                        continue
+                    raw_arguments = str(payload.get("arguments") or "")
+                    snapshot = preview_program_arguments(raw_arguments)
+                    if not snapshot:
+                        continue
+                    program_preview["raw"] = raw_arguments
+                    if not program_preview["id"]:
+                        program_preview["id"] = "program-" + uuid.uuid4().hex[:8]
+                    total = sum(len(value) for value in snapshot["files"].values())
+                    if total - program_preview["last_total"] >= 60:
+                        program_preview["last_total"] = total
+                        yield "program", {
+                            "id": program_preview["id"],
+                            "type": "program",
+                            "status": "writing",
+                            "files": snapshot["files"],
+                            "active": snapshot["active"],
+                        }
         except LLMError as exc:
             raise AgentError(f"AI 暂时无法理解这句话：{exc}") from exc
+        if program_preview["id"] and program_preview["raw"]:
+            snapshot = preview_program_arguments(program_preview["raw"])
+            if snapshot:
+                yield "program", {
+                    "id": program_preview["id"],
+                    "type": "program",
+                    "status": "generated",
+                    "files": snapshot["files"],
+                    "active": snapshot["active"],
+                }
         if result is None:
             raise AgentError("AI 没有返回规划结果")
 

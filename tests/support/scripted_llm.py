@@ -199,6 +199,18 @@ class ScriptedLLM:
         for start in range(0, len(reply), 6):
             yield "content", reply[start:start + 6]
         calls = self._calls_from_plan(plan)
+        # 模拟原生 function calling 的参数流：write_model_program 的代码参数分块推送，
+        # 让服务端/前端可以边生成边展示（真实 LLM 也是增量给出 tool_call arguments）。
+        for index, call in enumerate(calls):
+            if call.name != "write_model_program":
+                continue
+            raw = call.raw_arguments or "{}"
+            for end in range(120, len(raw) + 120, 120):
+                yield "tool_args", {
+                    "index": index,
+                    "name": call.name,
+                    "arguments": raw[:end],
+                }
         yield "result", ToolChatResult(content=reply, tool_calls=calls,
                                        message=self._wire_message(reply, calls))
 

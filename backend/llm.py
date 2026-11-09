@@ -280,6 +280,13 @@ class OpenAICompatClient:
                             entry["name"] += str(function["name"])
                         if function.get("arguments"):
                             entry["arguments"] += str(function["arguments"])
+                        # 实时把工具参数增量抛给上层：write_model_program 可在生成过程中
+                        # 把 AI 正在写的代码流式展示到页面（其他工具由上层自行忽略）。
+                        yield "tool_args", {
+                            "index": index,
+                            "name": entry["name"],
+                            "arguments": entry["arguments"],
+                        }
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise LLMError(f"模型接口 HTTP {exc.code}：{detail}") from exc

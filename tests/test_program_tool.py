@@ -76,6 +76,33 @@ class ProgramValidationTest(unittest.TestCase):
         info = custom.validate_program(files, "main.py")
         self.assertTrue(info["ok"])
 
+    def test_variable_named_code_is_allowed(self) -> None:
+        files = {"main.py": (
+            "import pandas as pd\n"
+            "\n"
+            "def build_transform(params=None):\n"
+            "    code = 1\n"
+            "    def transform(z, weights):\n"
+            "        code = pd.Series(0.0, index=z.index, dtype=float)\n"
+            "        return code\n"
+            "    return transform\n")}
+        info = custom.validate_program(files, "main.py")
+        self.assertTrue(info["ok"])
+        runtime = custom.compile_program(files, "main.py", {})
+        frame = pd.DataFrame({"z_ep": [0.1]}, index=["600000.SH"])
+        output = runtime.transform(frame, {"ep": 1.0})
+        self.assertEqual(list(output), [0.0])
+
+    def test_dangerous_call_still_rejected(self) -> None:
+        files = {"main.py": (
+            "def build_transform():\n"
+            "    exec('print(1)')\n"
+            "    def transform(z, weights):\n"
+            "        return z.iloc[:, 0]\n"
+            "    return transform\n")}
+        with self.assertRaises(custom.ModelCodeError):
+            custom.validate_program(files, "main.py")
+
     def test_compile_transform_and_select_hook(self) -> None:
         runtime = custom.compile_program(
             SCRIPTED_PROGRAM_FILES, "main.py", {"tilt": 0.5})

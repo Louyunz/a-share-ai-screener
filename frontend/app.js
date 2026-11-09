@@ -740,6 +740,8 @@
         return tuningCardHtml(block);
       case 'review':
         return reviewCardHtml(block);
+      case 'program':
+        return programCardHtml(block);
       default:
         return genericCardHtml(block);
     }
@@ -1132,6 +1134,31 @@
       + '</div></article>';
   }
 
+  /* ---------------------------------------------------------- AI 编写程序（实时） */
+  function programCardHtml(block) {
+    var contents = block.files && typeof block.files === 'object' ? block.files : {};
+    var paths = Object.keys(contents);
+    var active = block.active && contents[block.active] !== undefined
+      ? block.active
+      : (paths.length ? paths[0] : '');
+    var code = active ? String(contents[active] || '') : '';
+    var generated = block.status === 'generated';
+    var tabs = paths.map(function (path) {
+      return '<span class="program-file' + (path === active ? ' is-active' : '') + '">'
+        + esc(path) + '</span>';
+    }).join('');
+    return '<article class="card card-program">'
+      + '<header class="card-head">'
+      + '<div class="card-title"><h3>AI ' + (generated ? '已编写模型程序' : '正在编写模型程序') + '</h3></div>'
+      + '<span class="status-pill ' + (generated ? 'is-ok' : 'is-warn') + '">'
+      + (generated ? '已生成 · 待安全审核' : '编写中') + '</span></header>'
+      + '<div class="card-body">'
+      + (tabs ? '<div class="program-files">' + tabs + '</div>' : '')
+      + '<pre class="code-box program-code">' + esc(code) + '</pre>'
+      + '<p class="wb-note">代码生成过程实时展示；生成完成后进入 LLM 安全审核与服务端校验，不会自动启用。</p>'
+      + '</div></article>';
+  }
+
   function approvalCardHtml(block) {
     var actions = Array.isArray(block.actions) ? block.actions : [];
     var candidate = Number(block.candidate) || 0;
@@ -1498,6 +1525,15 @@
   }
 
   /* ============================== 卡片挂载与图表 ============================== */
+  function removeProgramCards() {
+    state.cardNodes.forEach(function (node, key) {
+      if (node && node.isConnected && node.getAttribute('data-card-type') === 'program') {
+        node.remove();
+        state.cardNodes.delete(key);
+      }
+    });
+  }
+
   function upsertCard(block) {
     if (!block || !block.id || !block.type) return;
     var turn = state.activeTurn;
@@ -1518,6 +1554,7 @@
       turn.cards.appendChild(node);
       turn.cardCount += 1;
     }
+    node.setAttribute('data-card-type', block.type);
     var html = renderCard(block);
     if (!html) return;
     node.innerHTML = html;
@@ -1527,7 +1564,10 @@
     if (codeBox) codeBox.scrollTop = codeBox.scrollHeight;
     var hasCode = block.type === 'work'
       && String((block.code_change || {}).diff || '').length > 0;
-    if (hasCode) state.pinnedOptimization = node;
+    if (hasCode) {
+      state.pinnedOptimization = node;
+      removeProgramCards();
+    }
     if (block.status === 'done' || block.status === 'error') {
       if (block.type === 'tuning' || state.pinnedOptimization === node) {
         state.pinnedOptimization = null;

@@ -156,6 +156,10 @@ def main(argv: list[str] | None = None) -> int:
 
         # AI 直接写程序：更换数学模型 → LLM 二次审核 → 寻优 → 审批 → 启用
         events = client.chat(sid, "更换数学模型")
+        program_cards = _blocks(events, "program")
+        assert program_cards, "代码生成过程中应实时推送 program 卡"
+        assert program_cards[-1]["status"] == "generated", program_cards[-1]
+        assert "main.py" in program_cards[-1]["files"], program_cards[-1]
         work = _blocks(events, "work")[-1]
         tuning = _blocks(events, "tuning")[-1]
         assert work["status"] == "done", work

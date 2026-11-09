@@ -176,7 +176,7 @@ Planner 每轮输出：
 - 程序是完整 Python 多文件模块（1~8 个顶层 `module.py`，总长 ≤20000 字符，模块间用 `import helpers` / `from helpers import x` 互相引用）；
 - 入口文件（默认 `main.py`）必须定义 `build_transform(params=None) -> transform(z, weights) -> pandas.Series`；可选定义 `select_stocks(scores, top_n, params=None) -> list[str]` 接管选股（`scores` 是 pandas.DataFrame，index=股票代码，含 `factor_score` 列与 z_* 因子列）；
 - 服务端**不做子进程冒烟测试**；执行前做 AST 白名单 / 受限 builtins / 入口契约校验，真正执行发生在网格寻优与回测阶段；
-- 程序生成后先经 **LLM 二次审核**（`program_review.txt`），审核不通过时自动修复一次并复审；仍不通过则返回 review 卡与问题清单，不生成候选、不启用；
+- 程序生成后先经 **LLM 安全审核**（`program_review.txt`，只检查沙箱/越权/恶意行为，不评价策略逻辑与收益），审核不通过时自动修复一次并复审；仍不通过则返回 review 卡与问题清单，不生成候选、不启用；
 - 第三方库：AI 在 `packages` 里申请，LLM 审核通过后服务端用 pip `--target data/ai_packages` 安装并写入审计 `program_install`；未申请的库会被静态校验拒绝；
 - 沙箱边界：禁止文件、网络、系统命令、动态执行、下划线属性访问；只允许白名单库 + 本程序模块 + 审核通过的第三方库；
 - 程序改动沿用现有 `code_change` 卡片逐行流式输出（多文件以文件名分段），候选/审批/版本/回滚机制不变。

@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import unittest
 
-from backend.agent import Agent, AgentError, ComplianceError, chunk_text, ensure_compliance
+from backend.agent import (Agent, AgentError, ComplianceError, chunk_text,
+                           ensure_compliance, preview_program_arguments)
 from backend.llm import ToolCall, ToolChatResult
 from tests.support.scripted_llm import ScriptedLLM
 from backend.schemas import profile_payload
@@ -68,6 +69,17 @@ class _ContextLLM:
 
 
 class SemanticContextTest(unittest.TestCase):
+    def test_preview_program_arguments_partial_json(self) -> None:
+        raw = ('{"files":[{"path":"main.py","content":"import pandas as pd\\n\\n'
+               'def build_transform():\\n    return None\\n"},'
+               '{"path":"helpers.py","content":"x = 1\\n"}]')
+        snapshot = preview_program_arguments(raw)
+        self.assertIsNotNone(snapshot)
+        self.assertIn("main.py", snapshot["files"])
+        self.assertIn("build_transform", snapshot["files"]["main.py"])
+        self.assertEqual(snapshot["files"]["helpers.py"], "x = 1\n")
+        self.assertEqual(snapshot["active"], "helpers.py")
+
     def test_payload_does_not_include_rich_blocks(self) -> None:
         history = [{"role": "assistant", "content": "好的",
                     "blocks": [{"type": "work", "code_change": {"diff": "+" * 500}}]}]

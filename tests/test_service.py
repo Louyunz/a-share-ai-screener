@@ -559,6 +559,17 @@ class ModelProgramToolTest(unittest.TestCase):
             },
         }
 
+    def test_program_is_streamed_while_being_written(self) -> None:
+        events = list(self.service.chat_stream(self.sid, "更换数学模型"))
+        program_blocks = [data["block"] for event, data in events
+                          if event == "ui"
+                          and (data.get("block") or {}).get("type") == "program"]
+        self.assertGreaterEqual(len(program_blocks), 2, "代码生成过程应多次流式更新")
+        self.assertEqual(len({block["id"] for block in program_blocks}), 1)
+        self.assertIn("main.py", program_blocks[-1]["files"])
+        self.assertIn("build_transform", program_blocks[-1]["files"]["main.py"])
+        self.assertEqual(program_blocks[-1]["status"], "generated")
+
     def test_rejected_program_is_auto_repaired_once(self) -> None:
         files = dict(SCRIPTED_PROGRAM_FILES)
         files["main.py"] += f"\n# {SCRIPTED_REJECT_MARKER}\n"
