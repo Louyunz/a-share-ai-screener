@@ -87,6 +87,38 @@ class ActionSchemaTest(unittest.TestCase):
         self.assertIn("candidate", properties)
         self.assertEqual(properties["candidate"].get("type"), "integer")
 
+    def test_write_model_program_tool_schema(self) -> None:
+        program_tool = next(item for item in TOOL_DEFINITIONS
+                            if item["function"]["name"] == "write_model_program")
+        properties = program_tool["function"]["parameters"]["properties"]
+        for key in ("files", "entry", "summary", "param_space", "objective",
+                    "packages", "escalate", "reason"):
+            self.assertIn(key, properties)
+        self.assertEqual(properties["files"]["type"], "array")
+        args = validate_tool_call("write_model_program", {
+            "files": [{"path": "main.py",
+                       "content": "def build_transform():\n    return None\n"}],
+            "entry": "main.py",
+            "summary": "测试程序",
+            "param_space": {"tilt": {"min": 0, "max": 1, "step": 0.5}},
+            "objective": "mdd",
+            "packages": ["scipy"],
+            "escalate": True,
+        })
+        self.assertEqual(args["entry"], "main.py")
+        self.assertEqual(args["files"]["main.py"].splitlines()[0],
+                         "def build_transform():")
+        self.assertEqual(args["packages"], ["scipy"])
+        self.assertTrue(args["escalate"])
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("write_model_program", {"files": []})
+        with self.assertRaises(ToolArgsError):
+            validate_tool_call("write_model_program", {
+                "files": [{"path": "main.py", "content": "x"}],
+                "entry": "main.py",
+                "unknown_field": True,
+            })
+
     def test_explain_results_args(self) -> None:
         args = validate_tool_call("explain_results", {"question": "为什么回撤大"})
         self.assertEqual(args["question"], "为什么回撤大")

@@ -49,21 +49,31 @@ def _state(*, confirmed: bool = True, pending: dict[str, Any] | None = None,
     }
 
 
+def _is_program(action: dict[str, Any] | None) -> bool:
+    """判断动作是否为 write_model_program 且给出了完整程序。"""
+    if not action or action.get("name") != "write_model_program":
+        return False
+    files = (action.get("args") or {}).get("files") or {}
+    if not isinstance(files, dict) or not files:
+        return False
+    return any("build_transform" in str(content) for content in files.values())
+
+
 CASES: list[dict[str, Any]] = [
     {
-        "name": "更换数学模型 → code",
+        "name": "更换数学模型 → write_model_program",
         "message": "更换数学模型",
-        "check": lambda action, reply: action is not None and action["args"]["engine"] == "code",
+        "check": lambda action, reply: _is_program(action),
     },
     {
-        "name": "构建新的投资数学模型 → code",
+        "name": "构建新的投资数学模型 → write_model_program",
         "message": "帮我构建一个新的投资数学模型",
-        "check": lambda action, reply: action is not None and action["args"]["engine"] == "code",
+        "check": lambda action, reply: _is_program(action),
     },
     {
-        "name": "写一个新的打分引擎 → code",
+        "name": "写一个新的打分引擎 → write_model_program",
         "message": "帮我写一个新的打分引擎",
-        "check": lambda action, reply: action is not None and action["args"]["engine"] == "code",
+        "check": lambda action, reply: _is_program(action),
     },
     {
         "name": "换其他模型 → model_type 自动选择",
@@ -85,18 +95,19 @@ CASES: list[dict[str, Any]] = [
         ),
     },
     {
-        "name": "用随机森林 → code",
+        "name": "用随机森林 → write_model_program",
         "message": "用随机森林模型帮我选股",
-        "check": lambda action, reply: (
-            action is not None and action["args"]["engine"] == "code"
-        ),
+        "check": lambda action, reply: _is_program(action),
         "state": _state(confirmed=True),
     },
     {
-        "name": "继续优化 → escalate",
+        "name": "继续优化 AI 程序 → write_model_program(escalate)",
         "message": "继续优化模型，上一版未达到我的预期",
-        "check": lambda action, reply: action is not None and bool(action["args"]["escalate"]),
-        "state": _state(pending={"summary": "上一版方案"}),
+        "check": lambda action, reply: _is_program(action) and bool(action["args"]["escalate"]),
+        "state": _state(pending={"summary": "上一版方案"}, pending_candidates=[
+            {"index": 1, "name": "AI 生成模型", "summary": "上一版程序",
+             "status": "pending", "available": True},
+        ]),
     },
     {
         "name": "普通优化 → 直接调用 auto",
@@ -188,8 +199,15 @@ def main() -> int:
             print(f"[{index:02d}] FAIL {case['name']}：调用失败 {type(exc).__name__}: {exc}")
             failures += 1
             continue
-        action = plan.action("analyze_model") or (
-            plan.actions[0] if plan.actions else None)
+        action = None
+        for tool_name in ("analyze_model", "write_model_program",
+                          "apply_pending_change", "rollback_version",
+                          "confirm_profile", "run_selection", "explain_results"):
+            action = plan.action(tool_name)
+            if action is not None:
+                break
+        if action is None and plan.actions:
+            action = plan.actions[0]
         try:
             ok = bool(case["check"](action, plan.reply))
         except Exception as exc:  # noqa: BLE001

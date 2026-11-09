@@ -22,6 +22,7 @@ from ..schemas import SLOT_KEYS
 __all__ = [
     "ACTION_NAMES",
     "AnalyzeModelArgs",
+    "WriteModelProgramArgs",
     "ToolArgsError",
     "TOOL_DEFINITIONS",
     "validate_tool_call",
@@ -33,6 +34,7 @@ ACTION_NAMES = (
     "run_selection",
     "explain_results",
     "analyze_model",
+    "write_model_program",
     "apply_pending_change",
     "rollback_version",
 )
@@ -125,12 +127,54 @@ class AnalyzeModelArgs(_StrictModel):
         }
 
 
+class ProgramFile(_StrictModel):
+    """AI 程序里的一个文件（顶层 module.py，内容为完整 Python 源码）。"""
+
+    path: str = Field(min_length=3, max_length=64)
+    content: str = Field(min_length=1, max_length=20000)
+
+
+class WriteModelProgramArgs(_StrictModel):
+    """AI 直接编写/编辑完整模型程序（多文件模块）。
+
+    入口文件必须定义 ``build_transform(params=None) -> transform(z, weights)``；
+    可选定义 ``select_stocks(scores, top_n, params=None)`` 接管选股。
+    ``packages`` 是向审核申请的第三方库（审核通过后服务端安装到 data/ai_packages）。
+    """
+
+    files: list[ProgramFile] = Field(min_length=1, max_length=8)
+    entry: str = Field(default="main.py", max_length=64)
+    summary: str = Field(default="", max_length=300)
+    param_space: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    objective: Literal["", "sharpe", "cagr", "mdd"] = ""
+    packages: list[str] = Field(default_factory=list, max_length=4)
+    escalate: bool = False
+    reason: str = Field(default="", max_length=120)
+    expected_effect: str = Field(default="", max_length=500)
+    risks: list[str] = Field(default_factory=list, max_length=8)
+
+    def clean(self) -> dict[str, Any]:
+        return {
+            "files": {item.path.strip(): item.content for item in self.files},
+            "entry": self.entry.strip() or "main.py",
+            "summary": self.summary.strip(),
+            "param_space": dict(self.param_space),
+            "objective": self.objective,
+            "packages": [str(item).strip() for item in self.packages if str(item).strip()],
+            "escalate": bool(self.escalate),
+            "reason": self.reason.strip(),
+            "expected_effect": self.expected_effect.strip(),
+            "risks": [str(item).strip() for item in self.risks if str(item).strip()],
+        }
+
+
 _TOOL_MODELS: dict[str, type[BaseModel]] = {
     "update_profile": UpdateProfileArgs,
     "confirm_profile": EmptyArgs,
     "run_selection": EmptyArgs,
     "explain_results": ExplainResultsArgs,
     "analyze_model": AnalyzeModelArgs,
+    "write_model_program": WriteModelProgramArgs,
     "apply_pending_change": ApplyPendingChangeArgs,
     "rollback_version": EmptyArgs,
 }
@@ -141,13 +185,20 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "run_selection": "画像已确认后，按当前会话模型执行 A 股筛选与回测；客户说开始/帮我选股时调用。",
     "explain_results": "最近已有选股结果、客户在追问原因/风险/怎么看时调用，回答只基于给定事实。",
     "analyze_model": (
-        "优化当前会话的投资模型（必须通过参数明确本轮引擎方向）。"
-        "客户要求构建/更换/新建一套新的投资数学模型、打分模型、引擎或公式时，"
-        "必须立即调用本工具并设 engine=code，由 AI 重写参数化打分引擎；"
-        "不要反问‘想换成哪种模型’、不要声称没有权限、不要只在文字里说会优化。"
-        "点名内置模型时 engine=model_type 并填 model_type；"
-        "客户说继续优化/上一版未达预期时 escalate=true；普通优化 engine=auto。"
-        "objective 取值来自客户本轮诉求，不确定留空。"
+        "调整当前会话投资模型的内置方向（不写代码）：点名内置模型 → engine=model_type 并填 model_type；"
+        "普通调参优化 → engine=auto；客户说继续优化/上一版未达预期 → escalate=true。"
+        "客户要求构建/更换/编辑一套新的数学模型、打分模型、引擎、程序或公式时，"
+        "不要用本工具，必须调用 write_model_program 直接编写完整程序；"
+        "不要反问‘想换成哪种模型’、不要声称没有权限写代码。"
+    ),
+    "write_model_program": (
+        "AI 直接编写/编辑完整的模型程序（多文件 Python）。客户要求构建、更换、重写、"
+        "定制数学/打分模型或修改现有模型程序时调用。必须给出完整可运行源码：入口文件"
+        "定义 build_transform(params=None) -> transform(z, weights)，可选定义 "
+        "select_stocks(scores, top_n, params=None) 接管选股；可写多个模块互相 import，"
+        "模块名用文件名（如 helpers.py → import helpers）。param_space 是交给服务端网格寻优"
+        "的参数范围（1~4 个，可省略则不做寻优）；需要额外的第三方库时在 packages 里申请，"
+        "由 LLM 审核决定是否安装。生成后会先经过 LLM 二次审核与安全校验，不会自动启用。"
     ),
     "apply_pending_change": (
         "存在待审批模型方案且客户本轮明确同意启用时调用。"
@@ -199,6 +250,8 @@ def validate_tool_call(name: str, arguments: Any) -> dict[str, Any]:
         )
         raise ToolArgsError(tool, detail) from exc
     if isinstance(model, AnalyzeModelArgs):
+        return model.clean()
+    if isinstance(model, WriteModelProgramArgs):
         return model.clean()
     if isinstance(model, ExplainResultsArgs):
         return model.clean()

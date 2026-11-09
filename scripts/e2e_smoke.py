@@ -153,6 +153,23 @@ def main(argv: list[str] | None = None) -> int:
         assert state["active_model"]["name"] == "均衡多因子", state["active_model"]
         print(f"[e2e] 回滚后当前会话模型：{state['active_model']['name']}，"
               f"会话版本 {len(state['versions'])} 个")
+
+        # AI 直接写程序：更换数学模型 → LLM 二次审核 → 寻优 → 审批 → 启用
+        events = client.chat(sid, "更换数学模型")
+        work = _blocks(events, "work")[-1]
+        tuning = _blocks(events, "tuning")[-1]
+        assert work["status"] == "done", work
+        assert tuning["status"] == "done", tuning
+        assert any(step.get("title") == "LLM 二次审核" for step in work["steps"]), work
+        code_change = work.get("code_change") or {}
+        assert code_change.get("diff"), "AI 程序应按行流式输出 diff"
+        assert "helpers.py" in "\n".join(code_change.get("files") or []), code_change
+        print(f"[e2e] AI 直接写程序（{len(code_change.get('files') or [])} 个模块）"
+              f" + 二次审核通过")
+        events = client.chat(sid, "同意，启用这个改进")
+        state = client.get(f"/api/sessions/{sid}/state")
+        assert state["active_model"]["name"] == "AI 生成模型", state["active_model"]
+        print(f"[e2e] 程序模型已启用：{state['active_model']['name']}")
         print("[e2e] [OK] 单对话全链路通过")
         return 0
     finally:

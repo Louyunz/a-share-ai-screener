@@ -25,11 +25,13 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+import types
+from collections.abc import Callable, Mapping, Sequence
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -39,10 +41,20 @@ from ..engine.factors import FACTOR_NAMES
 __all__ = [
     "MAX_SOURCE_CHARS",
     "SMOKE_TIMEOUT_SECONDS",
+    "MAX_PROGRAM_FILES",
+    "MAX_PROGRAM_CHARS",
+    "PROGRAM_ENTRY_DEFAULT",
     "ModelValidationError",
     "ModelCodeError",
+    "ProgramRuntime",
     "validate_code",
+    "validate_program",
     "compile_code",
+    "compile_program",
+    "normalize_package_specs",
+    "package_import_roots",
+    "ai_packages_dir",
+    "install_packages",
 ]
 
 # 源码长度上限（契约 6.3）
@@ -54,7 +66,37 @@ _SMOKE_ROWS = 8
 _SMOKE_SEED = 20240601
 
 # 允许导入的模块根名
-ALLOWED_IMPORT_ROOTS = ("math", "numpy", "pandas", "sklearn", "scipy")
+ALLOWED_IMPORT_ROOTS = (
+    "math", "numpy", "pandas", "sklearn", "scipy",
+    # 纯计算 stdlib：AI 编写程序时可自由使用
+    "itertools", "functools", "collections", "statistics", "numbers",
+    "re", "random", "datetime", "typing", "decimal", "fractions", "operator",
+)
+
+# AI 程序（write_model_program）的上限：多文件、更长源码
+MAX_PROGRAM_FILES = 8
+MAX_PROGRAM_CHARS = 20000
+PROGRAM_ENTRY_DEFAULT = "main.py"
+PIP_INSTALL_TIMEOUT_SECONDS = 240
+
+# 允许 AI 向审核申请安装的第三方包：包名 -> import 根名（无法自动推导时的映射）
+PACKAGE_ROOT_ALIASES = {
+    "scikit-learn": "sklearn",
+    "scikit_learn": "sklearn",
+    "statsmodels": "statsmodels",
+    "xgboost": "xgboost",
+    "lightgbm": "lightgbm",
+    "catboost": "catboost",
+    "shap": "shap",
+    "ta": "ta",
+}
+# 包名/版本约束的允许字符（排除 URL、git、本地路径等安装形式）
+_PACKAGE_SPEC_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,63})"
+    r"(?P<extras>\[[A-Za-z0-9_,. -]{1,64}\])?"
+    r"(?P<spec>([=<>!~]=?[0-9A-Za-z.*+!_-]{1,32})*)$"
+)
+_PROGRAM_PATH_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.py$")
 
 # sklearn 只允许模型/预处理相关的常用子模块，避免 datasets 等带文件 IO 的模块
 ALLOWED_SKLEARN_PREFIXES = (
@@ -241,8 +283,17 @@ class _RuleViolation(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _module_allowed(name: str) -> bool:
+def _module_allowed(
+    name: str,
+    *,
+    program_modules: frozenset[str] | set[str] | None = None,
+    extra_roots: Sequence[str] = (),
+) -> bool:
+    if program_modules and name in program_modules:
+        return True
     root = str(name).split(".")[0]
+    if root in set(extra_roots):
+        return True
     if root not in ALLOWED_IMPORT_ROOTS:
         return False
     if root == "sklearn":
@@ -252,18 +303,25 @@ def _module_allowed(name: str) -> bool:
     return True
 
 
-def _check_imports(tree: ast.Module) -> list[str]:
+def _check_imports(
+    tree: ast.Module,
+    *,
+    program_modules: frozenset[str] | set[str] | None = None,
+    extra_roots: Sequence[str] = (),
+) -> list[str]:
     """校验 import 白名单，返回人类可读的导入清单。"""
     imports: list[str] = []
+    allowed_roots = " / ".join(
+        list(ALLOWED_IMPORT_ROOTS) + sorted(set(extra_roots) - set(ALLOWED_IMPORT_ROOTS)))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root = alias.name.split(".")[0]
-                if not _module_allowed(alias.name):
+                if not _module_allowed(alias.name, program_modules=program_modules,
+                                       extra_roots=extra_roots):
                     raise _RuleViolation(
                         "imports",
                         f"第 {node.lineno} 行禁止导入 {alias.name}；"
-                        "只允许 math / numpy / pandas / sklearn（模型相关子模块）/ scipy",
+                        f"只允许 {allowed_roots} 以及本程序内的模块",
                     )
                 imports.append(
                     alias.name if alias.asname is None else f"{alias.name} as {alias.asname}"
@@ -272,12 +330,12 @@ def _check_imports(tree: ast.Module) -> list[str]:
             if node.level:
                 raise _RuleViolation("imports", f"第 {node.lineno} 行禁止相对导入")
             module = node.module or ""
-            root = module.split(".")[0]
-            if not _module_allowed(module):
+            if not _module_allowed(module, program_modules=program_modules,
+                                   extra_roots=extra_roots):
                 raise _RuleViolation(
                     "imports",
                     f"第 {node.lineno} 行禁止从 {module or '未知模块'} 导入；"
-                    "只允许 math / numpy / pandas / sklearn（模型相关子模块）/ scipy",
+                    f"只允许 {allowed_roots} 以及本程序内的模块",
                 )
             for alias in node.names:
                 if alias.name == "*":
@@ -721,13 +779,13 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     return builtins.__import__(name, globals, locals, fromlist, level)
 
 
-def _restricted_builtins() -> dict[str, Any]:
+def _restricted_builtins(import_hook=None) -> dict[str, Any]:
     allowed: dict[str, Any] = {}
     for name in SAFE_BUILTIN_NAMES:
         value = getattr(builtins, name, None)
         if value is not None:
             allowed[name] = value
-    allowed["__import__"] = _safe_import
+    allowed["__import__"] = import_hook or _safe_import
     return allowed
 
 
@@ -798,3 +856,364 @@ def compile_code(
     if not callable(transform):
         raise ModelCodeError("build_transform() 未返回可调用的 transform(z, weights)")
     return transform
+
+
+# ---------------------------------------------------------------------------
+# AI 程序（write_model_program）：多文件模块 + 可选选股钩子 + 第三方库申请
+# ---------------------------------------------------------------------------
+
+
+class ProgramRuntime:
+    """已编译的 AI 多文件程序运行时。"""
+
+    def __init__(
+        self,
+        *,
+        files: dict[str, str],
+        entry: str,
+        params: dict[str, Any],
+        transform: Callable[..., Any],
+        select_stocks: Callable[..., Any] | None,
+        imports: list[str],
+    ) -> None:
+        self.files = dict(files)
+        self.entry = entry
+        self.params = dict(params)
+        self.transform = transform
+        self.select_stocks = select_stocks
+        self.imports = list(imports)
+
+    def select(self, scores, top_n: int):
+        """选股钩子：程序里定义了 select_stocks 时使用，否则 None。"""
+        if self.select_stocks is None:
+            return None
+        return self.select_stocks(scores, int(top_n), dict(self.params))
+
+
+def _normalize_program_files(files: Mapping[str, Any] | list[Any]) -> dict[str, str]:
+    if isinstance(files, Mapping):
+        items = list(files.items())
+    elif isinstance(files, (list, tuple)):
+        items = []
+        for item in files:
+            if not isinstance(item, Mapping):
+                raise ModelCodeError("files 每项必须是 {path, content} 对象")
+            items.append((item.get("path"), item.get("content")))
+    else:
+        raise ModelCodeError("files 必须是文件列表或 {path: content} 字典")
+    if not items:
+        raise ModelCodeError("程序至少需要一个文件")
+    if len(items) > MAX_PROGRAM_FILES:
+        raise ModelCodeError(f"程序文件数 {len(items)} 超过上限 {MAX_PROGRAM_FILES}")
+    normalized: dict[str, str] = {}
+    total = 0
+    for path, content in items:
+        name = str(path or "").strip()
+        if not _PROGRAM_PATH_RE.match(name):
+            raise ModelCodeError(
+                f"程序文件名不合法：{name!r}；只允许顶层 module.py 形式（字母/数字/下划线）")
+        stem = name[: -len(".py")]
+        if stem in ALLOWED_IMPORT_ROOTS or stem in sys.stdlib_module_names:
+            raise ModelCodeError(f"程序文件名 {name!r} 与内置模块同名，请换一个名字")
+        source = str(content if content is not None else "")
+        if not source.strip():
+            raise ModelCodeError(f"程序文件 {name} 内容为空")
+        total += len(source)
+        normalized[name] = source
+    if total > MAX_PROGRAM_CHARS:
+        raise ModelCodeError(f"程序总长度 {total} 字符超过上限 {MAX_PROGRAM_CHARS}")
+    return normalized
+
+
+def _program_module_names(files: Mapping[str, str]) -> set[str]:
+    return {name[: -len(".py")] for name in files}
+
+
+def _program_trees(files: Mapping[str, str]) -> dict[str, ast.Module]:
+    trees: dict[str, ast.Module] = {}
+    for name, source in files.items():
+        try:
+            trees[name] = ast.parse(source, filename=name)
+        except SyntaxError as exc:
+            raise ModelCodeError(
+                f"程序文件 {name} 第 {exc.lineno} 行语法错误：{exc.msg}") from exc
+    return trees
+
+
+def validate_program(
+    files: Mapping[str, Any] | list[Any],
+    entry: str | None = None,
+    *,
+    extra_roots: Sequence[str] = (),
+) -> dict[str, Any]:
+    """校验 AI 多文件程序：语法 + 导入白名单 + AST 安全 + 入口函数。
+
+    与旧 ``validate_code`` 不同：**不做子进程冒烟**（按产品要求），真正执行在
+    网格寻优/回测阶段完成。
+    """
+    normalized = _normalize_program_files(files)
+    entry_name = str(entry or PROGRAM_ENTRY_DEFAULT).strip()
+    if entry_name not in normalized:
+        raise ModelCodeError(f"程序入口文件不存在：{entry_name}")
+    module_names = _program_module_names(normalized)
+    trees = _program_trees(normalized)
+    checks: list[dict[str, str]] = []
+    all_imports: list[str] = []
+    takes_params = False
+    for name, tree in trees.items():
+        try:
+            imports = _check_imports(tree, program_modules=module_names,
+                                     extra_roots=extra_roots)
+            _check_module_structure(tree)
+            _check_ast_safety(tree)
+            if name == entry_name:
+                takes_params = _check_entrypoint(tree)
+        except _RuleViolation as exc:
+            raise ModelCodeError(
+                f"程序 {name} 未通过校验（{exc.check}）：{exc.detail}") from exc
+        all_imports.extend(f"{name}: {item}" for item in imports)
+        checks.append({"name": "ast_safety", "status": "passed",
+                       "detail": f"{name}：语法/AST 白名单通过"})
+    checks.append({"name": "entrypoint", "status": "passed",
+                   "detail": f"{entry_name} 定义了 build_transform"})
+    return {
+        "ok": True,
+        "checks": checks,
+        "imports": all_imports,
+        "files": sorted(normalized),
+        "entry": entry_name,
+        "takes_params": takes_params,
+        "extra_roots": sorted(set(extra_roots)),
+    }
+
+
+def _program_dependency_order(
+    trees: Mapping[str, ast.Module], module_names: set[str]
+) -> list[str]:
+    """按 import 依赖返回模块执行顺序（返回去掉 .py 的模块名）。"""
+    stems = {name[: -len(".py")]: tree for name, tree in trees.items()}
+    dependencies: dict[str, set[str]] = {name: set() for name in stems}
+    for name, tree in stems.items():
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [(node.module or "").split(".")[0]]
+            for imported in names:
+                if imported in module_names and imported != name:
+                    dependencies[name].add(imported)
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            raise ModelCodeError(f"程序模块存在循环导入：{name}")
+        visiting.add(name)
+        for dependency in sorted(dependencies.get(name, ())):
+            visit(dependency)
+        visiting.discard(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for name in stems:
+        visit(name)
+    return ordered
+
+
+def compile_program(
+    files: Mapping[str, Any] | list[Any],
+    entry: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    *,
+    validate: bool = True,
+    extra_roots: Sequence[str] = (),
+    extra_paths: Sequence[Path | str] = (),
+) -> ProgramRuntime:
+    """编译 AI 多文件程序，返回 ``ProgramRuntime``（transform + 可选选股钩子）。
+
+    ``extra_roots`` 是审核通过、已安装到 ``data/ai_packages`` 的第三方 import 根名；
+    ``extra_paths`` 是这些包所在的目录（会加入 sys.path）。
+    """
+    cleaned_params = _clean_params(params)
+    if validate:
+        info = validate_program(files, entry, extra_roots=extra_roots)
+        normalized = _normalize_program_files(files)
+    else:
+        normalized = _normalize_program_files(files)
+        info = {"entry": str(entry or PROGRAM_ENTRY_DEFAULT),
+                "imports": [], "takes_params": True}
+    entry_name = str(info.get("entry") or entry or PROGRAM_ENTRY_DEFAULT)
+    if entry_name not in normalized:
+        raise ModelCodeError(f"程序入口文件不存在：{entry_name}")
+    module_names = _program_module_names(normalized)
+    trees = _program_trees(normalized)
+    takes_params = bool(info.get("takes_params"))
+    if not validate:
+        try:
+            takes_params = _check_entrypoint(trees[entry_name])
+        except _RuleViolation as exc:
+            raise ModelCodeError(f"程序入口检查失败：{exc.detail}") from exc
+    for path in extra_paths or ():
+        path_text = str(path)
+        if path_text and path_text not in sys.path:
+            sys.path.insert(0, path_text)
+    allowed_roots = set(ALLOWED_IMPORT_ROOTS) | set(extra_roots)
+    modules: dict[str, types.ModuleType] = {}
+
+    def _program_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level:
+            raise ImportError("程序内不允许相对导入")
+        root = str(name).split(".")[0]
+        if root in module_names:
+            module = modules.get(root)
+            if module is None:
+                raise ImportError(f"程序模块 {root} 尚未加载（请检查导入顺序）")
+            return module
+        if root not in allowed_roots:
+            raise ImportError(
+                f"不允许导入模块: {name}；如需第三方库请先向审核申请安装")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    for module_name in _program_dependency_order(trees, module_names):
+        file_name = module_name + ".py"
+        module = types.ModuleType(module_name)
+        module.__dict__["__builtins__"] = _restricted_builtins(_program_import)
+        module.__dict__["__file__"] = file_name
+        try:
+            exec(compile(normalized[file_name], file_name, "exec"), module.__dict__)
+        except Exception as exc:  # noqa: BLE001
+            raise ModelCodeError(
+                f"程序模块 {file_name} 执行失败：{type(exc).__name__}: {exc}") from exc
+        modules[module_name] = module
+    entry_stem = entry_name[: -len(".py")]
+    entry_module = modules[entry_stem]
+    build_transform = entry_module.__dict__.get("build_transform")
+    if not callable(build_transform):
+        raise ModelCodeError("程序入口未提供可调用的 build_transform()")
+    try:
+        transform = (
+            build_transform(cleaned_params) if takes_params else build_transform())
+    except Exception as exc:  # noqa: BLE001
+        raise ModelCodeError(
+            f"build_transform() 执行失败：{type(exc).__name__}: {exc}") from exc
+    if not callable(transform):
+        raise ModelCodeError("build_transform() 必须返回可调用的 transform(z, weights)")
+    select_raw = entry_module.__dict__.get("select_stocks")
+    select_hook = select_raw if callable(select_raw) else None
+    return ProgramRuntime(
+        files=normalized,
+        entry=entry_name,
+        params=cleaned_params,
+        transform=transform,
+        select_stocks=select_hook,
+        imports=list(info.get("imports") or []),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 第三方库：审核通过后的安装（data/ai_packages，data 目录不受 git 部署覆盖）
+# ---------------------------------------------------------------------------
+
+
+def normalize_package_specs(packages: Sequence[str] | None) -> list[str]:
+    """校验 AI 申请的 PyPI 包名/版本约束，最多 4 个，拒绝 URL/路径/git 形式。"""
+    if not packages:
+        return []
+    if not isinstance(packages, (list, tuple)):
+        raise ModelCodeError("packages 必须是字符串列表")
+    if len(packages) > 4:
+        raise ModelCodeError("一次最多申请安装 4 个第三方库")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in packages:
+        text = str(raw or "").strip()
+        match = _PACKAGE_SPEC_RE.match(text)
+        if not match:
+            raise ModelCodeError(
+                f"第三方库名不合法：{text!r}；只允许 PyPI 包名 + 版本约束，不支持 URL/路径/git")
+        name = match.group("name").lower()
+        if name in {"pip", "setuptools", "wheel"}:
+            raise ModelCodeError(f"不允许通过该接口安装基础工具包：{text}")
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(text)
+    return cleaned
+
+
+def package_import_roots(packages: Sequence[str] | None) -> list[str]:
+    """把包名映射成 import 根名（供程序导入白名单使用）。"""
+    roots: set[str] = set()
+    for spec in normalize_package_specs(packages):
+        base = spec.split("[")[0]
+        base = re.split(r"[=<>!~]", base)[0].strip().lower()
+        roots.add(PACKAGE_ROOT_ALIASES.get(base, base.replace("-", "_").replace(".", "_")))
+    return sorted(roots)
+
+
+def ai_packages_dir(data_dir: Path | str | None = None) -> Path:
+    """AI 审核通过后安装的第三方库目录（默认 data/ai_packages）。"""
+    if data_dir is not None:
+        return Path(data_dir) / "ai_packages"
+    from ..config import DATA_DIR
+    return Path(DATA_DIR) / "ai_packages"
+
+
+def install_packages(
+    packages: Sequence[str] | None,
+    *,
+    target_dir: Path | str | None = None,
+    timeout: int = PIP_INSTALL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """安装审核通过的第三方库到 ``data/ai_packages``，并把清单写入 manifest。"""
+    specs = normalize_package_specs(packages)
+    if not specs:
+        return {"installed": [], "roots": [], "target": "", "output": ""}
+    target = Path(target_dir) if target_dir is not None else ai_packages_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.setdefault("PIP_NO_INPUT", "1")
+    env["PYTHONIOENCODING"] = "utf-8"
+    command = [
+        sys.executable, "-m", "pip", "install",
+        "--target", str(target), "--upgrade", "--no-cache-dir",
+        "--disable-pip-version-check", *specs,
+    ]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as exc:
+        raise ModelCodeError(
+            f"安装第三方库超时（>{timeout}s）：{', '.join(specs)}") from exc
+    except OSError as exc:
+        raise ModelCodeError(f"无法启动 pip 安装：{exc}") from exc
+    output = ((completed.stdout or b"") + (completed.stderr or b"")).decode(
+        "utf-8", errors="replace")[-1500:]
+    if completed.returncode != 0:
+        raise ModelCodeError(
+            f"第三方库安装失败（{', '.join(specs)}）：{output or 'pip 返回非零退出码'}")
+    manifest = target / "manifest.json"
+    previous: list[str] = []
+    if manifest.exists():
+        try:
+            loaded = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                previous = [str(item) for item in loaded]
+        except (OSError, json.JSONDecodeError):
+            previous = []
+    merged = sorted(set(previous) | set(specs))
+    try:
+        manifest.write_text(json.dumps(merged, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+    except OSError:
+        pass
+    return {
+        "installed": specs,
+        "roots": package_import_roots(specs),
+        "target": str(target),
+        "output": output,
+    }

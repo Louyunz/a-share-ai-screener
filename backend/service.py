@@ -373,6 +373,9 @@ class AppService:
         if name == "analyze_model":
             return (yield from self._analyze_model(session_id, request_text,
                                                    action.get("args") or {}))
+        if name == "write_model_program":
+            return (yield from self._write_model_program(
+                session_id, request_text, action.get("args") or {}))
         if name == "apply_pending_change":
             candidate = int((action.get("args") or {}).get("candidate") or 0)
             return (yield from self._apply_pending(session_id, candidate))
@@ -403,18 +406,20 @@ class AppService:
         if not profile or not profile["confirmed"]:
             raise ConflictError("画像还没确认，先和我说清楚你的情况吧")
         model = self._session_active_model(session_id)
-        weights, transform = self._model_engine(model)
+        weights, transform, select_hook = self._model_runtime(model)
         from .engine import selection
 
         top_df, _scores = selection.screen(self.data, weights, top_n=DEFAULT_TOP_N,
-                                           score_transform=transform)
+                                           score_transform=transform,
+                                           select_hook=select_hook)
         portfolio = selection.build_portfolio(top_df, self.data.prices,
                                               method="equal_weight", capital=1_000_000.0)
         start, end = self._backtest_window()
         backtest = selection.run_backtest(
             self.data, weights, start=start, end=end, top_n=DEFAULT_TOP_N,
             rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY, cost_sell=COST_SELL,
-            risk_free_rate=RISK_FREE_RATE, score_transform=transform)
+            risk_free_rate=RISK_FREE_RATE, score_transform=transform,
+            select_hook=select_hook)
 
         contributions: dict[str, float] = {}
         top_payload: list[dict[str, Any]] = []
@@ -511,14 +516,20 @@ class AppService:
         from .models import custom, pipeline, registry
 
         intent = intent if isinstance(intent, dict) else {}
+        preset_plan = intent.pop("_preset_plan", None)
         model = self._session_active_model(session_id)
-        base_weights, base_transform = self._model_engine(model)
+        base_weights, base_transform, base_select = self._model_runtime(model)
         base_metrics = self._current_metrics(session_id)
 
         runtime_before = self.store.get_state(session_id)
         previous_pending = runtime_before.get("pending") or {}
         previous_approach = self._previous_approach(previous_pending)
         directive = resolve_directive(intent, previous_approach=previous_approach)
+        if (directive.engine == "code"
+                and not isinstance(preset_plan, dict)):
+            raise ConflictError(
+                "旧的“后台生成代码”方式已废弃：请改用 write_model_program 工具，"
+                "由 AI 直接编写完整程序")
         if directive.engine == "model_type" and not directive.model_type:
             directive = EngineDirective(
                 engine="model_type",
@@ -617,7 +628,8 @@ class AppService:
         yield "ui", publish()
 
         top_df, scores = selection.screen(self.data, base_weights, top_n=DEFAULT_TOP_N,
-                                          score_transform=base_transform)
+                                          score_transform=base_transform,
+                                          select_hook=base_select)
         focus = self._factor_focus(top_df, base_weights)
         add_step("翻数据找线索", f"最近组合更看重：{'、'.join(focus[:3]) or '均衡配置'}；"
                                  "先把偏弱的环节找出来。", "done", "data")
@@ -642,18 +654,29 @@ class AppService:
                 "max_trials": 1,
             }
         else:
-            try:
-                plan = pipeline.build_tuning_plan(self.llm, self._tuning_state(
-                    model, base_metrics, factor_stats, recent_metrics, request_text,
-                    directive=directive, previous=previous_pending))
-            except Exception as exc:  # noqa: BLE001
-                raise AgentError(f"AI 没能给出调参方案：{exc}") from exc
-            if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
-                plan = plan["plan"]
+            if isinstance(preset_plan, dict):
+                plan = dict(preset_plan)
+            else:
+                try:
+                    plan = pipeline.build_tuning_plan(self.llm, self._tuning_state(
+                        model, base_metrics, factor_stats, recent_metrics, request_text,
+                        directive=directive, previous=previous_pending))
+                except Exception as exc:  # noqa: BLE001
+                    raise AgentError(f"AI 没能给出调参方案：{exc}") from exc
+                if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
+                    plan = plan["plan"]
             if not isinstance(plan, dict) or not plan.get("approach"):
                 raise AgentError("AI 返回的调参方案格式不对")
+        program_review = (plan.get("program_review")
+                          if isinstance(plan.get("program_review"), dict) else None)
+        if program_review:
+            add_step(
+                "LLM 二次审核",
+                (f"审核通过（风险等级 {program_review.get('risk_level', 'medium')}）："
+                 f"{str(program_review.get('summary') or '').strip()}").strip(),
+                "done", "check")
         self.store.audit(
-            "analyze_model", reason="llm_tool",
+            "analyze_model", reason="llm_tool" if not program_review else "program_tool",
             payload={
                 "tool_args": _json_safe(intent),
                 "directive": {
@@ -666,7 +689,11 @@ class AppService:
                 "plan": {"approach": plan.get("approach"),
                          "objective": plan.get("objective"),
                          "model_type": plan.get("model_type"),
-                         "repair_attempts": plan.get("repair_attempts", 0)},
+                         "repair_attempts": plan.get("repair_attempts", 0),
+                         "program_files": sorted((plan.get("files") or {}).keys())
+                         if isinstance(plan.get("files"), dict) else [],
+                         "program_review": program_review,
+                         "packages": plan.get("package_specs") or []},
             })
         narration = self._plan_narration(plan, directive, target_model, objective_label)
         yield "token", {"text": "\n\n"}
@@ -742,6 +769,10 @@ class AppService:
             engine_kind = "param" if plan["approach"] == "code" else "weight"
             engine_weights = normalize_weights(plan.get("weights") or base_weights)
             code = str(plan.get("code") or "")
+            program_files = (plan.get("files")
+                             if isinstance(plan.get("files"), dict) else None)
+            program_entry = str(plan.get("entry") or "main.py")
+            program_roots = list(plan.get("packages") or [])
             if engine_kind == "weight":
                 search_space = dict(plan.get("search_space") or {})
                 labels = {name: FACTOR_PLAIN.get(name, name) for name in search_space}
@@ -765,12 +796,23 @@ class AppService:
                         risk_free_rate=risk_free_rate)
                     return {"metrics": backtest["metrics"],
                             "params": tuned_weights, "nav": backtest["nav"]}
-                trial_transform = custom.compile_code(code, params, validate=False)  # type: ignore[attr-defined]
+                if program_files:
+                    trial_runtime = custom.compile_program(
+                        program_files, program_entry, params, validate=False,
+                        extra_roots=program_roots,
+                        extra_paths=[custom.ai_packages_dir()])
+                    trial_transform = trial_runtime.transform
+                    trial_select = trial_runtime.select_stocks
+                else:
+                    trial_transform = custom.compile_code(  # type: ignore[attr-defined]
+                        code, params, validate=False)
+                    trial_select = None
                 backtest = selection.run_backtest(
                     self.data, engine_weights, start=start_date, end=end_date,
                     top_n=DEFAULT_TOP_N, rebalance_days=rebalance_days,
                     cost_buy=cost_buy, cost_sell=cost_sell,
-                    risk_free_rate=risk_free_rate, score_transform=trial_transform)
+                    risk_free_rate=risk_free_rate, score_transform=trial_transform,
+                    select_hook=trial_select)
                 return {"metrics": backtest["metrics"],
                         "params": dict(params), "nav": backtest["nav"]}
 
@@ -856,9 +898,18 @@ class AppService:
             else:
                 candidate_weights = engine_weights
                 try:
-                    validation = custom.validate_code(code, tuned_params)  # type: ignore[attr-defined]
+                    if program_files:
+                        validation = custom.validate_program(
+                            program_files, program_entry, extra_roots=program_roots)
+                        custom.compile_program(
+                            program_files, program_entry, tuned_params, validate=False,
+                            extra_roots=program_roots,
+                            extra_paths=[custom.ai_packages_dir()])
+                    else:
+                        validation = custom.validate_code(  # type: ignore[attr-defined]
+                            code, tuned_params)
                 except custom.ModelValidationError as exc:  # type: ignore[attr-defined]
-                    raise AgentError(f"AI 生成的模型引擎用最优参数校验失败：{exc}") from exc
+                    raise AgentError(f"AI 生成的模型程序用最优参数校验失败：{exc}") from exc
                 checks = "、".join(str(item.get("name")) for item in validation.get("checks", []))
             steps[-1] = dict(
                 steps[-1], status="done",
@@ -1063,6 +1114,182 @@ class AppService:
         blocks.extend([comparison_block, approval])
         return blocks, note_text, False
 
+    # ------------------------------------------------------------------
+    # 动作：AI 直接编写程序（write_model_program）
+    # ------------------------------------------------------------------
+    def _write_model_program(self, session_id: str, request_text: str = "",
+                             args: dict[str, Any] | None = None):
+        from .engine import tuning
+        from .models import custom
+
+        args = args if isinstance(args, dict) else {}
+        raw_files = args.get("files")
+        if isinstance(raw_files, dict):
+            files = {str(path): str(content) for path, content in raw_files.items()}
+        elif isinstance(raw_files, list):
+            files = {}
+            for item in raw_files:
+                if isinstance(item, dict) and item.get("path"):
+                    files[str(item["path"])] = str(item.get("content") or "")
+        else:
+            files = {}
+        entry = str(args.get("entry") or "main.py")
+        packages = list(args.get("packages") or [])
+        summary = str(args.get("summary") or "")
+        objective = str(args.get("objective") or "")
+        param_space_raw = args.get("param_space") or {}
+        risks = list(args.get("risks") or [])
+        expected = str(args.get("expected_effect") or "")
+        reason = str(args.get("reason") or "")
+        escalate = bool(args.get("escalate"))
+
+        # 1) 基础结构与参数空间校验（不执行代码）
+        try:
+            requested_roots = custom.package_import_roots(packages)
+            custom.validate_program(files, entry, extra_roots=requested_roots)
+            param_space = (tuning.normalize_param_space(param_space_raw)
+                           if param_space_raw else {})
+        except custom.ModelValidationError as exc:
+            raise AgentError(f"AI 程序未通过基础校验：{exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - 参数空间错误等
+            raise AgentError(f"AI 程序参数不合法：{exc}") from exc
+        if not param_space:
+            raise AgentError("write_model_program 需要至少 1 个可寻优参数（param_space）")
+
+        # 2) LLM 二次审核；不通过时自动修复一次并复审
+        review = self.agent.review_program(
+            files=files, entry=entry, summary=summary, objective=objective,
+            packages=packages, request_text=request_text)
+        if not self._review_passed(review, packages):
+            try:
+                repaired = self.agent.repair_program(
+                    files=files, summary=summary, objective=objective,
+                    packages=packages, request_text=request_text, review=review)
+            except AgentError as exc:
+                return (yield from self._program_review_failure(
+                    session_id, review, f"自动修复失败：{exc}"))
+            files = repaired.get("files") or files
+            entry = str(repaired.get("entry") or entry)
+            packages = list(repaired.get("packages") or [])
+            summary = str(repaired.get("summary") or summary)
+            expected = str(repaired.get("expected_effect") or expected)
+            risks = list(repaired.get("risks") or risks)
+            param_space_raw = repaired.get("param_space") or param_space_raw
+            try:
+                custom.validate_program(
+                    files, entry, extra_roots=custom.package_import_roots(packages))
+                param_space = (tuning.normalize_param_space(param_space_raw)
+                               if param_space_raw else {})
+            except Exception as exc:  # noqa: BLE001
+                return (yield from self._program_review_failure(
+                    session_id, review, f"修复后的程序不合法：{exc}"))
+            review = self.agent.review_program(
+                files=files, entry=entry, summary=summary, objective=objective,
+                packages=packages, request_text=request_text, repair_attempt=True)
+            if not self._review_passed(review, packages):
+                return (yield from self._program_review_failure(session_id, review, ""))
+
+        # 3) 审核通过的第三方库才允许安装
+        installed_roots: list[str] = []
+        if packages:
+            try:
+                installed = self._install_program_packages(session_id, packages)
+                installed_roots = list(installed.get("roots") or [])
+            except AgentError as exc:
+                return (yield from self._program_review_failure(session_id, review, str(exc)))
+        allowed_roots = sorted(set(installed_roots) | set(custom.package_import_roots(packages)))
+
+        # 4) 交给现有寻优/回测/审批流水线（preset plan）
+        plan = {
+            "approach": "code",
+            "files": dict(files),
+            "entry": entry,
+            "code": str(files.get(entry) or ""),
+            "param_space": param_space,
+            "packages": allowed_roots,
+            "package_specs": list(packages),
+            "summary": summary or str(review.get("summary") or "AI 编写的模型程序"),
+            "why": (f"客户本轮要求：{request_text[:200]}" if request_text
+                    else "客户要求定制模型程序"),
+            "expected_effect": expected,
+            "risks": risks or list(review.get("suggestions") or []),
+            "objective": objective,
+            "max_trials": 24,
+            "repair_attempts": 0,
+            "program_review": review,
+        }
+        intent = {"engine": "code", "model_type": "", "objective": objective,
+                  "escalate": escalate, "reason": reason, "_preset_plan": plan}
+        return (yield from self._analyze_model(session_id, request_text, intent))
+
+    @staticmethod
+    def _review_passed(review: dict[str, Any], packages: list[str]) -> bool:
+        if not isinstance(review, dict) or not review.get("approved"):
+            return False
+        if not packages:
+            return True
+        from .models import custom
+
+        approved = set()
+        for raw in review.get("approved_packages") or []:
+            text = str(raw or "").strip().lower()
+            if not text:
+                continue
+            approved.add(text)
+            try:
+                approved.update(custom.package_import_roots([text]))
+            except Exception:  # noqa: BLE001 - 审核返回的包名可能带版本/格式问题
+                pass
+        for spec in packages:
+            name = str(spec or "").strip().lower().split("[")[0]
+            name = name.split("=")[0].split("<")[0].split(">")[0].split("!")[0].split("~")[0].strip()
+            if name and name not in approved:
+                return False
+        return True
+
+    def _install_program_packages(self, session_id: str,
+                                  packages: list[str]) -> dict[str, Any]:
+        from .models import custom
+
+        try:
+            result = custom.install_packages(packages)
+        except Exception as exc:  # noqa: BLE001
+            raise AgentError(f"第三方库安装失败：{exc}") from exc
+        self.store.audit(
+            "program_install", reason="program_tool",
+            payload={"packages": list(packages), "roots": result.get("roots") or []})
+        return result
+
+    def _program_review_failure(self, session_id: str, review: dict[str, Any],
+                                extra: str = ""):
+        issues = [str(item).strip() for item in review.get("issues") or []
+                  if str(item).strip()]
+        suggestions = [str(item).strip() for item in review.get("suggestions") or []
+                       if str(item).strip()]
+        note_parts = list(issues[:5])
+        if not note_parts and extra:
+            note_parts.append(extra)
+        block = {
+            "id": "review-" + uuid.uuid4().hex[:8],
+            "type": "review",
+            "title": "AI 程序二次审核未通过",
+            "status": "failed",
+            "risk_level": review.get("risk_level") or "medium",
+            "issues": issues,
+            "suggestions": suggestions,
+            "summary": str(review.get("summary") or ""),
+        }
+        yield "ui", {"block": block}
+        if note_parts:
+            yield "token", {"text": "\n\n"}
+            note = "程序没有启用。审核意见：" + "；".join(note_parts)
+            if extra and extra not in note_parts:
+                note += f"；{extra}"
+            for piece in chunk_text(note):
+                yield "token", {"text": piece}
+            return [block], note, False
+        return [block], "", False
+
     def _tuning_state(self, model: dict[str, Any], base_metrics: dict[str, Any],
                       factor_stats: dict[str, Any], recent_metrics: dict[str, Any],
                       request_text: str, *, directive: EngineDirective,
@@ -1136,10 +1363,12 @@ class AppService:
     def _plan_detail(plan: dict[str, Any]) -> str:
         approach = str(plan.get("approach") or "")
         space = plan.get("search_space") or plan.get("param_space") or {}
+        files = plan.get("files") if isinstance(plan.get("files"), dict) else {}
         engine = {"weights": "线性因子权重引擎",
                   "model_type": "内置模型引擎",
-                  "code": "自定义代码引擎"}.get(approach, "模型引擎")
-        return (f"AI 选定{engine}，只负责编写底层逻辑并给出 {len(space)} 个参数的搜索范围；"
+                  "code": "自定义程序引擎"}.get(approach, "模型引擎")
+        module_hint = f"（{len(files)} 个程序模块）" if files else ""
+        return (f"AI 选定{engine}{module_hint}，只负责编写底层逻辑并给出 {len(space)} 个参数的搜索范围；"
                 "具体取值由服务端网格寻优逐组回测选出，AI 不直接拍参数。")
 
     def _candidate_model_name(self, plan: dict[str, Any]) -> str:
@@ -1161,11 +1390,17 @@ class AppService:
 
         approach = str(plan.get("approach") or "")
         if approach == "code":
+            files = plan.get("files") if isinstance(plan.get("files"), dict) else {}
+            entry = str(plan.get("entry") or "main.py")
             return {
                 "kind": "code", "model_id": "ai_generated", "name": "AI 生成模型",
                 "description": str(plan.get("summary") or ""),
                 "weights": plan.get("weights") or {},
-                "code": plan.get("code") or "",
+                "code": str(plan.get("code") or files.get(entry) or ""),
+                "files": dict(files),
+                "entry": entry,
+                "packages": list(plan.get("packages") or []),
+                "package_specs": list(plan.get("package_specs") or []),
                 "params": dict(tuned_params),
                 "summary": str(plan.get("summary") or ""),
             }
@@ -1222,6 +1457,8 @@ class AppService:
         """生成模型改动预览：代码方案展示源码 diff，权重/模型类型展示配置 diff。"""
         approach = proposal.get("approach")
         if approach == "code":
+            if isinstance(proposal.get("files"), dict) and proposal["files"]:
+                return cls._program_change(current_model, proposal)
             return cls._code_change(current_model, proposal["code"])
         from .engine.factors import FACTOR_NAMES
         from .models import registry
@@ -1285,7 +1522,7 @@ class AppService:
 
     @staticmethod
     def _code_change(current_model: dict[str, Any], code: str) -> dict[str, Any]:
-        """生成代码方案的行级 diff。"""
+        """生成单文件代码方案的行级 diff（旧版单文件程序兼容）。"""
         current_code = str((current_model or {}).get("code") or "")
         new_lines = str(code or "").splitlines()
         file_name = "models/strategy.py"
@@ -1304,17 +1541,84 @@ class AppService:
                 "diff": "\n".join(diff_lines), "added": added, "removed": removed}
 
     @staticmethod
+    def _program_files_of(item: dict[str, Any] | None) -> dict[str, str]:
+        """从模型/方案里取出程序文件集合（兼容旧的单 code 字符串）。"""
+        item = item or {}
+        files = item.get("files")
+        if isinstance(files, dict) and files:
+            return {str(path): str(content) for path, content in files.items()}
+        code = str(item.get("code") or "")
+        if code.strip():
+            return {"main.py": code}
+        return {}
+
+    @classmethod
+    def _program_change(cls, current_model: dict[str, Any],
+                        proposal: dict[str, Any]) -> dict[str, Any]:
+        """多文件程序的逐文件 diff；沿用 code_change 卡片，前端仍逐行流式展示。"""
+        current_files = cls._program_files_of(current_model)
+        new_files = cls._program_files_of(proposal)
+        diff_lines: list[str] = []
+        added = removed = 0
+        for path in sorted(set(current_files) | set(new_files)):
+            old = current_files.get(path, "")
+            new = new_files.get(path, "")
+            if old == new:
+                continue
+            if not old:
+                diff_lines.append("--- /dev/null")
+                diff_lines.append(f"+++ {path}（AI 新增）")
+                for line in new.splitlines():
+                    diff_lines.append("+" + line)
+                    added += 1
+                continue
+            if not new:
+                diff_lines.append(f"--- {path}（AI 删除）")
+                diff_lines.append("+++ /dev/null")
+                for line in old.splitlines():
+                    diff_lines.append("-" + line)
+                    removed += 1
+                continue
+            chunk = list(difflib.unified_diff(
+                old.splitlines(), new.splitlines(),
+                fromfile=path + "（当前）", tofile=path + "（候选）", lineterm=""))
+            diff_lines.extend(chunk)
+            added += sum(1 for line in chunk
+                         if line.startswith("+") and not line.startswith("+++"))
+            removed += sum(1 for line in chunk
+                           if line.startswith("-") and not line.startswith("---"))
+        if not diff_lines:
+            diff_lines = ["  （程序内容无变化）"]
+        return {
+            "file": f"AI 程序（{len(new_files)} 个模块）",
+            "files": sorted(new_files),
+            "language": "python",
+            "kind": "code",
+            "diff": "\n".join(diff_lines),
+            "added": added,
+            "removed": removed,
+        }
+
+    @staticmethod
     def _proposal_public(proposal: dict[str, Any], model_name: str | None = None) -> dict[str, Any]:
         approach_label = ("切换基础模型" if proposal.get("switch_only") else
                           {"model_type": "服务端网格寻优（切换基础模型）",
                            "weights": "服务端网格寻优（因子权重）",
-                           "code": "服务端网格寻优（自定义引擎）"}.get(
+                           "code": "服务端网格寻优（自定义程序）"}.get(
                               str(proposal.get("approach")), "网格寻优"))
+        files = proposal.get("files") if isinstance(proposal.get("files"), dict) else {}
+        combined = ""
+        if files:
+            combined = "\n\n".join(
+                f"# ===== {path} =====\n{files[path]}" for path in sorted(files))
         return {
             "summary": proposal.get("summary", ""),
             "approach": approach_label,
             "model_name": model_name or proposal.get("model_type") or "网格寻优权重",
-            "diff": proposal.get("code", ""),
+            "diff": combined or proposal.get("code", ""),
+            "files": sorted(files),
+            "entry": str(proposal.get("entry") or ""),
+            "packages": list(proposal.get("package_specs") or []),
             "why": proposal.get("why", ""),
             "expected_effect": proposal.get("expected_effect", ""),
             "risks": proposal.get("risks") or [],
@@ -1655,14 +1959,45 @@ class AppService:
             "metrics": metrics or {},
         }
 
+    def _model_program_runtime(self, model: dict[str, Any]):
+        """多文件 AI 程序的运行时（非程序模型返回 None）。"""
+        if model.get("kind") != "code":
+            return None
+        files = model.get("files") if isinstance(model.get("files"), dict) else None
+        if not files and model.get("code"):
+            files = {"main.py": str(model["code"])}
+        if not files:
+            return None
+        from .models import custom
+        params = model.get("params") if isinstance(model.get("params"), dict) else {}
+        return custom.compile_program(
+            files,
+            str(model.get("entry") or "main.py"),
+            params,
+            extra_roots=list(model.get("packages") or []),
+            extra_paths=[custom.ai_packages_dir()],
+        )
+
     def _model_engine(self, model: dict[str, Any]) -> tuple[dict[str, float], Any]:
         weights = normalize_weights(model.get("weights") or {})
+        runtime = self._model_program_runtime(model)
+        if runtime is not None:
+            return weights, runtime.transform
         transform = None
         if model.get("kind") == "code" and model.get("code"):
             from .models import custom
             params = model.get("params") if isinstance(model.get("params"), dict) else None
             transform = custom.compile_code(str(model["code"]), params)
         return weights, transform
+
+    def _model_runtime(self, model: dict[str, Any]):
+        """返回 (weights, transform, select_hook)；select_hook 只对 AI 程序存在。"""
+        runtime = self._model_program_runtime(model)
+        if runtime is not None:
+            weights = normalize_weights(model.get("weights") or {})
+            return weights, runtime.transform, runtime.select_stocks
+        weights, transform = self._model_engine(model)
+        return weights, transform, None
 
     @staticmethod
     def _previous_approach(pending: dict[str, Any] | None) -> str:
@@ -1694,12 +2029,13 @@ class AppService:
         active = self.store.session_active_version(session_id)
         if active and active.get("metrics"):
             return _json_safe(active["metrics"])
-        weights, transform = self._model_engine(model)
+        weights, transform, select_hook = self._model_runtime(model)
         start, end = self._backtest_window()
         backtest = selection.run_backtest(
             self.data, weights, start=start, end=end, top_n=DEFAULT_TOP_N,
             rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY, cost_sell=COST_SELL,
-            risk_free_rate=RISK_FREE_RATE, score_transform=transform)
+            risk_free_rate=RISK_FREE_RATE, score_transform=transform,
+            select_hook=select_hook)
         return _json_safe(backtest["metrics"])
 
     @staticmethod
@@ -1722,7 +2058,7 @@ class AppService:
 
     def _recent_metrics(self, model: dict[str, Any]) -> dict[str, Any]:
         from .engine import selection
-        weights, transform = self._model_engine(model)
+        weights, transform, select_hook = self._model_runtime(model)
         index = self.data.prices.index
         end = index[-1]
         start = max(end - pd.Timedelta(days=365), index[min(len(index) - 1, 200)])
@@ -1730,7 +2066,8 @@ class AppService:
             self.data, weights, start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"), top_n=DEFAULT_TOP_N,
             rebalance_days=REBALANCE_DAYS, cost_buy=COST_BUY, cost_sell=COST_SELL,
-            risk_free_rate=RISK_FREE_RATE, score_transform=transform)
+            risk_free_rate=RISK_FREE_RATE, score_transform=transform,
+            select_hook=select_hook)
         return _json_safe(backtest["metrics"])
 
     @staticmethod

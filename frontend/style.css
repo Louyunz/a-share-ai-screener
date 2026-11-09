@@ -339,6 +339,11 @@ strong, b { font-weight: 600; }
 .approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .card-approval.is-answered .approval-actions { opacity: 0.55; }
 
+.card-review { border-color: #FCA5A5; }
+.review-list { margin: 10px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.review-list li + li { margin-top: 3px; }
+.review-note { margin: 8px 0 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.55; }
+
 /* 版本 */
 .version-active { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 0px solid var(--border-default); border-radius: var(--radius-card); }
 .version-active-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }

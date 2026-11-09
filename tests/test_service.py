@@ -10,7 +10,14 @@ import unittest
 
 from backend.data.base import save_bundle
 from backend.data.sample import generate_bundle
-from tests.support.scripted_llm import ScriptedLLM
+from backend.agent import AgentError
+from backend.service import AppService, ConflictError, NotFoundError
+from tests.support.scripted_llm import (
+    SCRIPTED_PROGRAM_FILES,
+    SCRIPTED_PROGRAM_PARAM_SPACE,
+    SCRIPTED_REJECT_MARKER,
+    ScriptedLLM,
+)
 from backend.models import registry
 from backend.schemas import Plan, profile_summary
 from backend.service import AppService, ConflictError, NotFoundError
@@ -139,7 +146,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertGreater(diff_lengths[-1], diff_lengths[0])
         self.assertGreaterEqual(len(set(diff_lengths)), 3, "diff 应逐行增长而不是一次性出现")
         self.assertEqual((works[-1].get("proposal") or {}).get("approach"),
-                         "服务端网格寻优（自定义引擎）")
+                         "服务端网格寻优（自定义程序）")
         approval_text = " ".join(str(approvals[-1].get(key, ""))
                                  for key in ("title", "summary", "risk"))
         self.assertIn("网格寻优", approval_text)
@@ -518,6 +525,129 @@ class PendingCandidateSelectionTest(unittest.TestCase):
         self.assertEqual(self.service._session_active_model(self.sid)["name"], first_name)
 
 
+class ModelProgramToolTest(unittest.TestCase):
+    """AI 直接写程序（write_model_program）：二次审核、自动修复、安装第三方库。"""
+
+    def setUp(self) -> None:
+        self.dir = workdir("program_tool")
+        save_bundle(generate_bundle(n_stocks=15, n_days=240, seed=3), self.dir / "a_share")
+        self.service = AppService(data_dir=self.dir / "a_share", db_path=self.dir / "app.db",
+                                  llm=ScriptedLLM())
+        self.sid = self.service.create_session()["session_id"]
+        self.service.store.save_profile(self.sid, PROFILE_SLOTS,
+                                        profile_summary(PROFILE_SLOTS), True)
+
+    def tearDown(self) -> None:
+        self.service.close()
+        cleanup(self.dir)
+
+    def _action(self, files=None, packages=None, param_space=None) -> dict:
+        return {
+            "name": "write_model_program",
+            "args": {
+                "files": [{"path": path, "content": content}
+                          for path, content in (files or SCRIPTED_PROGRAM_FILES).items()],
+                "entry": "main.py",
+                "summary": "测试：AI 编写的多文件模型程序",
+                "param_space": param_space or dict(SCRIPTED_PROGRAM_PARAM_SPACE),
+                "objective": "",
+                "packages": list(packages or []),
+                "escalate": False,
+                "reason": "test-program",
+                "expected_effect": "",
+                "risks": [],
+            },
+        }
+
+    def test_rejected_program_is_auto_repaired_once(self) -> None:
+        files = dict(SCRIPTED_PROGRAM_FILES)
+        files["main.py"] += f"\n# {SCRIPTED_REJECT_MARKER}\n"
+        events = list(self.service._run_action(
+            self.sid, self._action(files=files), "更换数学模型"))
+        self.assertFalse([data for event, data in events if event == "error"])
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertIsNotNone(pending)
+        model = pending.get("model") or {}
+        self.assertNotIn(SCRIPTED_REJECT_MARKER,
+                         "\n".join((model.get("files") or {}).values()))
+
+    def test_rejected_program_always_rejected_shows_review(self) -> None:
+        files = dict(SCRIPTED_PROGRAM_FILES)
+        files["main.py"] += f"\n# {SCRIPTED_REJECT_MARKER}\n"
+        original = self.service.agent.review_program
+
+        def always_reject(**kwargs):
+            return {"approved": False, "risk_level": "high",
+                    "issues": ["测试：始终拒绝"], "suggestions": [],
+                    "approved_packages": [], "package_notes": [],
+                    "summary": "审核未通过"}
+
+        self.service.agent.review_program = always_reject  # type: ignore[assignment]
+        try:
+            events = list(self.service._run_action(
+                self.sid, self._action(files=files), "更换数学模型"))
+        finally:
+            self.service.agent.review_program = original
+        reviews = [data["block"] for event, data in events
+                   if event == "ui" and data["block"]["type"] == "review"]
+        self.assertTrue(reviews)
+        self.assertEqual(reviews[-1]["status"], "failed")
+        text = "".join(data.get("text", "") for event, data in events if event == "token")
+        self.assertIn("审核意见", text)
+        self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
+
+    def test_forbidden_import_rejected_before_generation(self) -> None:
+        files = {"main.py": (
+            "import os\n"
+            "def build_transform():\n"
+            "    def transform(z, weights):\n"
+            "        return z.iloc[:, 0]\n"
+            "    return transform\n")}
+        with self.assertRaises(AgentError):
+            list(self.service._run_action(
+                self.sid, self._action(files=files), "更换数学模型"))
+        self.assertIsNone(self.service.store.get_state(self.sid).get("pending"))
+
+    def test_missing_param_space_rejected(self) -> None:
+        with self.assertRaises(AgentError):
+            list(self.service._run_action(
+                self.sid, self._action(param_space={"tilt": {}}), "更换数学模型"))
+
+    def test_approved_package_is_installed_and_audited(self) -> None:
+        from backend.models import custom
+
+        files = dict(SCRIPTED_PROGRAM_FILES)
+        files["main.py"] = "import scipy\n" + files["main.py"]
+        original = custom.install_packages
+
+        def fake_install(packages):
+            return {"installed": list(packages), "roots": ["scipy"],
+                    "target": "/tmp/ai_packages", "output": ""}
+
+        custom.install_packages = fake_install  # type: ignore[assignment]
+        try:
+            events = list(self.service._run_action(
+                self.sid, self._action(files=files, packages=["scipy"]),
+                "更换数学模型"))
+        finally:
+            custom.install_packages = original
+        self.assertFalse([data for event, data in events if event == "error"])
+        pending = self.service.store.get_state(self.sid).get("pending")
+        self.assertIsNotNone(pending)
+        self.assertIn("scipy", (pending.get("model") or {}).get("packages") or [])
+        audit = self.service.store.list_audit(limit=8)
+        self.assertTrue(any(item["action"] == "program_install" for item in audit))
+
+    def test_old_analyze_model_code_path_is_redirected(self) -> None:
+        with self.assertRaises(ConflictError):
+            list(self.service._run_action(
+                self.sid,
+                {"name": "analyze_model",
+                 "args": {"engine": "code", "model_type": "", "objective": "",
+                          "escalate": False, "reason": "旧写法"}},
+                "更换数学模型"))
+
+
 class WeightTuningTest(unittest.TestCase):
     """权重引擎：AI 只给 search_space，服务端负责把权重试出来。"""
 
@@ -625,67 +755,33 @@ class WeightTuningTest(unittest.TestCase):
         _weights, zero_transform = self.service._model_engine(model)
         self.assertEqual(list(zero_transform(frame, weights)), [0.0, 0.0])
 
-    def test_new_math_model_request_forces_code_engine(self) -> None:
-        """「更换数学模型」必须通过 tool 参数强制 AI 重写引擎，不能降级为调权重/换风格。"""
-        from backend.models import pipeline
-
-        param_code = (
-            "import pandas as pd\n\n"
-            "def build_transform(params=None):\n"
-            "    tilt = float((params or {}).get('tilt', 0.3))\n"
-            "    def transform(z, weights):\n"
-            "        score = pd.Series(0.0, index=z.index, dtype=float)\n"
-            "        for factor, weight in weights.items():\n"
-            "            column = 'z_' + factor\n"
-            "            if column in z.columns:\n"
-            "                values = pd.to_numeric(z[column], errors='coerce').fillna(0.0)\n"
-            "                score = score + float(weight) * values\n"
-            "        return score * tilt\n"
-            "    return transform\n"
-        )
-        captured: dict = {}
-        base = dict(registry.get_model("multi_factor")["weights"])
-        plan = {
-            "approach": "code",
-            "summary": "把打分方式换成一套新的参数化数学引擎",
-            "code": param_code,
-            "param_space": {"tilt": {"min": 0.0, "max": 0.8, "step": 0.2,
-                                     "type": "float", "default": 0.4}},
-            "weights": base,
-            "objective": "sharpe",
-            "max_trials": 8,
-            "why": "原引擎对回撤控制不足",
-            "expected_effect": "回撤有望下降",
-            "risks": ["历史回测不代表未来表现"],
-            "repair_attempts": 0,
-        }
-
-        def fake_plan(llm, state):
-            captured.update(state)
-            return dict(plan)
-
-        original = pipeline.build_tuning_plan
-        pipeline.build_tuning_plan = fake_plan
-        try:
-            events = list(self.service.chat_stream(self.sid, "更换数学模型"))
-        finally:
-            pipeline.build_tuning_plan = original
+    def test_new_math_model_request_writes_program(self) -> None:
+        """「更换数学模型」必须走 write_model_program，AI 直接写完整多文件程序。"""
+        events = list(self.service.chat_stream(self.sid, "更换数学模型"))
         self.assertFalse([data for event, data in events if event == "error"])
-        self.assertEqual(captured["directive"]["engine"], "code")
         works = [data["block"] for event, data in events
                  if event == "ui" and data["block"]["type"] == "work"]
         self.assertTrue(works)
         self.assertEqual((works[-1].get("proposal") or {}).get("approach"),
-                         "服务端网格寻优（自定义引擎）")
-        self.assertEqual((works[-1].get("code_change") or {}).get("kind"), "code")
+                         "服务端网格寻优（自定义程序）")
+        titles = [step.get("title") for step in works[-1]["steps"]]
+        self.assertIn("LLM 二次审核", titles)
+        change = works[-1].get("code_change") or {}
+        self.assertEqual(change.get("kind"), "code")
+        self.assertIn("helpers.py", "\n".join(change.get("files") or []))
         pending = self.service.store.get_state(self.sid).get("pending")
-        self.assertEqual((pending.get("model") or {}).get("kind"), "code")
-        # 审计：意图来源必须是 llm_tool，而不是关键词
-        audit = self.service.store.list_audit(limit=5)
+        model = pending.get("model") or {}
+        self.assertEqual(model.get("kind"), "code")
+        self.assertIn("main.py", model.get("files") or {})
+        self.assertIn("helpers.py", model.get("files") or {})
+        self.assertTrue(model.get("params"))
+        # 审计：走 program_tool（不是 analyze_model(engine=code) 的隐藏生成）
+        audit = self.service.store.list_audit(limit=8)
         analyze = [item for item in audit if item["action"] == "analyze_model"]
         self.assertTrue(analyze)
-        self.assertEqual(analyze[0]["payload"]["tool_args"]["engine"], "code")
-        self.assertEqual(analyze[0]["payload"]["directive"]["engine"], "code")
+        self.assertEqual(analyze[0]["reason"], "program_tool")
+        self.assertIn("main.py", analyze[0]["payload"]["plan"]["program_files"])
+        self.assertEqual(analyze[0]["payload"]["plan"]["program_review"]["approved"], True)
 
     def test_objective_from_tool_args(self) -> None:
         """目标指标由 tool args 传入，服务端不再从用户原话 regex 猜测。"""

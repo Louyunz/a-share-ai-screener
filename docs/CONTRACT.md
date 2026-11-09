@@ -156,7 +156,7 @@ Planner 每轮输出：
 
 ```json
 // tool_calls（模型主动调用）
-[{"name":"analyze_model","args":{"engine":"code","model_type":"","objective":"","escalate":false,"reason":"客户要求更换数学模型"}}]
+[{"name":"write_model_program","args":{"files":[{"path":"main.py","content":"..."}],"entry":"main.py","summary":"按客户要求编写非线性打分程序","param_space":{"tilt":{"min":0,"max":1,"step":0.25}},"objective":"mdd","packages":[]}}]
 ```
 
 工具 schema 的唯一来源：`backend/chat/action_schema.py`（Pydantic 模型同时用于运行时校验、发给模型的 JSON Schema、测试）。服务端不再解析自然语言判断意图。
@@ -167,29 +167,39 @@ Planner 每轮输出：
 | `confirm_profile` | `{}` | 画像必填齐全且用户本轮明确确认 | 写入 confirmed，返回 profile 卡 |
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
-| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | `engine=model_type` 时切换内置模型并使用其预设权重（不寻优）；其他 engine 执行调参方案 → 服务端网格寻优（实时 tuning 卡）→ 改动 diff → 回测 → work/tuning/approval 卡，**不自动启用** |
+| `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 只做内置模型/权重层面调整；`engine=model_type` 切换内置模型并使用预设权重，其他 engine 走服务端调参方案 → 网格寻优 → work/tuning/approval 卡，**不自动启用**。`engine="code"` 已废弃，服务端会要求改用 `write_model_program` |
+| `write_model_program` | `{files[], entry, summary, param_space, objective, packages[], escalate, reason, expected_effect, risks[]}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → LLM 二次审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端网格寻优/回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
 | `apply_pending_change` | `{candidate?}` | 存在待审批候选方案且用户本轮明确同意/指定 | `candidate` 为候选方案编号（按出现顺序 1..N；缺省=最新待审批方案），当前会话启用该候选模型版本，返回 version 卡 |
 | `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
 
+**AI 程序接口（write_model_program）**：
+- 程序是完整 Python 多文件模块（1~8 个顶层 `module.py`，总长 ≤20000 字符，模块间用 `import helpers` / `from helpers import x` 互相引用）；
+- 入口文件（默认 `main.py`）必须定义 `build_transform(params=None) -> transform(z, weights) -> pandas.Series`；可选定义 `select_stocks(scores, top_n, params=None) -> list[str]` 接管选股（`scores` 是 pandas.DataFrame，index=股票代码，含 `factor_score` 列与 z_* 因子列）；
+- 服务端**不做子进程冒烟测试**；执行前做 AST 白名单 / 受限 builtins / 入口契约校验，真正执行发生在网格寻优与回测阶段；
+- 程序生成后先经 **LLM 二次审核**（`program_review.txt`），审核不通过时自动修复一次并复审；仍不通过则返回 review 卡与问题清单，不生成候选、不启用；
+- 第三方库：AI 在 `packages` 里申请，LLM 审核通过后服务端用 pip `--target data/ai_packages` 安装并写入审计 `program_install`；未申请的库会被静态校验拒绝；
+- 沙箱边界：禁止文件、网络、系统命令、动态执行、下划线属性访问；只允许白名单库 + 本程序模块 + 审核通过的第三方库；
+- 程序改动沿用现有 `code_change` 卡片逐行流式输出（多文件以文件名分段），候选/审批/版本/回滚机制不变。
+
 **多候选方案**：同一会话可先后产生多个候选方案（每次 `analyze_model` 一个），服务端按出现顺序编号 1..N 并保存在 `session_state.candidates`；Planner 状态中 `pending_candidates` 给出 `index/name/summary/status/available`。客户说“用第一个/第二个/第三个方案”时通过 `apply_pending_change(candidate=N)` 指定；旧会话（升级前只存了最新 pending）会从已持久化的 work/comparison/approval 卡片中尽力还原候选列表，无法无损还原的旧代码方案标记为 `available=false`，引导客户重新优化。`rollback_version` 只适用于已启用过的版本链，与“在未启用候选之间做选择”是不同动作。
 
-**换模型与调参分离**：客户说“换其他模型/换个模型”但未点名时，AI 调用 `analyze_model(engine="model_type", model_type="", escalate=false)`；服务端选择与当前不同的内置模型，**直接使用预设权重回测**，不跑网格寻优。只有“继续优化/上一版未达预期”才 `escalate=true` 进入结构性升级或参数寻优。
+**换模型与调参分离**：客户说“换其他模型/换个模型”但未点名时，AI 调用 `analyze_model(engine="model_type", model_type="", escalate=false)`；服务端选择与当前不同的内置模型，**直接使用预设权重回测**，不跑网格寻优。客户要求构建/更换/编辑模型程序、或“继续优化/上一版未达预期”的结构性升级，则通过 `write_model_program` 由 AI 直接写程序（上一版是权重/内置模型时也优先写程序）。
 
 **`analyze_model` 参数语义**（由 AI 判断，服务端只做确定性策略）：
-- `engine`: `auto`（普通优化，由 pipeline 决定） / `weights`（只调因子权重） / `model_type`（点名内置模型） / `code`（构建或更换新的数学模型/打分引擎）
+- `engine`: `auto`（普通优化，由 pipeline 决定） / `weights`（只调因子权重） / `model_type`（点名内置模型）；`code` 已废弃（服务端拒绝并要求使用 `write_model_program`）
 - `model_type`: `engine=model_type` 时的内置模型 id（`multi_factor/low_vol_quality/momentum_growth/value_dividend/contrarian`）
 - `objective`: `sharpe|cagr|mdd`，空字符串表示默认夏普
-- `escalate`: 客户说继续优化/上一版未达预期时为 true；服务端按上一版结构做升级（上一版权重→换基础模型；上一版模型/代码→写 code），禁止只调权重
+- `escalate`: 客户说继续优化/上一版未达预期时为 true；结构性升级由 `write_model_program` 完成
 - `reason`: 一句话审计原因（不参与路由）
 
 **动作前置校验**：服务端校验“当前状态是否允许该动作”（apply 需要存在待审批候选方案、rollback 需要可回滚版本、选股需要已确认画像等）；不合法时不猜意图，而是把结构化错误回传 LLM，让它重新调用工具（最多一次）。仍不合法则返回明确错误。
 
-**“更换数学模型”约定**：`数学模型/打分模型/引擎/公式` 指底层打分逻辑，必须 `engine=code`；不允许降级成切内置模型或只调权重，也不允许声称没有权限写代码。
+**“更换数学模型”约定**：`数学模型/打分模型/引擎/程序/公式` 指底层打分逻辑，必须调用 `write_model_program` 直接写完整程序；不允许降级成切内置模型或只调权重，也不允许声称没有权限写代码；旧的 `analyze_model(engine="code")` 隐藏生成路径已删除。
 
 **AI 与服务的调参分工**：
-- AI 只输出 `approach + search_space/param_space + code`（见 6.2），**不输出最终权重/参数值**；
+- AI 直接负责程序源码（`files`）与参数搜索范围（`param_space`），**不输出最终参数值**；
 - 服务端在范围内执行逐轴网格搜索，逐组回测后按目标指标保留最优（见 6.5）；
-- 最终候选的权重/参数由服务端写回模型与改动框，并在 tuning 卡中展示搜索范围与得分走势。
+- 最终候选的参数由服务端写回模型与改动框，并在 tuning 卡中展示搜索范围与得分走势。
 
 ## 5. 画像槽位（生活化标签）
 

@@ -12,6 +12,44 @@ from typing import Any
 
 from backend.llm import LLMError, ToolCall, ToolChatResult, extract_json
 
+# 测试/演示用：write_model_program 的确定性多文件程序（覆盖 helpers 模块与选股钩子）
+SCRIPTED_PROGRAM_FILES = {
+    "main.py": (
+        "import pandas as pd\n"
+        "import helpers\n"
+        "\n"
+        "def build_transform(params=None):\n"
+        "    options = params or {}\n"
+        "    tilt = float(options.get('tilt', 0.5))\n"
+        "    def transform(z, weights):\n"
+        "        base = helpers.weighted_score(z, weights)\n"
+        "        vol = pd.to_numeric(z['z_volatility_60'], errors='coerce').fillna(0.0)\n"
+        "        return base + tilt * vol\n"
+        "    return transform\n"
+        "\n"
+        "def select_stocks(scores, top_n, params=None):\n"
+        "    ordered = scores.sort_values('factor_score', ascending=False)\n"
+        "    return list(ordered.index[:int(top_n)])\n"
+    ),
+    "helpers.py": (
+        "import pandas as pd\n"
+        "\n"
+        "def weighted_score(z, weights):\n"
+        "    total = pd.Series(0.0, index=z.index, dtype=float)\n"
+        "    for name, weight in weights.items():\n"
+        "        column = 'z_' + name\n"
+        "        if column in z.columns:\n"
+        "            values = pd.to_numeric(z[column], errors='coerce').fillna(0.0)\n"
+        "            total = total + float(weight) * values\n"
+        "    return total\n"
+    ),
+}
+SCRIPTED_PROGRAM_PARAM_SPACE = {
+    "tilt": {"min": 0.0, "max": 1.0, "step": 0.25, "type": "float", "default": 0.5},
+}
+SCRIPTED_REJECT_MARKER = "SCRIPTED_REJECT"
+
+
 
 class ScriptedLLM:
     """确定性模型：驱动无 Key 的自动化测试与现场演示。
@@ -31,11 +69,62 @@ class ScriptedLLM:
                 payload = extract_json(content)
             except LLMError:
                 payload = {}
+        if "files" in payload and "review" in payload:
+            return self._repair_program(payload)
+        if "files" in payload and "contract" in payload:
+            return self._review_program(payload)
         if payload.get("tuning_request"):
             return self._tuning_plan(payload)
         if "facts" in payload:
             return {"text": self._explain(payload["facts"], payload.get("question", ""))}
         return self._plan(payload)
+
+    # ------------------------------------------------------------------
+    # AI 程序二次审核（测试替身）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _program_text(files: Any) -> str:
+        if isinstance(files, dict):
+            return "\n".join(str(value) for value in files.values())
+        if isinstance(files, list):
+            return "\n".join(str((item or {}).get("content") or "") for item in files)
+        return ""
+
+    def _review_program(self, payload: dict[str, Any]) -> dict[str, Any]:
+        packages = [str(item) for item in payload.get("packages") or []]
+        text = self._program_text(payload.get("files"))
+        if SCRIPTED_REJECT_MARKER in text:
+            return {
+                "approved": False,
+                "risk_level": "high",
+                "issues": ["代码包含必被拒绝的测试标记，请移除后重写"],
+                "suggestions": ["按审核意见修复后再复审"],
+                "approved_packages": [],
+                "package_notes": ["测试标记存在时不批准任何依赖"],
+                "summary": "审核未通过：存在阻塞问题",
+            }
+        return {
+            "approved": True,
+            "risk_level": "low",
+            "issues": [],
+            "suggestions": [],
+            "approved_packages": packages,
+            "package_notes": [f"{name}：测试替身默认批准" for name in packages],
+            "summary": "审核通过：程序符合契约与客户要求（测试替身）",
+        }
+
+    @staticmethod
+    def _repair_program(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "files": [{"path": path, "content": content}
+                      for path, content in SCRIPTED_PROGRAM_FILES.items()],
+            "entry": "main.py",
+            "summary": "按审核意见修复后的模型程序（测试替身）",
+            "param_space": dict(SCRIPTED_PROGRAM_PARAM_SPACE),
+            "packages": [],
+            "expected_effect": "修复后程序应能通过复审并参与寻优回测。",
+            "risks": ["历史回测不代表未来表现"],
+        }
 
     def chat_text(self, system: str, messages: list[dict[str, str]]) -> str:
         content = messages[-1]["content"] if messages else ""
@@ -252,6 +341,25 @@ class ScriptedLLM:
             args["objective"] = "mdd"
         return args
 
+    @staticmethod
+    def _program_action(analyze_intent: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": "write_model_program",
+            "args": {
+                "files": [{"path": path, "content": content}
+                          for path, content in SCRIPTED_PROGRAM_FILES.items()],
+                "entry": "main.py",
+                "summary": "测试替身生成的多文件模型程序：加权打分 + 低波倾斜 + 选股钩子。",
+                "param_space": dict(SCRIPTED_PROGRAM_PARAM_SPACE),
+                "objective": analyze_intent.get("objective") or "",
+                "packages": [],
+                "escalate": bool(analyze_intent.get("escalate")),
+                "reason": "fake-llm-program",
+                "expected_effect": "在低波因子上做小幅倾斜，预期回撤控制更稳。",
+                "risks": ["历史回测不代表未来表现"],
+            },
+        }
+
     def _plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         state = payload.get("state") or {}
         message = str(payload.get("user_message", ""))
@@ -267,6 +375,9 @@ class ScriptedLLM:
         pending_intent = state.get("pending_intent")
         choice = self._candidate_choice(message)
         analyze_intent = self._analyze_intent(message)
+        # 结构化升级统一走“AI 直接重写程序”；普通优化仍交给 analyze_model（AI 定范围）
+        program_needed = (analyze_intent["engine"] == "code"
+                          or bool(analyze_intent["escalate"]))
         actions: list[dict[str, Any]] = []
 
         if pending_intent and not self._is_question(message):
@@ -282,6 +393,10 @@ class ScriptedLLM:
         elif (pending or candidates) and self._agree(message):
             actions = [{"name": "apply_pending_change", "args": {}}]
             reply = "收到。我将应用该改进方案并切换模型版本，随后给出对比结果。"
+        elif program_needed and profile.get("confirmed"):
+            actions = [self._program_action(analyze_intent)]
+            reply = ("收到。我会按您的要求直接编写完整的模型程序，先经 LLM 二次审核与安全校验，"
+                     "再由服务端寻优回测；确认前不会启用。")
         elif (self._wants_optimize(message)
               or analyze_intent["engine"] != "auto"
               or analyze_intent["escalate"]) and profile.get("confirmed"):

@@ -104,10 +104,18 @@ class Agent:
     @staticmethod
     def _payload(state: dict[str, Any], history: list[dict[str, Any]],
                  message: str) -> str:
+        # 富卡片 blocks（净值序列、程序 diff、寻优历史等）只用于前端渲染，
+        # 不发给 Planner，避免上下文被大量结构化数据撑爆。
+        compact_history = [
+            {"role": str(item.get("role") or ""),
+             "content": str(item.get("content") or "")[:1200]}
+            for item in history[-8:]
+            if isinstance(item, dict)
+        ]
         return json.dumps({
             "state": state,
             "user_message": message,
-            "recent_history": history[-8:],
+            "recent_history": compact_history,
         }, ensure_ascii=False)
 
     @staticmethod
@@ -283,6 +291,81 @@ class Agent:
         except LLMError as exc:
             raise AgentError(f"解读生成失败：{exc}") from exc
         return ensure_compliance(text)
+
+    # ------------------------------------------------------------------
+    # AI 程序（write_model_program）：二次审核 + 审核不通过时自动修复一次
+    # ------------------------------------------------------------------
+    def review_program(self, *, files: dict[str, str], entry: str,
+                       summary: str, objective: str, packages: list[str],
+                       request_text: str, repair_attempt: bool = False) -> dict[str, Any]:
+        """让 LLM 对 AI 刚生成的程序做二次审核，返回结构化审核结果。"""
+        payload = {
+            "customer_request": request_text,
+            "summary": summary,
+            "objective": objective,
+            "files": [{"path": path, "content": files[path]} for path in sorted(files)],
+            "packages": list(packages),
+            "entry": entry,
+            "repair_attempt": bool(repair_attempt),
+            "contract": (
+                "入口文件定义 build_transform(params=None) -> transform(z, weights)；"
+                "可选 select_stocks(scores, top_n, params=None)；z 只含 10 个 z_* 因子列；"
+                "多文件模块按文件名互相 import；沙箱禁止文件/网络/系统/动态执行。"
+            ),
+        }
+        try:
+            raw = self.llm.chat_json(
+                _load_prompt("program_review.txt"),
+                [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            )
+        except LLMError as exc:
+            raise AgentError(f"程序二次审核失败：{exc}") from exc
+        if not isinstance(raw, dict) or "approved" not in raw:
+            raise AgentError("程序二次审核没有返回有效的 JSON 结果")
+        issues = [str(item).strip() for item in raw.get("issues") or [] if str(item).strip()]
+        suggestions = [str(item).strip() for item in raw.get("suggestions") or []
+                       if str(item).strip()]
+        approved_packages = [str(item).strip().lower()
+                             for item in raw.get("approved_packages") or []
+                             if str(item).strip()]
+        risk = str(raw.get("risk_level") or "medium").strip().lower()
+        if risk not in ("low", "medium", "high"):
+            risk = "medium"
+        return {
+            "approved": bool(raw.get("approved")),
+            "risk_level": risk,
+            "issues": issues[:8],
+            "suggestions": suggestions[:8],
+            "approved_packages": approved_packages,
+            "package_notes": [str(item).strip() for item in raw.get("package_notes") or []
+                              if str(item).strip()][:8],
+            "summary": str(raw.get("summary") or "").strip()[:300],
+        }
+
+    def repair_program(self, *, files: dict[str, str], summary: str, objective: str,
+                       packages: list[str], request_text: str,
+                       review: dict[str, Any]) -> dict[str, Any]:
+        """审核不通过时让 LLM 按审核意见自动改写程序（只自动修复一次）。"""
+        payload = {
+            "customer_request": request_text,
+            "files": [{"path": path, "content": files[path]} for path in sorted(files)],
+            "packages": list(packages),
+            "review": review,
+            "objective": objective,
+        }
+        try:
+            raw = self.llm.chat_json(
+                _load_prompt("program_repair.txt"),
+                [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            )
+        except LLMError as exc:
+            raise AgentError(f"程序自动修复失败：{exc}") from exc
+        if not isinstance(raw, dict):
+            raise AgentError("程序自动修复没有返回有效的 JSON 结果")
+        try:
+            return validate_tool_call("write_model_program", raw)
+        except ToolArgsError as exc:
+            raise AgentError(f"自动修复后的程序参数不合法：{exc.detail}") from exc
 
 
 def safe_question(text: str) -> str:

@@ -68,6 +68,13 @@ class _ContextLLM:
 
 
 class SemanticContextTest(unittest.TestCase):
+    def test_payload_does_not_include_rich_blocks(self) -> None:
+        history = [{"role": "assistant", "content": "好的",
+                    "blocks": [{"type": "work", "code_change": {"diff": "+" * 500}}]}]
+        payload = json.loads(Agent._payload({"profile": {}}, history, "继续"))
+        self.assertNotIn("blocks", payload["recent_history"][0])
+        self.assertEqual(payload["recent_history"][0]["role"], "assistant")
+
     def test_plan_uses_update_profile_tool_for_contextual_slot(self) -> None:
         llm = _ContextLLM()
         state = {"profile": {"complete": False, "confirmed": False,
@@ -136,9 +143,10 @@ class AgentPlanTest(unittest.TestCase):
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
                  "loss_reaction": "会有点慌，但先不卖"}
         plan = self.agent.plan(_state(slots, confirmed=True), [], "更换数学模型")
-        action = plan.action("analyze_model")
+        action = plan.action("write_model_program")
         self.assertIsNotNone(action)
-        self.assertEqual(action["args"]["engine"], "code")
+        self.assertIn("main.py", action["args"]["files"])
+        self.assertTrue(action["args"]["param_space"])
 
     def test_analyze_intent_model_type(self) -> None:
         slots = {"goal": "退休养老", "horizon": "5 年", "drawdown_tolerance": "15%",
@@ -153,7 +161,8 @@ class AgentPlanTest(unittest.TestCase):
                  "loss_reaction": "会有点慌，但先不卖"}
         plan = self.agent.plan(_state(slots, confirmed=True, pending={"summary": "旧方案"}),
                                [], "继续优化模型，上一版未达到我的预期")
-        action = plan.action("analyze_model")
+        action = plan.action("write_model_program")
+        self.assertIsNotNone(action)
         self.assertTrue(action["args"]["escalate"])
 
     def test_analyze_intent_objective(self) -> None:

@@ -74,6 +74,37 @@ def _apply_score_transform(scores: pd.DataFrame, weights: dict, score_transform)
     return output.sort_values("factor_score", ascending=False)
 
 
+def _apply_select_hook(scores: pd.DataFrame, top_n: int, select_hook):
+    """用 AI 程序里的 select_stocks 钩子接管选股；非法返回转成业务错误。"""
+    if select_hook is None:
+        return None
+    try:
+        raw = select_hook(scores.copy(), int(top_n))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"自定义选股程序执行失败：{exc}") from exc
+    if raw is None:
+        return None
+    try:
+        raw_codes = list(raw)
+    except TypeError as exc:
+        raise ValueError("select_stocks 必须返回股票代码列表") from exc
+    codes: list[str] = []
+    seen: set[str] = set()
+    for item in raw_codes:
+        code = str(item).strip()
+        if not code or code in seen:
+            continue
+        if code not in scores.index:
+            raise ValueError(f"select_stocks 返回了不存在的股票代码：{code}")
+        seen.add(code)
+        codes.append(code)
+        if len(codes) >= top_n:
+            break
+    if not codes:
+        raise ValueError("select_stocks 没有返回任何股票")
+    return scores.loc[codes]
+
+
 def _get(data, name: str):
     """从 DataBundle 对象或 dict 中读取字段（duck typing）。"""
     if isinstance(data, Mapping):
@@ -223,6 +254,7 @@ def screen(
     asof=None,
     exclude_codes=None,
     score_transform=None,
+    select_hook=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """按因子权重筛选 Top N 股票。
 
@@ -241,6 +273,9 @@ def screen(
     score_transform:
         可选的自定义打分函数 ``transform(z_df, weights) -> Series``，
         用于 AI 生成的模型代码接管最终打分。
+    select_hook:
+        可选的自定义选股函数 ``select_stocks(scores, top_n) -> list[str]``，
+        用于 AI 程序接管选股（返回的代码必须在 scores 索引内）。
 
     Returns
     -------
@@ -274,7 +309,8 @@ def screen(
     if scores.empty:
         raise ValueError("排除后没有可用股票，无法筛选")
 
-    selected = scores.head(top_n)
+    hook_selected = _apply_select_hook(scores, top_n, select_hook)
+    selected = hook_selected if hook_selected is not None else scores.head(top_n)
     industry_series = _industry_lookup(industry, scores.index)
 
     top_df = pd.DataFrame(
@@ -450,6 +486,7 @@ def run_backtest(
     cost_sell: float = 0.0013,
     risk_free_rate: float = 0.02,
     score_transform=None,
+    select_hook=None,
 ) -> dict:
     """按 A 股交易规则回测因子选股策略。
 
@@ -631,7 +668,9 @@ def run_backtest(
             asof=all_dates[pos],
         )
         scores = _apply_score_transform(scores, weights, score_transform)
-        top_codes = list(scores.head(top_n).index)
+        hook_selected = _apply_select_hook(scores, top_n, select_hook)
+        selected_scores = hook_selected if hook_selected is not None else scores.head(top_n)
+        top_codes = list(selected_scores.index)
         if not top_codes:
             raise ValueError("调仓日没有可用股票，无法生成组合")
         weight = 1.0 / len(top_codes)

@@ -738,6 +738,8 @@
         return versionCardHtml(block);
       case 'tuning':
         return tuningCardHtml(block);
+      case 'review':
+        return reviewCardHtml(block);
       default:
         return genericCardHtml(block);
     }
@@ -1106,6 +1108,30 @@
   }
 
   /* ---------------------------------------------------------- 审批卡 */
+  function reviewCardHtml(block) {
+    var issues = Array.isArray(block.issues) ? block.issues : [];
+    var suggestions = Array.isArray(block.suggestions) ? block.suggestions : [];
+    var failed = block.status === 'failed';
+    var risk = block.risk_level ? String(block.risk_level) : 'medium';
+    return '<article class="card card-review">'
+      + '<header class="card-head"><div class="card-title"><h3>'
+      + esc(block.title || 'AI 程序二次审核') + '</h3></div>'
+      + '<span class="status-pill ' + (failed ? 'is-warn' : 'is-ok') + '">'
+      + (failed ? '未通过' : '已通过') + '</span></header>'
+      + '<div class="card-body">'
+      + (block.summary ? '<p class="card-summary">' + esc(block.summary) + '</p>' : '')
+      + (issues.length
+        ? '<ul class="review-list">' + issues.map(function (item) {
+          return '<li>' + esc(item) + '</li>';
+        }).join('') + '</ul>'
+        : '')
+      + (suggestions.length
+        ? '<p class="review-note">建议：' + esc(suggestions.slice(0, 3).join('；')) + '</p>'
+        : '')
+      + '<p class="review-note">风险等级：' + esc(risk) + '</p>'
+      + '</div></article>';
+  }
+
   function approvalCardHtml(block) {
     var actions = Array.isArray(block.actions) ? block.actions : [];
     var candidate = Number(block.candidate) || 0;
