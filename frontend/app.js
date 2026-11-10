@@ -85,6 +85,7 @@
   var state = {
     sessionId: '',
     streaming: false,
+    task: null,
     activeTurn: null,
     cardNodes: new Map(),
     profile: null,
@@ -109,6 +110,8 @@
 
   var dom = {};
   var composing = false;
+  var taskPollTimer = null;
+  var taskPollGeneration = 0;
 
   /* ============================== 工具函数 ============================== */
   function $(selector, root) {
@@ -381,6 +384,7 @@
   /* 把 /state（或启用按钮返回值里的 state）应用到工作台状态。 */
   function applySessionState(data) {
     if (!data || typeof data !== 'object') return;
+    if (data.task !== undefined) state.task = data.task;
     if (data.profile !== undefined) state.profile = normalizeProfile(data.profile);
     if (data.active_model !== undefined) state.activeModel = normalizeModel(data.active_model);
     if (data.versions !== undefined) state.versions = normalizeVersions(data.versions);
@@ -393,6 +397,57 @@
       state.pendingDismissed = '';
     }
     state.pendingCandidates = candidates;
+  }
+
+  function stopTaskPolling() {
+    taskPollGeneration += 1;
+    if (taskPollTimer !== null) window.clearTimeout(taskPollTimer);
+    taskPollTimer = null;
+  }
+
+  function resumeTaskPolling(force) {
+    stopTaskPolling();
+    updateComposerState();
+    if (state.streaming || ((!state.task || !state.task.running) && !force)) return;
+    var sessionId = state.sessionId;
+    var generation = taskPollGeneration;
+    var previousHistory = '';
+    setChatRunStatus(state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
+    async function poll() {
+      if (generation !== taskPollGeneration || sessionId !== state.sessionId || state.streaming) return;
+      try {
+        var data = await apiGet('/api/sessions/' + encodeURIComponent(sessionId) + '/state', 1);
+        var fetched = await fetchMessages(sessionId);
+        if (generation !== taskPollGeneration || sessionId !== state.sessionId || state.streaming) return;
+        applySessionState(data);
+        if (fetched.ok) {
+          var snapshot = JSON.stringify(fetched.messages);
+          if (snapshot !== previousHistory) {
+            var follow = state.following;
+            var scrollTop = dom.scroll.scrollTop;
+            clearChat();
+            renderHistory(fetched.messages);
+            state.following = follow;
+            if (follow) scrollToBottom(true);
+            else dom.scroll.scrollTop = scrollTop;
+            previousHistory = snapshot;
+          }
+        }
+        renderAllWorkbench();
+        updateComposerState();
+        if (!state.task || !state.task.running) {
+          setChatRunStatus(state.task && state.task.status === 'error' ? '执行失败' : '就绪');
+          if (state.task && state.task.error) setWorkbenchAlert(state.task.error);
+          return;
+        }
+        setChatRunStatus(state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
+      } catch (error) {
+        if (generation !== taskPollGeneration || sessionId !== state.sessionId) return;
+        setWorkbenchAlert('任务状态暂时无法同步，正在重试：' + error.message);
+      }
+      taskPollTimer = window.setTimeout(poll, 1000);
+    }
+    taskPollTimer = window.setTimeout(poll, 0);
   }
 
   async function loadVersions() {
@@ -1776,6 +1831,11 @@
   function renderModelSection() {
     var head = '<header class="wb-head"><h2>当前模型与版本</h2></header>';
     var html = head;
+    if (state.task && state.task.running) {
+      html += '<p class="wb-session-note">'
+        + (state.task.status === 'cancelling' ? '正在停止任务，当前步骤结束后生效。' : '模型任务正在执行，完成后候选方案会自动显示。刷新页面不会停止任务。')
+        + '</p>';
+    }
     var model = state.activeModel;
     if (model) {
       var chips = metricChipsHtml(model.metrics);
@@ -1973,7 +2033,7 @@
   }
 
   function updateComposerState() {
-    var busy = state.streaming;
+    var busy = state.streaming || !!(state.task && state.task.running);
     dom.sendBtn.disabled = busy;
     if (dom.stopBtn) dom.stopBtn.hidden = !busy;
     if (dom.regenerateBtn) {
@@ -1995,7 +2055,7 @@
       dom.input.focus();
       return;
     }
-    if (state.streaming) {
+    if (state.streaming || (state.task && state.task.running)) {
       dom.input.focus();
       return;
     }
@@ -2004,6 +2064,7 @@
       return;
     }
     state.streaming = true;
+    stopTaskPolling();
     setChatRunStatus('生成中…');
     updateComposerState();
     dom.input.value = '';
@@ -2047,7 +2108,7 @@
       if (error && error.name === 'AbortError') {
         failed = false;
         stopped = true;
-        appendTextMessage('ai', '已停止生成。你可以修改问题后重新发送，或点击输入区的重新生成。', null);
+        appendTextMessage('ai', '已断开当前回复显示，任务状态将在下方同步。', null);
       } else {
         showTurnError(turn, '网络异常', error && error.message ? error.message : '请检查后端服务后重试。', true);
       }
@@ -2057,11 +2118,9 @@
       state.streaming = false;
       setChatRunStatus(stopped ? '已停止' : failed ? '处理出错' : '就绪');
       updateComposerState();
-      if (!stopped) {
-        // 每轮对话后刷新工作台：新的候选方案/版本/待确认数量要及时出现
-        await loadState();
-        renderAllWorkbench();
-      }
+      await loadState();
+      renderAllWorkbench();
+      resumeTaskPolling(true);
       checkHealth();
       dom.input.focus();
     }
@@ -2161,6 +2220,8 @@
 
   /* ============================== 初始化 ============================== */
   async function bootstrap() {
+    stopTaskPolling();
+    state.task = null;
     state.thinkingBudget = readThinkingBudget();
     try {
       var savedSteps = Number(window.localStorage.getItem(REACT_STEPS_KEY));
@@ -2223,6 +2284,7 @@
     renderAllWorkbench();
     state.following = true;
     scrollToBottom(true);
+    resumeTaskPolling();
     dom.input.focus();
   }
 
@@ -2505,6 +2567,8 @@
       return false;
     }
     closeHistory();
+    stopTaskPolling();
+    state.task = null;
     state.sessionId = sessionId;
     saveSession(sessionId);
     updateSessionChip();
@@ -2531,6 +2595,7 @@
     await loadVersions();
     renderAllWorkbench();
     scrollToBottom(true);
+    resumeTaskPolling();
     dom.input.focus();
     return true;
   }
@@ -2778,8 +2843,14 @@
       resizeInput();
       dom.input.focus();
     });
-    if (dom.stopBtn) dom.stopBtn.addEventListener('click', function () {
-      if (state.abortController) state.abortController.abort();
+    if (dom.stopBtn) dom.stopBtn.addEventListener('click', async function () {
+      try {
+        var result = await api('/api/sessions/' + encodeURIComponent(state.sessionId) + '/task/cancel', { method: 'POST', body: {} });
+        state.task = result.task || null;
+        if (state.abortController) state.abortController.abort();
+        else resumeTaskPolling();
+        renderAllWorkbench();
+      } catch (error) { setWorkbenchAlert('停止任务失败：' + error.message); }
     });
     if (dom.regenerateBtn) dom.regenerateBtn.addEventListener('click', function () {
       if (state.streaming) return;

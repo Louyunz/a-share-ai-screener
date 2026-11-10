@@ -66,6 +66,12 @@
 `event: done` → `{message_id}`。
 `event: error` → `{message, retryable}`。
 
+聊天正文（含工具解读）在每次 token 发送给浏览器前提交到历史；同一轮持续更新同一条 assistant 消息，完成时补齐卡片，不新增重复回复。用户在工具解读已经显示、后续 ReAct 仍在运行时刷新或断开连接，已显示的正文仍可由 messages 接口恢复。
+
+**任务与刷新恢复**：聊天由服务进程内的独立线程执行，SSE 只订阅输出，浏览器刷新/断连不取消任务。每个 `ui` 事件（包括程序预览、work、tuning）发送前按 block id 保存最新快照，纯卡片消息同样入库。`GET /api/sessions/{sid}/state` 额外返回 `task:{id,status,running,started_at,finished_at,error}|null`，状态为 running/cancelling/completed/error/cancelled。刷新或切回会话后，前端在任务运行期间每秒同步 state 与 messages，完成后自动显示候选；状态与候选读取的顺序保证不会因为完成瞬间的竞态而提前停止同步。同一会话运行中再次提交聊天返回 409。
+
+`POST /api/sessions/{sid}/task/cancel` 明确请求停止当前会话任务（需要登录且会话属于当前用户）；停止在当前模型调用/回测步骤返回后生效。浏览器停止按钮调用该接口，断开 SSE 本身不等于停止。取消或失败会记录到历史，尚未完成的卡片标记为 error。任务仅保证在当前服务进程存活期间继续执行；服务重启不提供任务自动续跑。生产多进程或跨重启续跑需要外部任务队列。
+
 **模型思考强度（thinking_budget）**：请求体可选 `off|low|high|max`（默认 `off`），向 DeepSeek 官方接口发送真实 `thinking.type=disabled|enabled` 与 `reasoning_effort=low|high|max`；旧值 `medium` 规范化为 `high`。这是模型思考强度，不是精确 token 额度，也不决定工具轮数。非 DeepSeek 官方接口开启思考时明确报错，避免静默忽略；`off` 时保留原有兼容调用，不发送厂商扩展字段。请求范围的客户端副本覆盖规划、修复、解读、审核和收尾调用，不修改其他会话的设置。流式 `reasoning_content` 单独保留用于工具调用修复协议，不作为回答正文或工具 thought 展示。
 
 **自主执行上限（react_max_steps）**：请求体可选 1 到 10 的整数（默认 6），前端提供 1/3/6/10 轮选项并记住选择。所有请求统一走同一个多步 ReAct 循环；每轮可以包含多个工具调用，因此这是轮数上限而非精确工具调用次数。关闭模型思考仍可执行多轮工具。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；工具执行失败会作为 observation 回传模型继续修正，不直接把内部技术错误抛给用户。审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。程序沙箱允许本地文件读写（CSV/JSON/Parquet 等），仍禁止网络、系统命令/子进程与动态执行。

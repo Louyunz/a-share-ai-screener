@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import iterate_in_threadpool
 
 from .auth import AuthError, AuthManager
 from .config import DB_PATH, FRONTEND_DIR
@@ -74,12 +75,15 @@ def _error(exc: Exception) -> JSONResponse:
 
 
 def _sse(events: Iterator[tuple[str, dict[str, Any]]]) -> StreamingResponse:
-    def generator() -> Iterator[str]:
+    async def generator():
         try:
-            for event, data in events:
+            async for event, data in iterate_in_threadpool(iter(events)):
                 yield sse_format(event, data)
         except Exception as exc:  # noqa: BLE001 - 响应已开始，只能发 error 事件
             yield sse_format("error", {"message": str(exc), "retryable": False})
+        finally:
+            if hasattr(events, "close"):
+                events.close()
 
     return StreamingResponse(generator(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
@@ -232,10 +236,18 @@ def create_app(service: AppService | None = None) -> FastAPI:
             user = getattr(request.state, "user", {})
             service = get_service()
             service._require_session(sid, int(user["id"]))  # noqa: SLF001
-            return _sse(service.chat_stream(sid, content, int(user["id"]),
+            return _sse(service.start_chat(sid, content, int(user["id"]),
                                             thinking_budget=thinking_budget,
                                             react_max_steps=react_max_steps))
         except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @app.post("/api/sessions/{sid}/task/cancel")
+    def cancel_chat(sid: str, request: Request) -> Any:
+        try:
+            user = getattr(request.state, "user", {})
+            return get_service().cancel_chat(sid, owner_id=int(user["id"]))
+        except Exception as exc:
             return _error(exc)
 
     @app.get("/api/sessions/{sid}/messages")
@@ -400,6 +412,8 @@ def create_app(service: AppService | None = None) -> FastAPI:
     @app.on_event("shutdown")
     def _shutdown() -> None:
         global _auth, _sync
+        if _service is not None:
+            _service.jobs.shutdown()
         if _sync is not None:
             _sync.stop()
             _sync = None

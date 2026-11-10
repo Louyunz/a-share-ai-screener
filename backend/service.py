@@ -131,6 +131,8 @@ class AppService:
         self.data = bundle if bundle is not None else load_bundle(self.data_dir)
         self.llm = llm or build_llm()
         self.agent = Agent(self.llm)
+        from .jobs import ChatJobs
+        self.jobs = ChatJobs()
 
     # ------------------------------------------------------------------
     # 基础
@@ -196,6 +198,9 @@ class AppService:
 
     def get_state(self, session_id: str, owner_id: int | None = None) -> dict[str, Any]:
         self._require_session(session_id, owner_id)
+        # Read task status first: observing completion must imply the candidate
+        # writes below are already visible, otherwise a polling client can stop early.
+        task = self.jobs.state(session_id)
         profile = self._profile(session_id)
         candidates = self._candidates(session_id)
         runtime = self.store.get_state(session_id)
@@ -216,6 +221,7 @@ class AppService:
             "last_selection": runtime.get("last_selection"),
             "model_scope": "session",
             "default_model": self._model_public(self._default_model()),
+            "task": task,
         }
 
     # ------------------------------------------------------------------
@@ -255,6 +261,37 @@ class AppService:
     # ------------------------------------------------------------------
     # 对话主流程
     # ------------------------------------------------------------------
+    def start_chat(self, session_id: str, content: str, owner_id: int | None = None,
+                   thinking_budget: str = "off", react_max_steps: int = 6):
+        """Start once; browser disconnect only detaches the event observer."""
+        self._require_session(session_id, owner_id)
+        if not (content or "").strip():
+            raise ValidationError("说点什么吧")
+        self._normalize_thinking_budget(thinking_budget)
+        if isinstance(react_max_steps, bool) or not isinstance(react_max_steps, int) or not 1 <= react_max_steps <= MAX_REACT_STEPS:
+            raise ValidationError("自主执行上限必须是 1 到 10 的整数")
+        from .llm import OpenAICompatClient
+        if isinstance(self.llm, OpenAICompatClient):
+            self.llm.with_thinking_budget(self._normalize_thinking_budget(thinking_budget))
+        from .jobs import JobBusyError
+        try:
+            return self.jobs.start(session_id, lambda: self.chat_stream(
+                session_id, content, owner_id, thinking_budget, react_max_steps),
+                on_finish=lambda status, error: self._finish_chat_job(session_id, status, error))
+        except JobBusyError as exc:
+            raise ConflictError(str(exc)) from exc
+
+    def cancel_chat(self, session_id: str, owner_id: int | None = None):
+        self._require_session(session_id, owner_id)
+        return {"task": self.jobs.cancel(session_id)}
+
+    def _finish_chat_job(self, session_id: str, status: str, error: str):
+        if status not in ("cancelled", "error"):
+            return []
+        note = "任务已停止。" if status == "cancelled" else "任务执行失败，请查看错误提示后重试。"
+        blocks = self.store.finish_interrupted_message(session_id, note)
+        return [("ui", {"block": block}) for block in blocks] + [("token", {"text": "\n\n" + note})]
+
     def chat_stream(self, session_id: str, content: str,
                     owner_id: int | None = None,
                     thinking_budget: str = "off",
@@ -338,13 +375,17 @@ class AppService:
         need_final = False
         executed_signatures: set[str] = set()
         step = 0
+        assistant_message_id: int | None = None
 
-        def persist_partial() -> None:
+        def persist_partial(block=None) -> None:
+            nonlocal assistant_message_id
+            if isinstance(block, dict) and block.get("id"):
+                saved_blocks[str(block["id"])] = block
             text = "".join(reply_parts).strip()
             if text or notes or saved_blocks or narration:
-                self._remember_assistant(session_id, text, notes,
-                                         list(saved_blocks.values()),
-                                         "".join(narration))
+                assistant_message_id = self._remember_assistant(
+                    session_id, text, notes, list(saved_blocks.values()),
+                    "".join(narration), message_id=assistant_message_id)
 
         while step < max_steps:
             step += 1
@@ -367,6 +408,7 @@ class AppService:
                                 else str((payload or {}).get("text") or ""))
                         if text:
                             reply_parts.append(text)
+                            persist_partial()
                             yield "token", {"text": text}
                     elif kind == "thinking":
                         text = str((payload or {}).get("text") or "") if isinstance(payload, dict) else str(payload or "")
@@ -377,6 +419,7 @@ class AppService:
                         if block:
                             preview_id = str(block["id"])
                             preview_change = block.get("code_change")
+                            persist_partial(block)
                             yield "ui", {"block": block}
                     elif kind == "plan":
                         plan = payload
@@ -456,6 +499,7 @@ class AppService:
                             and not plan.has_action("confirm_profile")):
                         profile_block = self._profile_block(session_id)
                         saved_blocks[profile_block["id"]] = profile_block
+                        persist_partial()
                         yield "ui", {"block": profile_block}
 
             step_blocks: list[dict[str, Any]] = []
@@ -485,7 +529,8 @@ class AppService:
                 try:
                     for action in plan.actions:
                         relay = self._relay_action(
-                            self._run_action(session_id, action, request_text), narration)
+                            self._run_action(session_id, action, request_text), narration,
+                            checkpoint=persist_partial)
                         events, note, should_stop = yield from relay
                         for block in events or []:
                             if isinstance(block, dict) and block.get("id"):
@@ -494,6 +539,7 @@ class AppService:
                                 step_blocks.append(block)
                         if note:
                             notes.append(note)
+                            persist_partial()
                             yield "token", {"text": "\n\n"}
                             for piece in chunk_text(note):
                                 yield "token", {"text": piece}
@@ -544,6 +590,7 @@ class AppService:
                         state, plan_history, loop_message, observations):
                     if kind == "token" and payload:
                         reply_parts.append(payload)
+                        persist_partial()
                         yield "token", {"text": payload}
             except AgentError as exc:
                 yield "thinking", {"text": f"收尾说明：{exc}", "step": step}
@@ -554,11 +601,12 @@ class AppService:
             text = (text + "\n\n" + "\n\n".join(missing)).strip()
         if text or notes or saved_blocks or narration:
             self._remember_assistant(session_id, text, notes,
-                                     list(saved_blocks.values()), "".join(narration))
+                                     list(saved_blocks.values()), "".join(narration),
+                                     message_id=assistant_message_id)
         yield "done", {"message_id": uuid.uuid4().hex[:8]}
 
     @staticmethod
-    def _relay_action(generator, narration: list[str]):
+    def _relay_action(generator, narration: list[str], checkpoint=None):
         """转发动作事件；顺手收集动作中插入的对话旁白，供消息持久化。"""
         while True:
             try:
@@ -570,6 +618,13 @@ class AppService:
                 text = str(item[1].get("text") or "")
                 if text:
                     narration.append(text)
+                    # Commit before the browser can see the text. A refresh may
+                    # cancel the stream while the next ReAct step is still running.
+                    if checkpoint is not None:
+                        checkpoint()
+            elif (isinstance(item, tuple) and item and item[0] == "ui"
+                  and isinstance(item[1], dict) and checkpoint is not None):
+                checkpoint(item[1].get("block"))
             yield item
 
     def _run_action(self, session_id: str, action: dict[str, Any], request_text: str = ""):
@@ -2661,12 +2716,17 @@ class AppService:
 
     def _remember_assistant(self, session_id: str, reply: str, notes: list[str],
                             blocks: list[dict[str, Any]] | None = None,
-                            extra_text: str = "") -> None:
+                            extra_text: str = "", *,
+                            message_id: int | None = None) -> int | None:
         text = self._assistant_text(reply, notes, extra_text)
-        if text.strip():
-            self.store.add_message(session_id, "assistant", text, blocks or [])
+        if text.strip() or blocks:
+            if message_id is None:
+                return self.store.add_message(session_id, "assistant", text, blocks or [])
+            self.store.update_assistant_message(session_id, message_id, text, blocks or [])
+        return message_id
 
     def close(self) -> None:
+        self.jobs.shutdown()
         self.store.close()
 
 

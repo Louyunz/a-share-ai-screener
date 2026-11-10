@@ -117,6 +117,54 @@ class ChatSettingsTest(unittest.TestCase):
         self.assertEqual([item['role'] for item in messages], ['user', 'assistant'])
         self.assertEqual(messages[-1]['content'], 'tool explanation')
 
+    def test_refresh_during_tool_reply_keeps_every_visible_chunk(self):
+        explanation = 'This explanation has multiple chunks and the next planning step is still pending.'
+        self.service.agent.explain = lambda *a: explanation
+        stream = self.service.chat_stream(self.sid, 'explain', react_max_steps=3)
+        visible = ''
+        from backend.store import Store
+        reader = Store(self.root/'app.db')
+        try:
+            for event, data in stream:
+                if event != 'token':
+                    continue
+                visible += data['text']
+                messages = reader.get_messages(self.sid)
+                self.assertEqual([m['role'] for m in messages], ['user', 'assistant'])
+                self.assertEqual(messages[-1]['content'], visible.strip())
+                if visible == explanation:
+                    break
+            # Refresh/abort closes the connection before ReAct reaches its end.
+            stream.close()
+            self.assertEqual(reader.get_messages(self.sid)[-1]['content'], explanation)
+        finally:
+            stream.close()
+            reader.close()
+
+    def test_stream_checkpoints_update_one_history_message(self):
+        list(self.service.chat_stream(self.sid, 'explain', react_max_steps=3))
+        messages = self.service.store.get_messages(self.sid)
+        self.assertEqual([m['role'] for m in messages], ['user', 'assistant'])
+        self.assertIn('final reply', messages[-1]['content'])
+        self.assertEqual(messages[-1]['content'].count('tool explanation'), 3)
+
+    def test_program_preview_without_text_is_persisted_before_next_step(self):
+        def preview(*args, **kwargs):
+            yield 'program', {'id': 'program-preview', 'status': 'writing',
+                              'files': {'main.py': 'def build_transform(params=None):\n    pass\n'}}
+            yield 'plan', Plan(reply='')
+        self.service.agent.stream_plan = preview
+        stream = self.service.chat_stream(self.sid, 'write code', react_max_steps=1)
+        try:
+            event, data = next(stream)
+            self.assertEqual(event, 'ui')
+            history = self.service.messages(self.sid)['messages']
+            self.assertEqual(history[-1]['role'], 'assistant')
+            self.assertEqual(history[-1]['content'], '')
+            self.assertEqual(history[-1]['blocks'][0]['id'], data['block']['id'])
+        finally:
+            stream.close()
+
     def test_tool_narration_is_saved_if_next_plan_fails(self):
         original = self.service.agent.stream_plan
         def stream_plan(*args, **kwargs):

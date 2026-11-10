@@ -133,7 +133,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 session_id = match.group(1)
                 content = str(body.get("content", ""))
                 self.service._require_session(session_id)  # noqa: SLF001
-                return self._stream_sse(self.service.chat_stream(session_id, content))
+                return self._stream_sse(self.service.start_chat(
+                    session_id, content, thinking_budget=str(body.get("thinking_budget") or "off"),
+                    react_max_steps=body.get("react_max_steps", 6)))
+            match = re.match(r"^/api/sessions/([^/]+)/task/cancel$", path)
+            if match:
+                return self._send_json(200, self.service.cancel_chat(match.group(1)))
             match = re.match(r"^/api/sessions/([^/]+)/candidates/(\d+)/apply$", path)
             if match:
                 return self._send_json(200, self.service.apply_candidate(

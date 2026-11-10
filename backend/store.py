@@ -232,14 +232,49 @@ class Store:
         return int(row["n"]) if row else 0
 
     def add_message(self, session_id: str, role: str, content: str,
-                    blocks: list[dict[str, Any]] | None = None) -> None:
+                    blocks: list[dict[str, Any]] | None = None) -> int:
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "INSERT INTO message(session_id, role, content, blocks_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (session_id, role, content,
                  json.dumps(blocks or [], ensure_ascii=False), _now()))
             self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def update_assistant_message(self, session_id: str, message_id: int, content: str,
+                                 blocks: list[dict[str, Any]] | None = None) -> None:
+        """Update one streaming response, preserving its identity and creation time."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE message SET content = ?, blocks_json = ? "
+                "WHERE id = ? AND session_id = ? AND role = 'assistant'",
+                (content, json.dumps(blocks or [], ensure_ascii=False), message_id, session_id))
+            self._conn.commit()
+            if cursor.rowcount != 1:
+                raise ValueError("找不到当前会话的 AI 消息")
+
+    def finish_interrupted_message(self, session_id: str, note: str) -> list[dict[str, Any]]:
+        """Mark only this turn's unfinished cards as ended on explicit stop/error."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, content, blocks_json FROM message WHERE session_id = ? "
+                "AND role = 'assistant' AND id > COALESCE((SELECT MAX(id) FROM message "
+                "WHERE session_id = ? AND role = 'user'), 0) ORDER BY id DESC LIMIT 1",
+                (session_id, session_id)).fetchone()
+            if row is None:
+                self.add_message(session_id, "assistant", note)
+                return []
+            blocks = json.loads(row["blocks_json"] or "[]")
+            changed = []
+            for block in blocks:
+                if block.get("status") in ("running", "writing", "generated"):
+                    block["status"] = "error"
+                    changed.append(block)
+            text = str(row["content"] or "")
+            self.update_assistant_message(session_id, row["id"],
+                                          (text + "\n\n" + note).strip(), blocks)
+            return changed
 
     def list_sessions(self, limit: int = 80, owner_id: int | None = None) -> list[dict[str, Any]]:
         """历史对话归档列表：按最近消息时间倒序。"""

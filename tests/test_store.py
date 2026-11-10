@@ -41,6 +41,20 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(messages[0]["blocks"])
         self.assertEqual(messages[0]["blocks"][0]["code_change"]["diff"], "+x")
 
+    def test_streaming_message_updates_are_scoped_to_session_and_assistant(self) -> None:
+        sid = self.store.create_session()
+        other = self.store.create_session()
+        user_id = self.store.add_message(sid, "user", "question")
+        message_id = self.store.add_message(sid, "assistant", "partial")
+        self.store.update_assistant_message(sid, message_id, "complete", [{"id": "result"}])
+        with self.assertRaises(ValueError):
+            self.store.update_assistant_message(other, message_id, "wrong session")
+        with self.assertRaises(ValueError):
+            self.store.update_assistant_message(sid, user_id, "wrong role")
+        messages = self.store.get_messages(sid)
+        self.assertEqual([m['content'] for m in messages], ['question', 'complete'])
+        self.assertEqual(messages[-1]['blocks'], [{'id': 'result'}])
+
     def test_profile_upsert(self) -> None:
         sid = self.store.create_session()
         self.store.save_profile(sid, {"goal": "养老"}, "想养老", False)
