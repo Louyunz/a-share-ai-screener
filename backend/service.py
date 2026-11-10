@@ -262,14 +262,13 @@ class AppService:
     # 对话主流程
     # ------------------------------------------------------------------
     def start_chat(self, session_id: str, content: str, owner_id: int | None = None,
-                   thinking_budget: str = "off", react_max_steps: int = 6):
+                   thinking_budget: str = "off", react_max_steps: int | None = 6):
         """Start once; browser disconnect only detaches the event observer."""
         self._require_session(session_id, owner_id)
         if not (content or "").strip():
             raise ValidationError("说点什么吧")
         self._normalize_thinking_budget(thinking_budget)
-        if isinstance(react_max_steps, bool) or not isinstance(react_max_steps, int) or not 1 <= react_max_steps <= MAX_REACT_STEPS:
-            raise ValidationError("自主执行上限必须是 1 到 10 的整数")
+        self._validate_react_max_steps(react_max_steps)
         from .llm import OpenAICompatClient
         if isinstance(self.llm, OpenAICompatClient):
             self.llm.with_thinking_budget(self._normalize_thinking_budget(thinking_budget))
@@ -295,15 +294,14 @@ class AppService:
     def chat_stream(self, session_id: str, content: str,
                     owner_id: int | None = None,
                     thinking_budget: str = "off",
-                    react_max_steps: int = DEFAULT_REACT_MAX_STEPS) -> Iterator[tuple[str, dict[str, Any]]]:
+                    react_max_steps: int | None = DEFAULT_REACT_MAX_STEPS) -> Iterator[tuple[str, dict[str, Any]]]:
         """所有请求统一走多步 ReAct 循环（旧单步工作流已删除）。"""
         self._require_session(session_id, owner_id)
         content = (content or "").strip()
         if not content:
             raise ValidationError("说点什么吧")
         budget = self._normalize_thinking_budget(thinking_budget)
-        if isinstance(react_max_steps, bool) or not isinstance(react_max_steps, int) or not 1 <= react_max_steps <= MAX_REACT_STEPS:
-            raise ValidationError("自主执行上限必须是 1 到 10 的整数")
+        self._validate_react_max_steps(react_max_steps)
         worker = self
         # A per-request service/agent copy keeps nested explanation/review/tuning calls
         # on the same settings without mutating objects shared by other sessions.
@@ -314,6 +312,12 @@ class AppService:
             worker.agent = copy.copy(self.agent)
             worker.agent.llm = worker.llm
         yield from worker._chat_stream_react(session_id, content, react_max_steps)
+
+    @staticmethod
+    def _validate_react_max_steps(value: Any) -> None:
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or not 1 <= value <= MAX_REACT_STEPS):
+            raise ValidationError("自主执行上限必须是 1 到 10 的整数，或 null（无上限）")
 
     @staticmethod
     def _normalize_thinking_budget(value: Any) -> str:
@@ -357,9 +361,9 @@ class AppService:
             lines.append("执行说明：" + "；".join(str(item) for item in notes)[:600])
         return "\n".join(lines)[:1800]
 
-    def _chat_stream_react(self, session_id: str, content: str, max_steps: int,
+    def _chat_stream_react(self, session_id: str, content: str, max_steps: int | None,
                            ) -> Iterator[tuple[str, dict[str, Any]]]:
-        """ReAct 循环：每轮最多执行 3/6/10 步工具，观察结果回传给模型继续决策。"""
+        """ReAct 工具轮数独立控制；None 不预设轮数上限，仍可停止或自行结束。"""
         self.store.add_message(session_id, "user", content)
         history = self.store.get_messages(session_id)
         plan_history = history[:-1]
@@ -387,7 +391,7 @@ class AppService:
                     session_id, text, notes, list(saved_blocks.values()),
                     "".join(narration), message_id=assistant_message_id)
 
-        while step < max_steps:
+        while max_steps is None or step < max_steps:
             step += 1
             state = self._planner_state(session_id)
             if observations:
@@ -402,7 +406,7 @@ class AppService:
             preview_change: dict[str, Any] | None = None
             try:
                 for kind, payload in self.agent.stream_plan(
-                        state, plan_history, loop_message, emit_thinking=True):
+                        state, plan_history, loop_message):
                     if kind == "token":
                         text = (payload if isinstance(payload, str)
                                 else str((payload or {}).get("text") or ""))
@@ -560,7 +564,7 @@ class AppService:
                                "请分析错误、修改参数/程序后重新调用工具；"
                                "不要向客户输出技术错误。")
                     observations.append(failure)
-                    if step >= max_steps:
+                    if max_steps is not None and step >= max_steps:
                         need_final = True
                         break
                     plan_history = plan_history + (
@@ -580,11 +584,12 @@ class AppService:
                 loop_message = (
                     "【工具执行观察】\n" + "\n".join(observations[-3:])
                     + "\n请根据观察判断下一步：若任务已完成，直接用 content 给客户最终答复并停止调用工具；"
-                      "若还需要继续，调用必要工具并填写 thought。")
+                      "若还需要继续，调用必要工具。")
                 continue
             break
 
-        if max_steps > 1 and ((last_had_actions and step >= max_steps) or need_final):
+        if (max_steps is None or max_steps > 1) and (
+                (max_steps is not None and last_had_actions and step >= max_steps) or need_final):
             try:
                 for kind, payload in self.agent.stream_final(
                         state, plan_history, loop_message, observations):
@@ -592,8 +597,12 @@ class AppService:
                         reply_parts.append(payload)
                         persist_partial()
                         yield "token", {"text": payload}
+                    elif kind == "thinking" and payload:
+                        text = str(payload.get("text") or "")
+                        if text:
+                            yield "thinking", {"text": text, "step": step}
             except AgentError as exc:
-                yield "thinking", {"text": f"收尾说明：{exc}", "step": step}
+                yield "error", {"message": str(exc), "retryable": True}
 
         text = "".join(reply_parts).strip()
         missing = [reply for reply in plan_replies if reply and reply not in text]

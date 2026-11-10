@@ -61,7 +61,7 @@
 ## 3. 聊天 SSE 事件
 
 `event: token` → `{text}`：**LLM 流式生成的真实文本增量**（content 直接以 delta 形式转发，前端收到即渲染）。
-`event: thinking` → `{text, step}`：ReAct 每步工具调用参数 `thought` 的流式增量；仅展示，不进入执行参数、不持久化为业务消息。
+`event: thinking` → `{text, step}`：模型 `reasoning_content` 的真实流式增量，覆盖规划、语义复核、参数修复与最终收尾；仅展示，不进入工具参数或回答正文，不持久化为业务消息。
 `event: ui` → `{block: {...}}`：插入或更新一个富卡片（按 `id` upsert）。
 `event: done` → `{message_id}`。
 `event: error` → `{message, retryable}`。
@@ -72,11 +72,11 @@
 
 `POST /api/sessions/{sid}/task/cancel` 明确请求停止当前会话任务（需要登录且会话属于当前用户）；停止在当前模型调用/回测步骤返回后生效。浏览器停止按钮调用该接口，断开 SSE 本身不等于停止。取消或失败会记录到历史，尚未完成的卡片标记为 error。任务仅保证在当前服务进程存活期间继续执行；服务重启不提供任务自动续跑。生产多进程或跨重启续跑需要外部任务队列。
 
-**模型思考强度（thinking_budget）**：请求体可选 `off|low|high|max`（默认 `off`），向 DeepSeek 官方接口发送真实 `thinking.type=disabled|enabled` 与 `reasoning_effort=low|high|max`；旧值 `medium` 规范化为 `high`。这是模型思考强度，不是精确 token 额度，也不决定工具轮数。非 DeepSeek 官方接口开启思考时明确报错，避免静默忽略；`off` 时保留原有兼容调用，不发送厂商扩展字段。请求范围的客户端副本覆盖规划、修复、解读、审核和收尾调用，不修改其他会话的设置。流式 `reasoning_content` 单独保留用于工具调用修复协议，不作为回答正文或工具 thought 展示。
+**模型思考强度（thinking_budget）**：请求体可选 `off|low|high|max`（默认 `off`），向 DeepSeek 官方接口发送真实 `thinking.type=disabled|enabled` 与 `reasoning_effort=low|high|max`；旧值 `medium` 规范化为 `high`。这是模型思考强度，不是精确 token 额度，也不决定工具轮数。非 DeepSeek 官方接口开启思考时明确报错，避免静默忽略；`off` 时保留原有兼容调用，不发送厂商扩展字段。请求范围的客户端副本覆盖规划、修复、解读、审核和收尾调用，不修改其他会话的设置。流式 `reasoning_content` 逐段转为 thinking 事件发送到前端，同时保留完整内容用于工具调用修复协议，不混入回答正文。
 
-**自主执行上限（react_max_steps）**：请求体可选 1 到 10 的整数（默认 6），前端提供 1/3/6/10 轮选项并记住选择。所有请求统一走同一个多步 ReAct 循环；每轮可以包含多个工具调用，因此这是轮数上限而非精确工具调用次数。关闭模型思考仍可执行多轮工具。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；工具执行失败会作为 observation 回传模型继续修正，不直接把内部技术错误抛给用户。审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。程序沙箱允许本地文件读写（CSV/JSON/Parquet 等），仍禁止网络、系统命令/子进程与动态执行。
+**自主执行上限（react_max_steps）**：请求体可选 1 到 10 的整数（默认 6）或 `null`（无上限），前端通过点击展开的滑条逐轮设置 1–10 轮，最右端为“无上限”，并记住选择（本地保存为 `unlimited`，请求发送 JSON null）。滑轨使用页面的蓝色主题、白色滑块及档位圆点，档位切换采用平滑过渡，尊重减少动态效果的系统设置。无上限不预设工具轮数上限，模型完成任务或用户显式停止时结束；重复动作保护、审批限制和错误反馈继续生效。所有请求统一走同一个多步 ReAct 循环；每轮可以包含多个工具调用，因此这是轮数上限而非精确工具调用次数。关闭模型思考仍可执行多轮工具。工具执行失败会作为 observation 回传模型继续修正，不直接把内部技术错误抛给用户。审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。程序沙箱允许本地文件读写（CSV/JSON/Parquet 等），仍禁止网络、系统命令/子进程与动态执行。
 
-Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 与 thought 增量实时发给浏览器；tool_calls 执行后结果回到 ReAct 循环，由模型决定下一步或给最终答复。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
+Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 与 `reasoning_content` 增量分别实时发给浏览器；tool_calls 执行后结果回到 ReAct 循环，由模型决定下一步或给最终答复。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
 
 ### 3.1 卡片（block）
 
@@ -179,7 +179,7 @@ Planner 每轮输出：
 | `run_selection` | `{}` | 画像已确认（可同轮先 confirm） | 运行 10 因子选股+回测，返回 selection 卡 |
 | `explain_results` | `{question}` | 有最近一次选股结果 | 基于事实回答追问 |
 | `analyze_model` | `{engine, model_type, objective, escalate, reason}` | 画像已确认即可 | 只做内置模型/权重层面调整；`engine=model_type` 切换内置模型并使用预设权重，其他 engine 走服务端调参方案 → 网格寻优 → work/tuning/approval 卡，**不自动启用**。`engine="code"` 已删除，代码程序一律走 `write_model_program` |
-| `write_model_program` | `{files[], entry, summary, param_space?, objective?, max_trials?, config?, packages[], escalate, reason, expected_effect, risks[], thought?}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → 生成过程实时显示在「AI 正在优化模型」work 卡 → LLM 安全审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端寻优/单次回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
+| `write_model_program` | `{files[], entry, summary, param_space?, objective?, max_trials?, config?, packages[], escalate, reason, expected_effect, risks[]}` | 客户要求构建/更换/编辑模型程序，或结构性升级 | **AI 直接写完整多文件程序** → 生成过程实时显示在「AI 正在优化模型」work 卡 → LLM 安全审核（不通过自动修复 1 次）→ 安装审核通过的第三方库 → 受限沙箱静态校验 → 服务端寻优/单次回测 → 逐行流式 diff → work/tuning/comparison/approval 卡，**不自动启用** |
 | `apply_pending_change` | `{candidate?}` | 存在待审批候选方案且用户本轮明确同意/指定 | `candidate` 为候选方案编号（按出现顺序 1..N；缺省=最新待审批方案），当前会话启用该候选模型版本，返回 version 卡 |
 | `rollback_version` | `{}` | 用户明确要求回滚且当前会话有可回滚版本 | 沿当前会话版本链切回上一版 |
 

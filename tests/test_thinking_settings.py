@@ -103,6 +103,30 @@ class ChatSettingsTest(unittest.TestCase):
         self.assertEqual(self.calls, 3)
         self.assertFalse([data for event, data in events if event == 'error'])
 
+    def unlimited_plan(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls <= 12:
+            yield 'plan', Plan(reply='', actions=[{'name': 'explain_results',
+                                                   'args': {'question': str(self.calls)}}])
+        else:
+            yield 'token', 'done'
+            yield 'plan', Plan(reply='done')
+
+    def test_unlimited_mode_runs_beyond_ten_rounds_and_finishes(self):
+        self.service.agent.stream_plan = self.unlimited_plan
+        events = list(self.service.chat_stream(self.sid, 'explain', react_max_steps=None))
+        self.assertEqual(self.calls, 13)
+        self.assertEqual(sum(e == 'token' and d.get('text') == 'tool explanation' for e, d in events), 12)
+        self.assertEqual(events[-1][0], 'done')
+        self.assertFalse([d for e, d in events if e == 'error'])
+
+    def test_unlimited_mode_is_supported_by_background_jobs(self):
+        self.service.agent.stream_plan = self.unlimited_plan
+        stream = self.service.start_chat(self.sid, 'explain', react_max_steps=None)
+        list(stream)
+        self.assertEqual(self.calls, 13)
+        self.assertEqual(self.service.get_state(self.sid)['task']['status'], 'completed')
+
     def test_tool_only_reply_survives_history_reload(self):
         events = list(self.service.chat_stream(self.sid, 'explain', thinking_budget='high', react_max_steps=1))
         self.assertEqual(self.calls, 1)

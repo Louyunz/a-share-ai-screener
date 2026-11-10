@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""意图契约测试：动作 schema、工具说明渲染、thought 字段、服务端策略，
+"""意图契约测试：动作 schema、工具说明渲染、严格参数校验、服务端策略，
 以及“禁止关键词路由”的回归断言。"""
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from backend.chat.directives import (
 
 BACKEND = Path(__file__).resolve().parent.parent / "backend"
 
-# 每个工具的最小合法业务参数（不含 thought），用于参数化断言。
+# 每个工具的最小合法业务参数，用于参数化断言。
 MINIMAL_BUSINESS_ARGS: dict[str, dict] = {
     "update_profile": {"slots": {"horizon": "5 年"}},
     "confirm_profile": {},
@@ -162,9 +162,7 @@ class ToolSpecTest(unittest.TestCase):
         for spec in TOOL_SPECS:
             self.assertTrue(spec.description.strip(), f"{spec.name} 缺少 description")
             self.assertTrue(spec.usage.strip(), f"{spec.name} 缺少 usage")
-            # 参数模型与元数据绑定：每个工具模型都带 thought 字段。
-            self.assertIn("thought", spec.model.model_fields,
-                          f"{spec.name} 的参数模型缺少 thought")
+
 
     def test_definitions_are_built_from_specs(self) -> None:
         definitions = tool_definitions()
@@ -172,16 +170,14 @@ class ToolSpecTest(unittest.TestCase):
                          [spec.name for spec in TOOL_SPECS])
         for spec, definition in zip(TOOL_SPECS, definitions):
             function = definition["function"]
-            # description 复用元数据描述（后面统一补充 thought 用法说明）
+            # description 复用元数据描述
             self.assertTrue(function["description"].startswith(spec.description),
                             f"{spec.name} 的 function description 未复用元数据")
-            self.assertIn("thought", function["description"],
-                          f"{spec.name} 的 description 未说明 thought")
             # parameters 直接来自绑定的 Pydantic 模型，不另外维护 schema 副本
             schema = spec.model.model_json_schema()
             schema.pop("title", None)
             self.assertEqual(function["parameters"], schema)
-            self.assertIn("thought", function["parameters"]["properties"])
+
 
     def test_tool_definitions_are_rebuilt_consistently(self) -> None:
         self.assertEqual(tool_definitions(), tool_definitions())
@@ -206,7 +202,7 @@ class ToolDocsRenderTest(unittest.TestCase):
         for position, name in enumerate(ACTION_NAMES, start=1):
             self.assertIn(f"`{name}`", docs)
             self.assertIn(f"### {position}. `{name}`", docs)
-        for label in ("用途", "何时调用", "关键参数", "行为注意", "thought"):
+        for label in ("用途", "何时调用", "关键参数", "行为注意"):
             self.assertIn(label, docs)
 
     def test_render_does_not_embed_json_schema(self) -> None:
@@ -227,56 +223,20 @@ class ToolDocsRenderTest(unittest.TestCase):
         self.assertNotIn("{{TOOL_DOCS}}", first)
 
 
-class ThoughtFieldTest(unittest.TestCase):
-    """所有动作参数模型都暴露可选 thought；校验后的执行参数里不含 thought。"""
-
-    def test_all_tool_schemas_expose_optional_thought(self) -> None:
+class StrictToolParametersTest(unittest.TestCase):
+    def test_tool_schema_contains_only_business_parameters(self) -> None:
         for definition in TOOL_DEFINITIONS:
-            name = definition["function"]["name"]
-            parameters = definition["function"]["parameters"]
-            properties = parameters.get("properties") or {}
-            self.assertIn("thought", properties, f"{name} schema 缺少 thought")
-            thought = properties["thought"]
-            self.assertEqual(thought.get("type"), "string", name)
-            self.assertEqual(thought.get("default"), "", name)
-            self.assertEqual(thought.get("maxLength"), 2000, name)
-            self.assertIn("thought", str(thought.get("description") or ""), name)
-            self.assertNotIn("thought", parameters.get("required") or [],
-                             f"{name} 的 thought 应为可选")
+            self.assertNotIn("thought", definition["function"]["parameters"].get("properties", {}))
+        self.assertNotIn("thought", render_tool_docs())
 
-    def test_validate_never_returns_thought(self) -> None:
-        thought = "客户想换模型，我先确认意图，再调用对应工具。"
+    def test_unknown_display_parameter_is_rejected(self) -> None:
         for name in ACTION_NAMES:
-            business_args = MINIMAL_BUSINESS_ARGS[name]
-            base = validate_tool_call(name, dict(business_args))
-            with_thought = validate_tool_call(name, {**business_args, "thought": thought})
-            self.assertNotIn("thought", with_thought,
-                             f"{name} 的 clean 结果不应包含 thought")
-            self.assertEqual(with_thought, base,
-                             f"{name} 写入 thought 不应影响业务参数")
+            with self.subTest(tool=name), self.assertRaises(ToolArgsError):
+                validate_tool_call(name, {**MINIMAL_BUSINESS_ARGS[name], "thought": "summary"})
 
-    def test_thought_does_not_shadow_business_args(self) -> None:
-        args = validate_tool_call("analyze_model", {
-            "engine": "weights",
-            "objective": "mdd",
-            "thought": "客户只要求调整权重，目标回撤优先。",
-        })
-        self.assertEqual(args["engine"], "weights")
-        self.assertEqual(args["objective"], "mdd")
-        self.assertNotIn("thought", args)
-
-    def test_thought_only_call_for_empty_actions(self) -> None:
-        self.assertEqual(
-            validate_tool_call("run_selection", {"thought": "画像已确认，开始选股。"}), {})
-        self.assertEqual(
-            validate_tool_call("confirm_profile", {"thought": "客户确认画像。"}), {})
-        self.assertEqual(
-            validate_tool_call("rollback_version", {"thought": "客户要求回滚。"}), {})
-
-    def test_thought_length_limit(self) -> None:
-        self.assertEqual(validate_tool_call("run_selection", {"thought": "思" * 2000}), {})
-        with self.assertRaises(ToolArgsError):
-            validate_tool_call("run_selection", {"thought": "思" * 2001})
+    def test_empty_actions_accept_empty_arguments(self) -> None:
+        for name in ("run_selection", "confirm_profile", "rollback_version"):
+            self.assertEqual(validate_tool_call(name, {}), {})
 
 
 class DirectivePolicyTest(unittest.TestCase):

@@ -128,17 +128,6 @@ def preview_program_arguments(raw_arguments: str) -> dict[str, Any] | None:
     return {"files": files, "active": active}
 
 
-_THOUGHT_RE = re.compile(r'"thought"\s*:\s*"((?:\\.|[^"\\])*)')
-
-
-def preview_tool_thought(raw_arguments: str) -> str:
-    """从任意工具的流式参数中提取已生成的 ``thought`` 文本。"""
-    match = _THOUGHT_RE.search(str(raw_arguments or ""))
-    if not match:
-        return ""
-    return _decode_json_string_fragment(match.group(1))
-
-
 def _state_blocked_action(action: dict[str, Any], state: dict[str, Any]) -> bool:
     """按会话状态判断动作是否不可能执行（只做状态校验，不解析自然语言）。"""
     name = str(action.get("name") or "")
@@ -239,13 +228,11 @@ class Agent:
                 *tool_messages, {"role": "user", "content": correction}]
 
     def stream_plan(self, state: dict[str, Any], history: list[dict[str, Any]],
-                    message: str, emit_thinking: bool = True,
-                    _retry: bool = False) -> Iterator[tuple[str, Any]]:
+                    message: str, _retry: bool = False) -> Iterator[tuple[str, Any]]:
         """产出 ("token"/"thinking"/"program") 若干次，最后产出 ("plan", Plan)。"""
         user_content = self._payload(state, history, message)
         reply_parts: list[str] = []
         result: ToolChatResult | None = None
-        thought_sent: dict[int, int] = {}
         program_preview: dict[str, Any] = {"id": "", "last_total": -1,
                                            "raw": "", "active": ""}
 
@@ -257,9 +244,11 @@ class Agent:
                 for kind, payload in self.llm.chat_tools_stream(
                         _planner_system(), messages, TOOL_DEFINITIONS):
                     if kind == "content":
-                        reply_parts.append(payload)
                         if emit_tokens:
+                            reply_parts.append(payload)
                             yield "token", payload
+                    elif kind == "reasoning":
+                        yield "thinking", {"text": payload}
                     elif kind == "result":
                         holder["result"] = payload
 
@@ -272,18 +261,12 @@ class Agent:
                 if kind == "content":
                     reply_parts.append(payload)
                     yield "token", payload
+                elif kind == "reasoning":
+                    yield "thinking", {"text": payload}
                 elif kind == "result":
                     result = payload
                 elif kind == "tool_args":
                     raw_arguments = str(payload.get("arguments") or "")
-                    if emit_thinking:
-                        thought = preview_tool_thought(raw_arguments)
-                        if thought:
-                            call_index = int(payload.get("index", 0))
-                            sent = thought_sent.get(call_index, 0)
-                            if len(thought) > sent:
-                                yield "thinking", {"text": thought[sent:]}
-                                thought_sent[call_index] = len(thought)
                     if str(payload.get("name") or "") != "write_model_program":
                         continue
                     snapshot = preview_program_arguments(raw_arguments)
@@ -311,8 +294,7 @@ class Agent:
                     + "\n\n【重试】上次生成模型程序时工具调用参数不是合法 JSON（可能因输出过长被截断）。"
                       "请减少单次程序体积（更少文件/更短代码），确保完整合法的工具调用 JSON 后重新生成。")
                 yield from self.stream_plan(
-                    state, history, retry_message,
-                    emit_thinking=emit_thinking, _retry=True)
+                    state, history, retry_message, _retry=True)
                 return
             raise AgentError(f"AI 暂时无法理解这句话：{exc}") from exc
         if program_preview["id"] and program_preview["raw"]:
@@ -356,14 +338,10 @@ class Agent:
                     "则不要调用工具。不要修改 content 文案。")},
             ]
             try:
-                if reply_parts:
-                    reviewed = self.llm.chat_tools(
-                        _planner_system(), review_messages, TOOL_DEFINITIONS)
-                else:
-                    review_gen, review_state = stream_secondary(review_messages)
-                    for item in review_gen:
-                        yield item
-                    reviewed = review_state["result"]
+                review_gen, review_state = stream_secondary(review_messages, emit_tokens=not reply_parts)
+                for item in review_gen:
+                    yield item
+                reviewed = review_state["result"]
             except LLMError:
                 reviewed = None
             if reviewed is not None:
@@ -437,9 +415,14 @@ class Agent:
                   + "\n\n请基于以上真实结果，用 content 给客户一段最终答复；"
                     "不要再调用工具，不要描述内部步骤或工具名，遵守既有表达规范。")
         try:
-            for text in self.llm.chat_text_stream(
-                    _planner_system(), [{"role": "user", "content": prompt}]):
-                if text:
+            stream_events = getattr(self.llm, "chat_events_stream", None)
+            messages = [{"role": "user", "content": prompt}]
+            events = (stream_events(_planner_system(), messages) if callable(stream_events)
+                      else (("content", text) for text in self.llm.chat_text_stream(_planner_system(), messages)))
+            for kind, text in events:
+                if kind == "reasoning" and text:
+                    yield "thinking", {"text": text}
+                elif kind == "content" and text:
                     yield "token", text
         except LLMError as exc:
             raise AgentError(f"AI 生成最终答复失败：{exc}") from exc

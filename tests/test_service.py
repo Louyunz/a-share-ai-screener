@@ -462,7 +462,7 @@ class PendingCandidateSelectionTest(unittest.TestCase):
         original = self.service.agent.stream_plan
         calls = {"count": 0}
 
-        def fake_stream(state, history, message, emit_thinking=True, **kwargs):
+        def fake_stream(state, history, message, **kwargs):
             calls["count"] += 1
             if calls["count"] == 1:
                 yield "token", "收到，正在启用您指定的候选方案。"
@@ -492,7 +492,7 @@ class PendingCandidateSelectionTest(unittest.TestCase):
         sid = self.service.create_session()["session_id"]
         original = self.service.agent.stream_plan
 
-        def fake_stream(state, history, message, emit_thinking=True, **kwargs):
+        def fake_stream(state, history, message, **kwargs):
             yield "token", {"text": "当前会话还没有可回滚的模型版本。"}
             yield "plan", Plan(
                 reply="当前会话还没有可回滚的模型版本。",

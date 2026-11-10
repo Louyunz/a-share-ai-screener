@@ -47,8 +47,8 @@ class BackgroundChatTest(unittest.TestCase):
         self.service.close()
         cleanup(self.root)
 
-    def start_at_tuning(self):
-        stream = self.service.start_chat(self.sid, '优化模型', owner_id=7, react_max_steps=1)
+    def start_at_tuning(self, max_steps=1):
+        stream = self.service.start_chat(self.sid, '优化模型', owner_id=7, react_max_steps=max_steps)
         for event, data in stream:
             if event == 'ui' and data['block']['type'] == 'tuning':
                 break
@@ -107,6 +107,15 @@ class BackgroundChatTest(unittest.TestCase):
         history = self.service.messages(self.sid)['messages']
         self.assertIn('任务已停止', history[-1]['content'])
         self.assertTrue(all(b.get('status') != 'running' for b in history[-1]['blocks']))
+
+    def test_unlimited_task_can_be_explicitly_stopped(self):
+        stream = self.start_at_tuning(max_steps=None)
+        self.service.cancel_chat(self.sid, owner_id=7)
+        stream.close()
+        self.release.set()
+        state = self.wait_finished()
+        self.assertEqual(state['task']['status'], 'cancelled')
+        self.assertFalse(state['pending_candidates'])
 
     def test_job_error_is_persisted_and_exposed_after_disconnect(self):
         def fail(*args, **kwargs):

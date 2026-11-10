@@ -8,8 +8,6 @@
 - 每个工具的「参数模型 + 给模型看的描述 + 用法说明」都放在同一个
   :class:`ToolSpec` 里（定义在对应参数模型旁边），``render_tool_docs()`` 与
   ``TOOL_DEFINITIONS`` 都从这份单一事实源生成，避免提示词/代码/文档三处漂移；
-- 所有动作参数模型都带可选 ``thought`` 字段：ReAct 每一步的可见思考文本，
-  只用于流式展示与审计，**不会**进入 ``validate_tool_call`` 的执行参数。
 
 服务端不再解析自然语言来判断“要换模型还是调参”；这个判断只由 LLM 在
 tool_calls 的 args 中给出，服务端只做 schema 校验与确定性策略执行。
@@ -60,19 +58,6 @@ PROGRAM_CONFIG_KEYS = (
     "cost_buy", "cost_sell", "portfolio_method",
 )
 
-# thought：ReAct 每一步的可见思考文本；只做展示/审计，不参与业务执行。
-THOUGHT_MAX_LENGTH = 2000
-THOUGHT_FIELD_DESCRIPTION = (
-    "当前这一步的思考（会被实时展示给客户）：用一句简短中文说明你的判断与打算；"
-    "建议每次工具调用都填写，但它不参与业务执行，"
-    "除 thought 之外的业务参数仍必须严格按 schema 完整、正确填写。"
-)
-TOOL_THOUGHT_NOTE = (
-    "可选参数 thought：用一句简短中文说明当前这一步的思考（会实时展示给客户）；"
-    "thought 之外的业务参数仍必须完整、正确填写。"
-)
-
-
 def _doc(text: str) -> str:
     """整理工具用法说明：去掉统一缩进与首尾空行，保证渲染结果稳定。"""
     return textwrap.dedent(text).strip()
@@ -99,25 +84,15 @@ class _StrictModel(BaseModel):
 
 
 class _ActionArgs(_StrictModel):
-    """所有动作参数的公共基类（``thought`` + ``clean`` 契约）。
-
-    ``thought`` 是 ReAct 每步的可见思考文本，只用于流式展示/审计：
-    它会被 Pydantic 校验长度，但 :meth:`clean` 返回的业务参数里永远不含它。
-    """
-
-    thought: str = Field(
-        default="",
-        max_length=THOUGHT_MAX_LENGTH,
-        description=THOUGHT_FIELD_DESCRIPTION,
-    )
+    """动作参数公共基类。"""
 
     def clean(self) -> dict[str, Any]:
-        """返回供执行层使用的业务参数；``thought`` 永不进入返回值。"""
+        """返回供执行层使用的业务参数。"""
         return {}
 
 
 class EmptyArgs(_ActionArgs):
-    """无业务参数动作（仅可选 thought）。"""
+    """无业务参数动作。"""
 
 
 class ExplainResultsArgs(_ActionArgs):
@@ -301,7 +276,7 @@ _TOOL_SPECS: tuple[ToolSpec, ...] = (
         usage=_doc("""
             - 用途：记录客户对当前画像的确认；确认后才能执行选股或模型优化。
             - 何时调用：客户本轮明确同意画像，且必填项 goal、horizon、drawdown_tolerance、loss_reaction 已齐全。
-            - 关键参数：无业务参数（仅可选 thought）。
+            - 关键参数：无业务参数。
             - 行为注意：
               - 客户只是含糊应答、还在补充信息、或必填项不齐时不要调用。
               - 本轮画像刚好补齐时，可以同一轮同时调用 confirm_profile 与 run_selection。
@@ -314,7 +289,7 @@ _TOOL_SPECS: tuple[ToolSpec, ...] = (
         usage=_doc("""
             - 用途：按当前会话模型执行 A 股筛选与回测。
             - 何时调用：画像已确认（或本轮同时确认），客户表示开始/帮我选股/按这个来执行。
-            - 关键参数：无业务参数（仅可选 thought）。
+            - 关键参数：无业务参数。
             - 行为注意：
               - 选股与回测由服务端执行；调用时 content 给客户一句正在执行的简短确认。
               - 画像未确认时不要调用，先补齐画像并请客户确认。
@@ -416,7 +391,7 @@ _TOOL_SPECS: tuple[ToolSpec, ...] = (
         usage=_doc("""
             - 用途：回滚到当前会话上一版已启用的模型。
             - 何时调用：客户明确要求回退到上一版模型，且 state.versions 非空。
-            - 关键参数：无业务参数（仅可选 thought）。
+            - 关键参数：无业务参数。
             - 行为注意：
               - state.versions 为空表示从未启用过模型版本，此时不要调用，只在 content 说明当前没有可回滚的版本。
         """),
@@ -454,7 +429,7 @@ def _definition_for(spec: ToolSpec) -> dict[str, Any]:
         "type": "function",
         "function": {
             "name": spec.name,
-            "description": spec.description + "\n\n" + TOOL_THOUGHT_NOTE,
+            "description": spec.description,
             "parameters": _schema_for(spec.model),
         },
     }
@@ -473,9 +448,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = tool_definitions()
 
 _TOOL_DOCS_INTRO = (
     "## 可用工具（按固定顺序，共 {count} 个）\n\n"
-    "所有工具都支持可选字段 `thought`：用一句简短中文说明当前这一步的思考"
-    "（会实时展示给客户）；`thought` 不参与业务执行，但除它之外的业务参数"
-    "仍必须按 schema 完整、正确填写。\n"
+    "工具的业务参数必须按 schema 完整、正确填写。\n"
 )
 
 
@@ -494,8 +467,6 @@ def render_tool_docs() -> str:
 
 def validate_tool_call(name: str, arguments: Any) -> dict[str, Any]:
     """校验一个 tool call 的参数并返回干净 dict（供执行层使用）。
-
-    ``thought`` 只用于流式展示/审计，永远不会出现在返回的执行参数里。
 
     失败抛 :class:`ToolArgsError`；调用方应把错误回传 LLM 让它重新调用工具，
     不得在服务端用关键词猜测意图。
@@ -518,6 +489,4 @@ def validate_tool_call(name: str, arguments: Any) -> dict[str, Any]:
         )
         raise ToolArgsError(tool, detail) from exc
     cleaned = dict(model.clean())
-    # 双保险：即使某个 clean() 意外带上了 thought，也不允许它进入执行参数。
-    cleaned.pop("thought", None)
     return cleaned

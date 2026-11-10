@@ -54,6 +54,9 @@ class LLMClient(Protocol):
     def chat_text_stream(self, system: str,
                          messages: list[dict[str, str]]) -> Iterator[str]: ...
 
+    def chat_events_stream(self, system: str,
+                           messages: list[dict[str, str]]) -> Iterator[tuple[str, str]]: ...
+
 
 def extract_json(text: str) -> dict[str, Any]:
     """从模型输出中提取第一个 JSON 对象（容忍 ```json 包裹）。"""
@@ -164,6 +167,12 @@ class OpenAICompatClient:
 
     def chat_text_stream(self, system: str,
                          messages: list[dict[str, str]]) -> Iterator[str]:
+        for kind, text in self.chat_events_stream(system, messages):
+            if kind == "content":
+                yield text
+
+    def chat_events_stream(self, system: str,
+                           messages: list[dict[str, str]]) -> Iterator[tuple[str, str]]:
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
@@ -193,10 +202,14 @@ class OpenAICompatClient:
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
-                    text = (choices[0].get("delta") or {}).get("content") or ""
+                    delta = choices[0].get("delta") or {}
+                    reasoning = delta.get("reasoning_content") or ""
+                    if reasoning:
+                        yield "reasoning", reasoning
+                    text = delta.get("content") or ""
                     if text:
                         produced = True
-                        yield text
+                        yield "content", text
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise LLMError(f"模型接口 HTTP {exc.code}：{detail}") from exc
@@ -303,6 +316,7 @@ class OpenAICompatClient:
                     delta = choices[0].get("delta") or {}
                     if delta.get("reasoning_content"):
                         reasoning_parts.append(delta["reasoning_content"])
+                        yield "reasoning", delta["reasoning_content"]
                     text = delta.get("content") or ""
                     if text:
                         content_parts.append(text)

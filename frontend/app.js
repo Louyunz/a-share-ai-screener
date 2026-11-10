@@ -112,6 +112,7 @@
   var composing = false;
   var taskPollTimer = null;
   var taskPollGeneration = 0;
+  var activeSetting = null;
 
   /* ============================== 工具函数 ============================== */
   function $(selector, root) {
@@ -209,6 +210,10 @@
     dom.input = $('#composer-input');
     dom.thinkingBudget = $('#thinking-budget');
     dom.reactMaxSteps = $('#react-max-steps');
+    dom.thinkingToggle = $('#thinking-toggle');
+    dom.reactToggle = $('#react-toggle');
+    dom.thinkingPanel = $('#thinking-panel');
+    dom.reactPanel = $('#react-panel');
     dom.sendBtn = $('#send-btn');
     dom.healthPill = $('#health-pill');
     dom.healthDot = $('#health-dot');
@@ -500,6 +505,92 @@
 
   var THINKING_BUDGET_KEY = 'zhitou.thinkingBudget.v2';
   var REACT_STEPS_KEY = 'zhitou.reactMaxSteps';
+  var THINKING_LEVELS = [
+    { value: 'off', label: '关闭', description: '快速直接作答，不限制自主执行轮数。' },
+    { value: 'low', label: '低', description: '以较少的思考开销处理常规分析，兼顾速度。' },
+    { value: 'high', label: '高', description: '更充分地分析复杂问题，响应可能需要更长时间。' },
+    { value: 'max', label: '最大', description: '适合较复杂的建模任务，通常需要更多思考时间。' }
+  ];
+
+  function updateSettingSlider(slider, index, count) {
+    var visual = slider.parentElement;
+    visual.style.setProperty('--setting-progress', String(index / (count - 1)));
+    visual.querySelectorAll('[data-position]').forEach(function (dot) {
+      dot.classList.toggle('is-passed', Number(dot.dataset.position) <= index);
+    });
+  }
+
+  function syncExecutionSettings() {
+    var index = THINKING_LEVELS.findIndex(function (level) { return level.value === state.thinkingBudget; });
+    if (index < 0) index = 0;
+    var level = THINKING_LEVELS[index];
+    var rounds = state.reactMaxSteps;
+    var roundsLabel = rounds === null ? '无上限' : rounds + ' 轮';
+    dom.thinkingBudget.value = String(index);
+    dom.reactMaxSteps.value = String(rounds === null ? 11 : rounds);
+    dom.thinkingBudget.setAttribute('aria-valuetext', level.label);
+    dom.reactMaxSteps.setAttribute('aria-valuetext', roundsLabel);
+    updateSettingSlider(dom.thinkingBudget, index, 4);
+    updateSettingSlider(dom.reactMaxSteps, rounds === null ? 10 : rounds - 1, 11);
+    $('#thinking-summary').textContent = level.label;
+    $('#thinking-value').textContent = level.label;
+    $('#thinking-description').textContent = level.description;
+    $('#react-summary').textContent = roundsLabel;
+    $('#react-value').textContent = roundsLabel;
+    $('#react-description').textContent = rounds === null ? '不预设轮数上限，任务完成或手动停止时结束。' : '每条消息最多执行 ' + rounds + ' 轮，'
+      + (rounds <= 3 ? '适合简短分析和单步任务。' : rounds <= 6 ? '适合连续分析与模型优化。' : '为复杂任务提供更多自主执行空间。');
+    dom.thinkingToggle.setAttribute('aria-label', '模型思考强度：' + level.label);
+    dom.reactToggle.setAttribute('aria-label', '自主执行上限：' + roundsLabel);
+    dom.thinkingPanel.querySelectorAll('[data-thinking-level]').forEach(function (tick) {
+      tick.classList.toggle('is-selected', tick.dataset.thinkingLevel === level.value);
+    });
+    dom.reactPanel.querySelectorAll('[data-react-level]').forEach(function (tick) {
+      tick.classList.toggle('is-selected', tick.dataset.reactLevel === 'unlimited' ? rounds === null : Number(tick.dataset.reactLevel) === rounds);
+    });
+  }
+
+  function closeSettingPopover(restoreFocus) {
+    if (!activeSetting) return;
+    var trigger = activeSetting.trigger;
+    activeSetting.panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    activeSetting = null;
+    if (restoreFocus) trigger.focus({ preventScroll: true });
+  }
+
+  function positionSettingPopover() {
+    if (!activeSetting) return;
+    var anchor = activeSetting.trigger.getBoundingClientRect();
+    var panel = activeSetting.panel;
+    var rect = panel.getBoundingClientRect();
+    var viewport = window.visualViewport;
+    var leftEdge = viewport ? viewport.offsetLeft : 0;
+    var topEdge = viewport ? viewport.offsetTop : 0;
+    var width = viewport ? viewport.width : window.innerWidth;
+    var height = viewport ? viewport.height : window.innerHeight;
+    var left = Math.min(Math.max(leftEdge + 12, anchor.right - rect.width), leftEdge + width - rect.width - 12);
+    var top = anchor.top - rect.height - 10;
+    if (top < topEdge + 12) top = anchor.bottom + 10;
+    top = Math.max(topEdge + 12, Math.min(top, topEdge + height - rect.height - 12));
+    panel.style.left = left + 'px';
+    panel.style.top = top + 'px';
+  }
+
+  function toggleSettingPopover(kind) {
+    var trigger = kind === 'thinking' ? dom.thinkingToggle : dom.reactToggle;
+    if (activeSetting && activeSetting.trigger === trigger) {
+      closeSettingPopover(false);
+      return;
+    }
+    closeSettingPopover(false);
+    activeSetting = { trigger: trigger,
+      panel: kind === 'thinking' ? dom.thinkingPanel : dom.reactPanel,
+      slider: kind === 'thinking' ? dom.thinkingBudget : dom.reactMaxSteps };
+    activeSetting.panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    positionSettingPopover();
+    activeSetting.slider.focus({ preventScroll: true });
+  }
 
   function readThinkingBudget() {
     try {
@@ -2064,6 +2155,7 @@
       return;
     }
     state.streaming = true;
+    closeSettingPopover(false);
     stopTaskPolling();
     setChatRunStatus('生成中…');
     updateComposerState();
@@ -2120,7 +2212,7 @@
       updateComposerState();
       await loadState();
       renderAllWorkbench();
-      resumeTaskPolling(true);
+      resumeTaskPolling(stopped || failed);
       checkHealth();
       dom.input.focus();
     }
@@ -2224,11 +2316,11 @@
     state.task = null;
     state.thinkingBudget = readThinkingBudget();
     try {
-      var savedSteps = Number(window.localStorage.getItem(REACT_STEPS_KEY));
-      state.reactMaxSteps = [1, 3, 6, 10].indexOf(savedSteps) >= 0 ? savedSteps : 6;
+      var storedSteps = window.localStorage.getItem(REACT_STEPS_KEY);
+      var savedSteps = Number(storedSteps);
+      state.reactMaxSteps = storedSteps === 'unlimited' ? null : Number.isInteger(savedSteps) && savedSteps >= 1 && savedSteps <= 10 ? savedSteps : 6;
     } catch (err) { state.reactMaxSteps = 6; }
-    if (dom.reactMaxSteps) dom.reactMaxSteps.value = String(state.reactMaxSteps);
-    if (dom.thinkingBudget) dom.thinkingBudget.value = state.thinkingBudget;
+    syncExecutionSettings();
     clearChat();
     dom.stream.innerHTML = '<div class="chat-loading"><span class="spinner"></span>正在连接 AI 助手…</div>';
     setHealth('loading', '连接中', '正在检查后端服务');
@@ -2812,16 +2904,32 @@
     });
     dom.input.addEventListener('input', resizeInput);
 
-    if (dom.reactMaxSteps) dom.reactMaxSteps.addEventListener('change', function () {
+    dom.thinkingToggle.addEventListener('click', function () { toggleSettingPopover('thinking'); });
+    dom.reactToggle.addEventListener('click', function () { toggleSettingPopover('react'); });
+    if (dom.reactMaxSteps) dom.reactMaxSteps.addEventListener('input', function () {
       var value = Number(dom.reactMaxSteps.value);
-      state.reactMaxSteps = [1, 3, 6, 10].indexOf(value) >= 0 ? value : 6;
-      try { window.localStorage.setItem(REACT_STEPS_KEY, String(state.reactMaxSteps)); } catch (err) { /* optional storage */ }
+      state.reactMaxSteps = value === 11 ? null : Number.isInteger(value) && value >= 1 && value <= 10 ? value : 6;
+      try { window.localStorage.setItem(REACT_STEPS_KEY, state.reactMaxSteps === null ? 'unlimited' : String(state.reactMaxSteps)); } catch (err) { /* optional storage */ }
+      syncExecutionSettings();
     });
-    if (dom.thinkingBudget) dom.thinkingBudget.addEventListener('change', function () {
-      var value = dom.thinkingBudget.value;
-      state.thinkingBudget = ['off', 'low', 'high', 'max'].indexOf(value) >= 0 ? value : 'off';
+    if (dom.thinkingBudget) dom.thinkingBudget.addEventListener('input', function () {
+      var level = THINKING_LEVELS[Number(dom.thinkingBudget.value)] || THINKING_LEVELS[0];
+      state.thinkingBudget = level.value;
       saveThinkingBudget(state.thinkingBudget);
+      syncExecutionSettings();
     });
+    document.addEventListener('click', function (event) {
+      if (activeSetting && !activeSetting.panel.contains(event.target) && !activeSetting.trigger.contains(event.target)) closeSettingPopover(false);
+    });
+    document.addEventListener('focusin', function (event) {
+      if (activeSetting && !activeSetting.panel.contains(event.target) && !activeSetting.trigger.contains(event.target)) closeSettingPopover(false);
+    });
+    window.addEventListener('resize', positionSettingPopover);
+    window.addEventListener('scroll', positionSettingPopover, true);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', positionSettingPopover);
+      window.visualViewport.addEventListener('scroll', positionSettingPopover);
+    }
 
     dom.scroll.addEventListener('scroll', function () {
       state.following = isNearBottom();
@@ -2968,6 +3076,11 @@
     }
     document.addEventListener('keydown', function (event) {
       if (event.key !== 'Escape') return;
+      if (activeSetting) {
+        event.preventDefault();
+        closeSettingPopover(true);
+        return;
+      }
       if (dom.infoOverlay && !dom.infoOverlay.hidden) closeInfo();
       else closeHistory();
     });

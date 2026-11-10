@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#F8FAFC">
   <meta name="description" content="智投罗盘 · AI 投资助手：投资者画像、智能顾问、策略分析、组合与模型管理。">
   <title>智投罗盘 · AI 投资助手</title>
-  <link rel="stylesheet" href="style.css?v=22">
+  <link rel="stylesheet" href="style.css?v=24">
   <link rel="stylesheet" href="user-admin.css?v=20">
 </head>
 <body>
@@ -171,24 +171,18 @@
           </div>
           <div class="composer-foot">
             <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
-            <label class="thinking-budget" title="控制 DeepSeek 的真实思考模式与强度；不限制工具轮数，仅支持官方接口">
-              <span>模型思考强度</span>
-              <select id="thinking-budget" aria-label="模型思考强度">
-                <option value="off" selected>关闭</option>
-                <option value="low">低</option>
-                <option value="high">高</option>
-                <option value="max">最大</option>
-              </select>
-            </label>
-            <label class="thinking-budget" title="每条消息允许自主执行的最大工具轮数；每轮可调用多个工具">
-              <span>自主执行上限</span>
-              <select id="react-max-steps" aria-label="自主执行上限">
-                <option value="1">1 轮</option>
-                <option value="3">3 轮</option>
-                <option value="6" selected>6 轮</option>
-                <option value="10">10 轮</option>
-              </select>
-            </label>
+            <div class="composer-settings" aria-label="AI 执行设置">
+              <button class="setting-trigger" id="thinking-toggle" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="thinking-panel">
+                <svg class="icon" aria-hidden="true"><use href="#i-spark"></use></svg>
+                <span>思考强度</span><strong id="thinking-summary">关闭</strong>
+                <svg class="setting-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m5 6 3 3 3-3"/></svg>
+              </button>
+              <button class="setting-trigger" id="react-toggle" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="react-panel">
+                <svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+                <span>自主执行</span><strong id="react-summary">6 轮</strong>
+                <svg class="setting-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m5 6 3 3 3-3"/></svg>
+              </button>
+            </div>
           </div>
         </form>
       </section>
@@ -312,7 +306,25 @@
     </div>
   </div>
 
+  <section class="setting-popover" id="thinking-panel" role="dialog" aria-labelledby="thinking-title" hidden>
+    <div class="setting-heading"><h3 id="thinking-title">模型思考强度</h3><output id="thinking-value" for="thinking-budget">关闭</output></div>
+    <p class="setting-description" id="thinking-description">快速直接作答，不限制自主执行轮数。</p>
+    <div class="setting-slider">
+      <input class="setting-range" id="thinking-budget" type="range" min="0" max="3" step="1" value="0" aria-labelledby="thinking-title" aria-describedby="thinking-description" aria-valuetext="关闭">
+      <div class="setting-rail" aria-hidden="true"><span class="setting-fill"></span><span class="setting-dot" style="--stop:0.0" data-position="0"></span><span class="setting-dot" style="--stop:0.3333333333333333" data-position="1"></span><span class="setting-dot" style="--stop:0.6666666666666666" data-position="2"></span><span class="setting-dot" style="--stop:1.0" data-position="3"></span><span class="setting-thumb"></span></div>
+    </div>
+    <div class="setting-ticks" aria-hidden="true"><span data-thinking-level="off" class="is-selected">关闭</span><span data-thinking-level="low">低</span><span data-thinking-level="high">高</span><span data-thinking-level="max">最大</span></div>
+  </section>
+  <section class="setting-popover" id="react-panel" role="dialog" aria-labelledby="react-title" hidden>
+    <div class="setting-heading"><h3 id="react-title">自主执行上限</h3><output id="react-value" for="react-max-steps">6 轮</output></div>
+    <p class="setting-description" id="react-description">每条消息最多执行 6 轮，适合连续分析与模型优化。</p>
+    <div class="setting-slider">
+      <input class="setting-range" id="react-max-steps" type="range" min="1" max="11" step="1" value="6" aria-labelledby="react-title" aria-describedby="react-description" aria-valuetext="6 轮">
+      <div class="setting-rail" aria-hidden="true"><span class="setting-fill"></span><span class="setting-dot" style="--stop:0.0" data-position="0"></span><span class="setting-dot" style="--stop:0.1" data-position="1"></span><span class="setting-dot" style="--stop:0.2" data-position="2"></span><span class="setting-dot" style="--stop:0.3" data-position="3"></span><span class="setting-dot" style="--stop:0.4" data-position="4"></span><span class="setting-dot" style="--stop:0.5" data-position="5"></span><span class="setting-dot" style="--stop:0.6" data-position="6"></span><span class="setting-dot" style="--stop:0.7" data-position="7"></span><span class="setting-dot" style="--stop:0.8" data-position="8"></span><span class="setting-dot" style="--stop:0.9" data-position="9"></span><span class="setting-dot" style="--stop:1.0" data-position="10"></span><span class="setting-thumb"></span></div>
+    </div>
+    <div class="setting-ticks setting-ticks-numeric" aria-hidden="true"><span style="--tick:0%" data-react-level="1">1 轮</span><span style="--tick:40%" data-react-level="5">5 轮</span><span style="--tick:100%" data-react-level="unlimited">无上限</span></div>
+  </section>
   <script src="charts.js?v=20"></script>
-  <script src="app.js?v=22"></script>
+  <script src="app.js?v=25"></script>
 </body>
 </html>
