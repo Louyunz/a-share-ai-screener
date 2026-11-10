@@ -201,6 +201,8 @@ class Agent:
             "content": str(message.get("content") or ""),
             "tool_calls": message.get("tool_calls") or [],
         }
+        if "reasoning_content" in message:
+            assistant["reasoning_content"] = message["reasoning_content"]
         tool_messages = [
             {"role": "tool", "tool_call_id": call.id,
              "content": "参数校验失败；请修正该工具参数后重新调用。"}
@@ -222,6 +224,8 @@ class Agent:
             "content": str(message.get("content") or ""),
             "tool_calls": message.get("tool_calls") or [],
         }
+        if "reasoning_content" in message:
+            assistant["reasoning_content"] = message["reasoning_content"]
         tool_messages = [
             {"role": "tool", "tool_call_id": call.id,
              "content": "工具调用已接受。"}
@@ -345,7 +349,7 @@ class Agent:
         if not result.tool_calls:
             review_messages = [
                 {"role": "user", "content": user_content},
-                {"role": "assistant", "content": result.content},
+                dict(result.message, role="assistant", content=result.content),
                 {"role": "user", "content": (
                     "请复核上一轮：如果客户是在要求执行动作（优化/更换或构建模型/选股/"
                     "确认画像/启用方案/回滚），必须立即调用对应工具；如果只是提问或回答信息，"

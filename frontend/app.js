@@ -97,7 +97,8 @@
     lastSelection: null,
     lastUserMessage: '',
     lastMessageId: null,
-    thinkingBudget: 'medium',
+    thinkingBudget: 'off',
+    reactMaxSteps: 6,
     stateError: null,
     following: true,
     pinnedOptimization: null,
@@ -204,6 +205,7 @@
     dom.composer = $('#composer');
     dom.input = $('#composer-input');
     dom.thinkingBudget = $('#thinking-budget');
+    dom.reactMaxSteps = $('#react-max-steps');
     dom.sendBtn = $('#send-btn');
     dom.healthPill = $('#health-pill');
     dom.healthDot = $('#health-dot');
@@ -441,14 +443,15 @@
     }
   }
 
-  var THINKING_BUDGET_KEY = 'dsh.thinkingBudget';
+  var THINKING_BUDGET_KEY = 'zhitou.thinkingBudget.v2';
+  var REACT_STEPS_KEY = 'zhitou.reactMaxSteps';
 
   function readThinkingBudget() {
     try {
-      var value = window.localStorage.getItem(THINKING_BUDGET_KEY) || 'medium';
-      return ['off', 'low', 'medium', 'high'].indexOf(value) >= 0 ? value : 'medium';
+      var value = window.localStorage.getItem(THINKING_BUDGET_KEY) || 'off';
+      return ['off', 'low', 'high', 'max'].indexOf(value) >= 0 ? value : 'off';
     } catch (err) {
-      return 'medium';
+      return 'off';
     }
   }
 
@@ -2019,7 +2022,7 @@
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-        body: JSON.stringify({ content: content, thinking_budget: state.thinkingBudget || 'medium' }),
+        body: JSON.stringify({ content: content, thinking_budget: state.thinkingBudget || 'off', react_max_steps: state.reactMaxSteps }),
         signal: controller ? controller.signal : undefined
       });
       if (response.status === 401) {
@@ -2159,6 +2162,11 @@
   /* ============================== 初始化 ============================== */
   async function bootstrap() {
     state.thinkingBudget = readThinkingBudget();
+    try {
+      var savedSteps = Number(window.localStorage.getItem(REACT_STEPS_KEY));
+      state.reactMaxSteps = [1, 3, 6, 10].indexOf(savedSteps) >= 0 ? savedSteps : 6;
+    } catch (err) { state.reactMaxSteps = 6; }
+    if (dom.reactMaxSteps) dom.reactMaxSteps.value = String(state.reactMaxSteps);
     if (dom.thinkingBudget) dom.thinkingBudget.value = state.thinkingBudget;
     clearChat();
     dom.stream.innerHTML = '<div class="chat-loading"><span class="spinner"></span>正在连接 AI 助手…</div>';
@@ -2739,9 +2747,14 @@
     });
     dom.input.addEventListener('input', resizeInput);
 
+    if (dom.reactMaxSteps) dom.reactMaxSteps.addEventListener('change', function () {
+      var value = Number(dom.reactMaxSteps.value);
+      state.reactMaxSteps = [1, 3, 6, 10].indexOf(value) >= 0 ? value : 6;
+      try { window.localStorage.setItem(REACT_STEPS_KEY, String(state.reactMaxSteps)); } catch (err) { /* optional storage */ }
+    });
     if (dom.thinkingBudget) dom.thinkingBudget.addEventListener('change', function () {
       var value = dom.thinkingBudget.value;
-      state.thinkingBudget = ['off', 'low', 'medium', 'high'].indexOf(value) >= 0 ? value : 'medium';
+      state.thinkingBudget = ['off', 'low', 'high', 'max'].indexOf(value) >= 0 ? value : 'off';
       saveThinkingBudget(state.thinkingBudget);
     });
 

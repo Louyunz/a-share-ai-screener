@@ -171,13 +171,22 @@
           </div>
           <div class="composer-foot">
             <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
-            <label class="thinking-budget" title="AI 思考预算：控制每轮自主执行步数与思考展示">
-              <span>AI 思考预算</span>
-              <select id="thinking-budget" aria-label="AI 思考预算">
-                <option value="off">关闭</option>
+            <label class="thinking-budget" title="控制 DeepSeek 的真实思考模式与强度；不限制工具轮数，仅支持官方接口">
+              <span>模型思考强度</span>
+              <select id="thinking-budget" aria-label="模型思考强度">
+                <option value="off" selected>关闭</option>
                 <option value="low">低</option>
-                <option value="medium" selected>中</option>
                 <option value="high">高</option>
+                <option value="max">最大</option>
+              </select>
+            </label>
+            <label class="thinking-budget" title="每条消息允许自主执行的最大工具轮数；每轮可调用多个工具">
+              <span>自主执行上限</span>
+              <select id="react-max-steps" aria-label="自主执行上限">
+                <option value="1">1 轮</option>
+                <option value="3">3 轮</option>
+                <option value="6" selected>6 轮</option>
+                <option value="10">10 轮</option>
               </select>
             </label>
           </div>

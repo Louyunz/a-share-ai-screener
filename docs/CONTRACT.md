@@ -47,7 +47,7 @@
 | GET | `/api/health` | `{ok, source, as_of, universe, llm}`（需登录） |
 | GET | `/api/sessions` | 历史对话归档 `{sessions:[{id,title,created_at,updated_at,message_count,profile_summary,profile_confirmed}]}` |
 | POST | `/api/sessions` | `{session_id}` |
-| POST | `/api/sessions/{sid}/chat` | `{content, thinking_budget?}` → **SSE 聊天流**（见第 3 节） |
+| POST | `/api/sessions/{sid}/chat` | `{content, thinking_budget?, react_max_steps?}` → **SSE 聊天流**（见第 3 节） |
 | GET | `/api/sessions/{sid}/messages` | 文本 + 富卡片历史 `{messages:[{role,content,blocks,created_at}]}` |
 | GET | `/api/sessions/{sid}/state` | 页面刷新恢复用：`{profile, active_model, versions, pending_proposal, pending_candidates, last_selection, model_scope:"session", default_model}`；`active_model`/`versions` 均为该会话级别；`pending_proposal.candidate_count` 是待确认候选方案数量；`pending_candidates` 是候选方案列表（`index/name/summary/status/available/metrics`） |
 | POST | `/api/sessions/{sid}/candidates/{index}/apply` | 工作台「启用」按钮：直接启用第 `index` 个待确认候选方案（不经过 LLM），返回 `{ok, note, blocks, state}` |
@@ -66,7 +66,9 @@
 `event: done` → `{message_id}`。
 `event: error` → `{message, retryable}`。
 
-**思考预算（thinking_budget）**：请求体可选 `off|low|medium|high`（默认 `medium`，前端会记住用户选择）。**所有请求统一走同一个多步 ReAct 循环**（旧单步工作流已删除）：`off` 表示本轮只执行 1 步，`low/medium/high` 分别允许每轮最多 3/6/10 个自主工具步骤。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；工具执行失败会作为 observation 回传模型继续修正，不直接把内部技术错误抛给用户。审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。程序沙箱允许本地文件读写（CSV/JSON/Parquet 等），仍禁止网络、系统命令/子进程与动态执行。
+**模型思考强度（thinking_budget）**：请求体可选 `off|low|high|max`（默认 `off`），向 DeepSeek 官方接口发送真实 `thinking.type=disabled|enabled` 与 `reasoning_effort=low|high|max`；旧值 `medium` 规范化为 `high`。这是模型思考强度，不是精确 token 额度，也不决定工具轮数。非 DeepSeek 官方接口开启思考时明确报错，避免静默忽略；`off` 时保留原有兼容调用，不发送厂商扩展字段。请求范围的客户端副本覆盖规划、修复、解读、审核和收尾调用，不修改其他会话的设置。流式 `reasoning_content` 单独保留用于工具调用修复协议，不作为回答正文或工具 thought 展示。
+
+**自主执行上限（react_max_steps）**：请求体可选 1 到 10 的整数（默认 6），前端提供 1/3/6/10 轮选项并记住选择。所有请求统一走同一个多步 ReAct 循环；每轮可以包含多个工具调用，因此这是轮数上限而非精确工具调用次数。关闭模型思考仍可执行多轮工具。每步工具调用必须在原始参数里带可选 `thought` 字段（流式展示）；工具执行失败会作为 observation 回传模型继续修正，不直接把内部技术错误抛给用户。审批/回滚/画像确认只允许来自用户本轮明确指令，服务端在后续自主步骤中会过滤这三类动作，防止自动启用候选。工具描述/用法由 `backend/chat/action_schema.py` 的 `ToolSpec` 元数据统一维护，`render_tool_docs()` 按固定顺序渲染并注入 planner 模板的固定占位符；`tool_definitions()` 仍输出 OpenAI tools schema。程序沙箱允许本地文件读写（CSV/JSON/Parquet 等），仍禁止网络、系统命令/子进程与动态执行。
 
 Planner 使用 OpenAI 兼容的 **stream + tools**：文本 delta 与 thought 增量实时发给浏览器；tool_calls 执行后结果回到 ReAct 循环，由模型决定下一步或给最终答复。画像更新通过 `update_profile` 工具完成，不再出现在回复 JSON 里。
 

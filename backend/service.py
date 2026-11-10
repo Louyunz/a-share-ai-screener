@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import difflib
+import copy
 import json
 import logging
 import math
@@ -77,8 +78,9 @@ MAX_PENDING_CANDIDATES = int(os.environ.get("MAX_PENDING_CANDIDATES", "100"))
 PROGRAM_CONTEXT_DAYS = int(os.environ.get("AI_PROGRAM_CONTEXT_DAYS", "0"))
 # 程序单次寻优的默认预算（AI 可通过 max_trials 覆盖；服务端最终上限由 tuning 控制）
 PROGRAM_DEFAULT_MAX_TRIALS = int(os.environ.get("AI_PROGRAM_DEFAULT_TRIALS", "64"))
-# ReAct 思考预算：所有请求都走同一 ReAct 循环；off=1 步，其余限制最大自主步数
-THINKING_BUDGET_STEPS = {"off": 1, "low": 3, "medium": 6, "high": 10}
+# 自主工具轮数独立于模型思考强度；每轮可包含多个工具调用。
+DEFAULT_REACT_MAX_STEPS = 6
+MAX_REACT_STEPS = 10
 
 
 class ServiceError(RuntimeError):
@@ -255,19 +257,36 @@ class AppService:
     # ------------------------------------------------------------------
     def chat_stream(self, session_id: str, content: str,
                     owner_id: int | None = None,
-                    thinking_budget: str = "off") -> Iterator[tuple[str, dict[str, Any]]]:
+                    thinking_budget: str = "off",
+                    react_max_steps: int = DEFAULT_REACT_MAX_STEPS) -> Iterator[tuple[str, dict[str, Any]]]:
         """所有请求统一走多步 ReAct 循环（旧单步工作流已删除）。"""
         self._require_session(session_id, owner_id)
         content = (content or "").strip()
         if not content:
             raise ValidationError("说点什么吧")
         budget = self._normalize_thinking_budget(thinking_budget)
-        yield from self._chat_stream_react(session_id, content, budget)
+        if isinstance(react_max_steps, bool) or not isinstance(react_max_steps, int) or not 1 <= react_max_steps <= MAX_REACT_STEPS:
+            raise ValidationError("自主执行上限必须是 1 到 10 的整数")
+        worker = self
+        # A per-request service/agent copy keeps nested explanation/review/tuning calls
+        # on the same settings without mutating objects shared by other sessions.
+        from .llm import OpenAICompatClient
+        if isinstance(self.llm, OpenAICompatClient):
+            worker = copy.copy(self)
+            worker.llm = self.llm.with_thinking_budget(budget)
+            worker.agent = copy.copy(self.agent)
+            worker.agent.llm = worker.llm
+        yield from worker._chat_stream_react(session_id, content, react_max_steps)
 
     @staticmethod
     def _normalize_thinking_budget(value: Any) -> str:
-        text = str(value or "medium").strip().lower()
-        return text if text in ("off", "low", "medium", "high") else "medium"
+        text = str(value or "off").strip().lower()
+        # Compatibility for the old UI's medium value; DeepSeek maps it to high.
+        if text == "medium":
+            text = "high"
+        if text not in ("off", "low", "high", "max"):
+            raise ValidationError("思考强度必须是 off/low/high/max")
+        return text
 
     def _observation_text(self, step: int, plan: Any,
                           blocks: list[dict[str, Any]],
@@ -301,10 +320,9 @@ class AppService:
             lines.append("执行说明：" + "；".join(str(item) for item in notes)[:600])
         return "\n".join(lines)[:1800]
 
-    def _chat_stream_react(self, session_id: str, content: str, budget: str,
+    def _chat_stream_react(self, session_id: str, content: str, max_steps: int,
                            ) -> Iterator[tuple[str, dict[str, Any]]]:
         """ReAct 循环：每轮最多执行 3/6/10 步工具，观察结果回传给模型继续决策。"""
-        max_steps = THINKING_BUDGET_STEPS.get(budget, 6)
         self.store.add_message(session_id, "user", content)
         history = self.store.get_messages(session_id)
         plan_history = history[:-1]
@@ -323,7 +341,7 @@ class AppService:
 
         def persist_partial() -> None:
             text = "".join(reply_parts).strip()
-            if text or notes or saved_blocks:
+            if text or notes or saved_blocks or narration:
                 self._remember_assistant(session_id, text, notes,
                                          list(saved_blocks.values()),
                                          "".join(narration))
@@ -534,7 +552,7 @@ class AppService:
         missing = [reply for reply in plan_replies if reply and reply not in text]
         if missing:
             text = (text + "\n\n" + "\n\n".join(missing)).strip()
-        if text or notes or saved_blocks:
+        if text or notes or saved_blocks or narration:
             self._remember_assistant(session_id, text, notes,
                                      list(saved_blocks.values()), "".join(narration))
         yield "done", {"message_id": uuid.uuid4().hex[:8]}
@@ -2638,7 +2656,7 @@ class AppService:
     @staticmethod
     def _assistant_text(reply: str, notes: list[str], extra_text: str = "") -> str:
         clean_notes = [note for note in notes if note]
-        text = reply + (("\n\n" + extra_text.strip()) if extra_text.strip() else "")
+        text = reply + ((("\n\n" if reply else "") + extra_text.strip()) if extra_text.strip() else "")
         return text + ("\n\n" + "\n".join(clean_notes) if clean_notes else "")
 
     def _remember_assistant(self, session_id: str, reply: str, notes: list[str],

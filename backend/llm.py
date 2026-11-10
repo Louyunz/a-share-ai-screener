@@ -2,6 +2,7 @@
 """LLM 客户端（OpenAI 兼容接口）。"""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator, Protocol
+from urllib.parse import urlsplit
 
 from .config import LLM_BASE_URL, LLM_MODEL
 
@@ -87,7 +89,28 @@ class OpenAICompatClient:
         # 生成完整模型程序可能很长，显式给足输出额度（不同兼容服务上限不同）
         self.max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
 
+    def with_thinking_budget(self, budget: str) -> "OpenAICompatClient":
+        """请求独立的客户端副本；禁止在共享客户端上修改用户的思考设置。"""
+        if budget not in {"off", "low", "high", "max"}:
+            raise LLMError("思考强度必须是 off/low/high/max")
+        is_deepseek = urlsplit(self.base_url).hostname == "api.deepseek.com"
+        if not is_deepseek and budget != "off":
+            raise LLMError("思考强度设置目前仅支持 DeepSeek 官方接口，请配置 LLM_BASE_URL")
+        client = copy.copy(self)
+        client.thinking_budget = budget if is_deepseek else None
+        return client
+
+    def _configure_thinking(self, payload: dict[str, Any]) -> None:
+        budget = getattr(self, "thinking_budget", None)
+        if budget is None:
+            return
+        payload["thinking"] = {"type": "disabled" if budget == "off" else "enabled"}
+        if budget != "off":
+            payload["reasoning_effort"] = budget
+            payload.pop("temperature", None)
+
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._configure_thinking(payload)
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -148,6 +171,7 @@ class OpenAICompatClient:
             "max_tokens": self.max_tokens,
             "stream": True,
         }
+        self._configure_thinking(payload)
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -252,6 +276,7 @@ class OpenAICompatClient:
             "max_tokens": self.max_tokens,
             "stream": True,
         }
+        self._configure_thinking(payload)
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -260,6 +285,7 @@ class OpenAICompatClient:
             method="POST",
         )
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         pending: dict[int, dict[str, str]] = {}
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -275,6 +301,8 @@ class OpenAICompatClient:
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
+                    if delta.get("reasoning_content"):
+                        reasoning_parts.append(delta["reasoning_content"])
                     text = delta.get("content") or ""
                     if text:
                         content_parts.append(text)
@@ -306,6 +334,8 @@ class OpenAICompatClient:
 
         message: dict[str, Any] = {"role": "assistant",
                                    "content": "".join(content_parts)}
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
         if pending:
             wire_calls = []
             for index in sorted(pending):
