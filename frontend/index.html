@@ -8,6 +8,7 @@
   <title>智投罗盘 · AI 投资助手</title>
   <link rel="stylesheet" href="style.css?v=25">
   <link rel="stylesheet" href="user-admin.css?v=20">
+  <link rel="stylesheet" href="nerv.css?v=8">
 </head>
 <body>
   <svg class="icon-sprite" aria-hidden="true" focusable="false">
@@ -51,6 +52,7 @@
         </span>
         <span class="brand-copy">
           <strong>智投罗盘</strong>
+          <span class="nerv-system" data-nerv-only>NERV / SYS-01</span>
         </span>
       </a>
     </div>
@@ -58,6 +60,7 @@
       <div class="health-pill" id="health-pill" title="后端与数据服务状态">
         <span class="health-dot is-loading" id="health-dot"></span>
         <span id="health-text">连接中</span>
+        <span id="nerv-service-error" data-nerv-only hidden></span>
       </div>
       <button class="topbar-icon-btn" id="help-btn" type="button" title="帮助">
         <svg class="icon"><use href="#i-help"></use></svg><span>帮助</span>
@@ -73,16 +76,16 @@
       <nav class="side-nav">
         <div class="nav-section">
           <span class="nav-label">工作区</span>
-          <button class="nav-item is-active" type="button" data-nav="assistant">
+          <button class="nav-item is-active" type="button" data-nav="assistant" data-command="01">
             <svg class="icon"><use href="#i-spark"></use></svg><span>AI 投资顾问</span>
           </button>
-          <button class="nav-item" type="button" data-nav="portfolio">
+          <button class="nav-item" type="button" data-nav="portfolio" data-command="02">
             <svg class="icon"><use href="#i-pie"></use></svg><span>投资组合</span>
           </button>
-          <button class="nav-item" type="button" data-nav="strategy">
+          <button class="nav-item" type="button" data-nav="strategy" data-command="03">
             <svg class="icon"><use href="#i-chart"></use></svg><span>策略分析</span>
           </button>
-          <button class="nav-item" type="button" data-nav="history">
+          <button class="nav-item" type="button" data-nav="history" data-command="04">
             <svg class="icon"><use href="#i-clock"></use></svg><span>历史记录</span>
           </button>
         </div>
@@ -91,7 +94,7 @@
         </div>
         <div class="nav-section">
           <span class="nav-label">管理</span>
-          <button class="nav-item" type="button" data-nav="users" id="nav-users" hidden>
+          <button class="nav-item" type="button" data-nav="users" data-command="05" id="nav-users" hidden>
             <svg class="icon"><use href="#i-shield"></use></svg><span>用户管理</span>
           </button>
         </div>
@@ -110,7 +113,7 @@
             <span class="chat-agent-mark"><svg class="icon"><use href="#i-spark"></use></svg></span>
             <div class="chat-header-copy">
               <h1>AI 投资顾问</h1>
-              <p><span class="session-chip" id="session-chip" title="当前会话 ID"></span></p>
+              <p><span class="session-chip" id="session-chip" title="当前会话 ID"></span><span id="chat-run-status" data-nerv-only role="status">连接中</span></p>
             </div>
           </div>
           <div class="chat-header-actions">
@@ -153,6 +156,7 @@
             <input type="file" id="attach-input" accept=".txt,.md,.csv,.json" hidden>
           </div>
           <div class="composer-box">
+            <span class="nerv-prompt" data-nerv-only aria-hidden="true">&gt;</span>
             <textarea id="composer-input" rows="1" maxlength="4000" placeholder="输入投资问题或分析需求，例如：帮我看看现在适合什么模型……"></textarea>
             <div class="composer-actions">
               <button class="icon-btn" id="clear-input" type="button" title="清空输入" aria-label="清空输入">
@@ -198,6 +202,7 @@
         </header>
         <div class="wb-scroll">
           <div class="wb-alert" id="wb-alert" hidden></div>
+          <section class="nerv-magi" id="nerv-magi" data-nerv-only aria-labelledby="nerv-magi-title"></section>
           <section class="wb-card" id="wb-profile"></section>
           <section class="wb-card" id="wb-model"></section>
           <section class="wb-card" id="wb-result"></section>
@@ -324,7 +329,7 @@
     </div>
     <div class="setting-ticks setting-ticks-numeric" aria-hidden="true"><span style="--tick:0%" data-react-level="1">1 轮</span><span style="--tick:40%" data-react-level="5">5 轮</span><span style="--tick:100%" data-react-level="unlimited">无上限</span></div>
   </section>
-  <script src="charts.js?v=20"></script>
-  <script src="app.js?v=26"></script>
+  <script src="charts.js?v=22"></script>
+  <script src="app.js?v=33"></script>
 </body>
 </html>

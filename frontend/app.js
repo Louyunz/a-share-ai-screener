@@ -86,6 +86,7 @@
     sessionId: '',
     streaming: false,
     task: null,
+    tuningStatus: '',
     activeTurn: null,
     cardNodes: new Map(),
     profile: null,
@@ -109,6 +110,8 @@
   };
 
   var dom = {};
+  var magiBlinkTimers = [];
+  var magiReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   var composing = false;
   var taskPollTimer = null;
   var taskPollGeneration = 0;
@@ -358,6 +361,9 @@
     dom.healthDot.className = 'health-dot is-' + level;
     dom.healthText.textContent = text;
     dom.healthPill.title = title || '后端与数据服务状态';
+    var failure = $('#nerv-service-error');
+    failure.hidden = level !== 'error';
+    failure.textContent = level === 'error' ? 'WARNING / ' + (title || text) : '';
   }
 
   async function fetchMessages(sessionId) {
@@ -417,7 +423,7 @@
     if (state.streaming || ((!state.task || !state.task.running) && !force)) return;
     var sessionId = state.sessionId;
     var generation = taskPollGeneration;
-    setChatRunStatus(state.task && state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
+    setChatRunStatus(state.task && state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…', 'processing');
     async function poll() {
       if (generation !== taskPollGeneration || sessionId !== state.sessionId || state.streaming) return;
       try {
@@ -442,11 +448,14 @@
         if (JSON.stringify(state.lastSelection) !== previousResult) renderResultSection();
         updateComposerState();
         if ((!state.task || !state.task.running) && fetched.ok) {
-          setChatRunStatus(state.task && state.task.status === 'error' ? '执行失败' : '就绪');
+          var status = state.task && state.task.status;
+          if (status === 'error') setChatRunStatus('执行失败', 'error');
+          else if (status === 'completed') setChatRunStatus('执行完成', 'completed');
+          else setChatRunStatus(status === 'cancelled' ? '已停止' : '就绪');
           if (state.task && state.task.error) setWorkbenchAlert(state.task.error);
           return;
         }
-        setChatRunStatus(state.task && state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
+        setChatRunStatus(state.task && state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…', 'processing');
       } catch (error) {
         if (generation !== taskPollGeneration || sessionId !== state.sessionId) return;
         setWorkbenchAlert('任务状态暂时无法同步，正在重试：' + error.message);
@@ -704,6 +713,7 @@
   /* ============================== 聊天区渲染 ============================== */
   function clearChat() {
     historyRows = [];
+    state.tuningStatus = '';
     dom.stream.innerHTML = '';
     dom.stream.classList.remove('is-welcome');
     state.cardNodes.clear();
@@ -813,8 +823,16 @@
     });
   }
 
+  function restoreTuningStatus(messages) {
+    var latest = messages[messages.length - 1];
+    var blocks = latest && latest.role === 'assistant' ? latest.blocks || [] : [];
+    var tuning = blocks.filter(function (block) { return block && block.type === 'tuning'; }).pop();
+    state.tuningStatus = tuning ? tuning.status : '';
+  }
+
   function syncHistory(messages) {
     var visible = visibleHistory(messages);
+    restoreTuningStatus(visible);
     var follow = state.following;
     var scrollTop = dom.scroll.scrollTop;
     var previousHeight = dom.scroll.scrollHeight;
@@ -1242,7 +1260,9 @@
     return '<li class="step is-' + status + '">'
       + '<span class="step-icon">' + iconHtml + '</span>'
       + '<div class="step-body"><div class="step-title"><span>' + esc(step.title || ('第 ' + (index + 1) + ' 步')) + '</span>'
-      + (kind ? '<span class="step-kind">' + esc(kind) + '</span>' : '') + '</div>'
+      + (kind ? '<span class="step-kind">' + esc(kind) + '</span>' : '')
+      + '<span class="nerv-step-state" data-nerv-only>'
+      + {done: '已完成', running: '执行中', error: '未通过', pending: '待执行'}[status] + '</span></div>'
       + (step.detail ? '<p class="step-detail">' + esc(step.detail) + '</p>' : '')
       + '</div></li>';
   }
@@ -1272,9 +1292,28 @@
   function comparisonHtml(comparison) {
     var items = comparisonItems(comparison);
     if (!items.length) return '';
+    var rows = items.map(function (item) {
+      var current = item.key === 'mdd' && item.current !== null ? Math.abs(item.current) : item.current;
+      var candidate = item.key === 'mdd' && item.candidate !== null ? Math.abs(item.candidate) : item.candidate;
+      var delta = '—';
+      if (current !== null && candidate !== null) {
+        var pct = metricMeta(item.key).type === 'pct';
+        var change = candidate - current;
+        delta = (change > 0 ? '+' : '') + fmtNum(change * (pct ? 100 : 1), pct ? 1 : 2) + (pct ? ' pp' : '');
+      }
+      return '<tr><th scope="row">' + esc(item.label) + '</th><td>' + esc(formatMetric(item.key, current))
+        + '</td><td>' + esc(formatMetric(item.key, candidate)) + '</td><td>' + esc(delta) + '</td></tr>';
+    }).join('');
     return '<div class="sub-block"><div class="sub-title"><h4>效果对比</h4><span class="sub-meta">当前 → 候选</span></div>'
       + '<div class="chart-box" data-chart="compare"></div>'
+      + '<div class="table-scroll" data-nerv-only><table class="nerv-matrix" aria-label="历史回测指标对比">'
+      + '<thead><tr><th scope="col">指标</th><th scope="col">基准</th><th scope="col">候选</th><th scope="col">变化</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>'
       + '</div></div>';
+  }
+
+  function operationIdHtml(block) {
+    return block.id ? '<span class="nerv-operation" data-nerv-only>' + esc(String(block.id).toUpperCase()) + '</span>' : '';
   }
 
   var CODE_TOKEN_RE = /(#[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|class|return|import|from|as|if|elif|else|for|while|in|not|and|or|is|None|True|False|lambda|with|try|except|finally|raise|yield|pass|break|continue|global|nonlocal|assert|del|async|await)\b|\b(\d+(?:\.\d+)?)\b|([A-Za-z_][A-Za-z0-9_]*)(?=\s*\()/g;
@@ -1356,7 +1395,7 @@
     var stepsHtml = '<ol class="steps">' + steps.map(stepHtml).join('') + '</ol>';
     return '<article class="card card-work is-' + status + '">'
       + '<header class="card-head">'
-      + '<div class="card-title"><h3>' + esc(block.title || 'AI 正在工作') + '</h3></div>'
+      + '<div class="card-title">' + operationIdHtml(block) + '<h3>' + esc(block.title || 'AI 正在工作') + '</h3></div>'
       + statusPill + '</header>'
       + '<div class="card-body">' + progressHtml + stepsHtml
       + codeBoxHtml(block.code_change)
@@ -1368,7 +1407,7 @@
     var body = comparisonHtml(block.comparison || {});
     if (!body) return '';
     return '<article class="card card-work is-done">'
-      + '<header class="card-head"><div class="card-title"><h3>' + esc(block.title || '效果对比')
+      + '<header class="card-head"><div class="card-title">' + operationIdHtml(block) + '<h3>' + esc(block.title || '效果对比')
       + '</h3></div><span class="status-pill is-ok">寻优结果</span></header>'
       + '<div class="card-body">' + body
       + (block.note ? '<p class="tuning-note">' + esc(block.note) + '</p>' : '')
@@ -1381,12 +1420,13 @@
     var suggestions = Array.isArray(block.suggestions) ? block.suggestions : [];
     var failed = block.status === 'failed';
     var risk = block.risk_level ? String(block.risk_level) : 'medium';
-    return '<article class="card card-review">'
+    return '<article class="card card-review"' + (risk === 'high' ? ' data-risk="high"' : '') + '>'
       + '<header class="card-head"><div class="card-title"><h3>'
       + esc(block.title || 'AI 程序二次审核') + '</h3></div>'
       + '<span class="status-pill ' + (failed ? 'is-warn' : 'is-ok') + '">'
       + (failed ? '未通过' : '已通过') + '</span></header>'
       + '<div class="card-body">'
+      + (risk === 'high' ? '<p class="nerv-risk-heading" data-nerv-only>WARNING <span>程序审核高风险</span></p>' : '')
       + (block.summary ? '<p class="card-summary">' + esc(block.summary) + '</p>' : '')
       + (issues.length
         ? '<ul class="review-list">' + issues.map(function (item) {
@@ -1802,6 +1842,7 @@
 
   function upsertCard(block) {
     if (!block || !block.id || !block.type) return;
+    if (block.type === 'tuning') setTuningStatus(block.status);
     var turn = state.activeTurn;
     if (!turn) turn = beginAssistantTurn();
     var key = String(block.id);
@@ -2001,7 +2042,109 @@
     return chips ? '<div class="wb-candidate-metrics">' + chips + '</div>' : '';
   }
 
+  function setTuningStatus(status) {
+    if (status === state.tuningStatus) return;
+    state.tuningStatus = status;
+    if (document.documentElement.dataset.theme === 'nerv') renderMagi();
+  }
+
+  function magiTuningState() {
+    if (!state.tuningStatus) return '';
+    var taskStatus = state.task && state.task.status;
+    if (taskStatus === 'cancelling') return 'cancelling';
+    if (taskStatus === 'cancelled') return 'cancelled';
+    if (taskStatus === 'error' || state.tuningStatus === 'error') return 'error';
+    return state.tuningStatus === 'running' && (state.streaming || (state.task && state.task.running))
+      ? 'running' : '';
+  }
+
+  function stopMagiBlink() {
+    magiBlinkTimers.forEach(function (timer) { window.clearTimeout(timer); });
+    magiBlinkTimers = [];
+  }
+
+  function syncMagiBlink(panel) {
+    if (panel.dataset.run !== 'running' || magiReducedMotion.matches) {
+      stopMagiBlink();
+      return;
+    }
+    if (magiBlinkTimers.length) return;
+    panel.querySelectorAll('.nerv-core').forEach(function (core, index) {
+      core.toggleAttribute('data-blink-warn', Math.random() < 0.5);
+      function schedule() {
+        magiBlinkTimers[index] = window.setTimeout(function () {
+          core.toggleAttribute('data-blink-warn');
+          schedule();
+        }, 90 + Math.random() * 120);
+      }
+      schedule();
+    });
+  }
+
+  function renderMagi() {
+    var panel = $('#nerv-magi');
+    var run = magiTuningState();
+    panel.dataset.run = run;
+    var runLabel = {running: '寻优中', cancelling: '正在停止', cancelled: '已停止', error: '执行失败'}[run];
+    var pending = state.pendingProposal;
+    var source = pending || state.activeModel;
+    var metrics = source && source.metrics || {};
+    var baseline = pending && pending.base_metrics || {};
+    var cores = [
+      { name: 'MELCHIOR', role: '策略收益', key: 'cagr', better: 1 },
+      { name: 'BALTHASAR', role: '风险控制', key: 'mdd', better: -1 },
+      { name: 'CASPER', role: '稳健性验证', key: 'win_rate', better: 0 }
+    ].map(function (core) {
+      var current = num(metrics[core.key]);
+      var previous = num(baseline[core.key]);
+      var comparable = core.better && current !== null && previous !== null;
+      var delta = comparable ? core.better * (core.key === 'mdd' ? Math.abs(current) - Math.abs(previous) : current - previous) : null;
+      var verdict = current === null ? '无结果' : !core.better ? '历史回测'
+        : delta === null ? '已测量' : Math.abs(delta) < 1e-9 ? '持平' : delta > 0 ? '改善' : '走弱';
+      return {
+        name: core.name, role: core.role, verdict: verdict,
+        comparable: comparable,
+        tone: current === null ? 'idle' : !core.better || delta < -1e-9 ? 'warn' : 'ok',
+        metric: current === null ? '—' : metricMeta(core.key).label + ' '
+          + formatMetric(core.key, core.key === 'mdd' ? Math.abs(current) : current)
+      };
+    });
+    var summary = '历史回测 · 样本外未验证';
+    if (cores.every(function (core) { return core.tone === 'idle'; })) summary = '暂无回测结果';
+    else if (cores[0].comparable && cores[1].comparable) {
+      summary = '年化收益' + cores[0].verdict + ' · 回撤表现' + cores[1].verdict + ' · 样本外未验证';
+    }
+    var coreOutlines = [
+      '1,1 99,1 99,72 83,99 17,99 1,72',
+      '1,1 78,1 99,42 99,99 1,99',
+      '22,1 99,1 99,99 1,99 1,42'
+    ];
+    var html = '<header class="wb-head"><h2 id="nerv-magi-title">MAGI <small>分析矩阵</small></h2></header>'
+      + '<div class="nerv-cores">' + cores.map(function (core, index) {
+        return '<div class="nerv-core" data-tone="' + core.tone + '">'
+          + '<svg class="nerv-core-shape" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" focusable="false">'
+          + '<polygon points="' + coreOutlines[index] + '" vector-effect="non-scaling-stroke"></polygon></svg>'
+          + '<strong>' + core.name + '</strong><span>'
+          + (runLabel || core.verdict) + '</span></div>';
+      }).join('') + '<svg class="nerv-core-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" focusable="false">'
+      + '<polygon points="50,25 25,75 75,75" fill="none" stroke="currentColor" stroke-width="3" vector-effect="non-scaling-stroke"></polygon></svg></div>'
+      + '<table class="nerv-matrix"><thead><tr><th scope="col">职责</th><th scope="col">分析结果</th></tr></thead><tbody>'
+      + cores.map(function (core) {
+        return '<tr><th scope="row">' + core.role + '</th><td>' + esc(core.metric) + '</td></tr>';
+      }).join('') + '</tbody></table>'
+      + '<p class="nerv-magi-summary">' + (source && (source.model_name || source.name)
+        ? esc(source.model_name || source.name) + ' · ' : '')
+      + summary + '</p>';
+    if (panel.dataset.snapshot !== html) {
+      stopMagiBlink();
+      panel.innerHTML = html;
+      panel.dataset.snapshot = html;
+    }
+    syncMagiBlink(panel);
+  }
+
   function renderModelSection() {
+    if (document.documentElement.dataset.theme === 'nerv') renderMagi();
     var head = '<header class="wb-head"><h2>当前模型与版本</h2></header>';
     var html = head;
     if (state.task && state.task.running) {
@@ -2175,8 +2318,10 @@
     }
   }
 
-  function setChatRunStatus(text) {
-    if (dom.chatRunStatus) dom.chatRunStatus.textContent = text;
+  function setChatRunStatus(text, status) {
+    if (!dom.chatRunStatus) return;
+    dom.chatRunStatus.textContent = text;
+    dom.chatRunStatus.dataset.runState = status || 'normal';
   }
 
   function updateChatSessionLabel() {
@@ -2207,6 +2352,8 @@
 
   function updateComposerState() {
     var busy = state.streaming || !!(state.task && state.task.running);
+    dom.stream.dataset.busy = String(busy);
+    if (document.documentElement.dataset.theme === 'nerv') renderMagi();
     dom.sendBtn.disabled = busy;
     if (dom.stopBtn) dom.stopBtn.hidden = !busy;
     if (dom.regenerateBtn) {
@@ -2236,10 +2383,12 @@
       appendSystemError('会话未就绪', '还没有建立会话，请点击重新连接。', 'retry-init');
       return;
     }
+    state.task = null;
+    state.tuningStatus = '';
     state.streaming = true;
     closeSettingPopover(false);
     stopTaskPolling();
-    setChatRunStatus('生成中…');
+    setChatRunStatus('生成中…', 'processing');
     updateComposerState();
     dom.input.value = '';
     resizeInput();
@@ -2271,6 +2420,7 @@
       if (!response.body) throw new Error('当前浏览器不支持流式响应');
       await readEventStream(response.body, turn, function (payload) {
         failed = true;
+        if (state.tuningStatus) setTuningStatus('error');
         showTurnError(turn, 'AI 执行出错', payload && payload.message ? String(payload.message) : '处理失败，请重试。', payload && payload.retryable !== false);
       });
       if (!failed && !turn.text && turn.cardCount === 0) {
@@ -2290,7 +2440,9 @@
       state.abortController = null;
       finalizeTurn(turn);
       state.streaming = false;
-      setChatRunStatus(stopped ? '已停止' : failed ? '处理出错' : '就绪');
+      if (stopped) setChatRunStatus('已停止');
+      else if (failed) setChatRunStatus('处理出错', 'error');
+      else setChatRunStatus('执行完成', 'completed');
       updateComposerState();
       await loadState();
       renderAllWorkbench();
@@ -2439,6 +2591,7 @@
     clearChat();
     if (history && history.length) {
       renderHistory(history);
+      restoreTuningStatus(visibleHistory(history));
     } else {
       appendWelcome();
     }
@@ -2758,7 +2911,10 @@
     state.following = true;
     var fetched = await fetchMessages(sessionId);
     var history = fetched.ok ? (fetched.messages || []) : [];
-    if (history.length) renderHistory(history);
+    if (history.length) {
+      renderHistory(history);
+      restoreTuningStatus(visibleHistory(history));
+    }
     else appendWelcome();
     updateChatSessionLabel();
     setChatRunStatus('就绪');
@@ -2941,7 +3097,7 @@
         approval.classList.add('is-answered');
         var pill = approval.querySelector('.card-head .status-pill');
         if (pill) {
-          pill.className = 'status-pill is-ok';
+          pill.className = 'status-pill is-ok is-replied';
           pill.textContent = '已回复';
         }
         Array.prototype.forEach.call(approval.querySelectorAll('button'), function (item) {
@@ -3200,9 +3356,49 @@
   }
 
   /* ============================== 启动 ============================== */
+  function bindNervShortcut() {
+    var sequence = 'NERV';
+    var matched = 0;
+    var root = document.documentElement;
+    try {
+      if (window.sessionStorage.getItem('nerv-theme') === 'enabled') root.dataset.theme = 'nerv';
+    } catch (error) { /* optional storage */ }
+    document.addEventListener('keydown', function (event) {
+      if (event.repeat || event.key === 'Shift') return;
+      if (!event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing
+          || event.target.closest?.('input, textarea, select, [contenteditable]')) {
+        matched = 0;
+        return;
+      }
+      var key = event.key.toUpperCase();
+      matched = key === sequence[matched] ? matched + 1 : Number(key === sequence[0]);
+      if (matched !== sequence.length) return;
+      matched = 0;
+      if (root.dataset.theme === 'nerv') {
+        delete root.dataset.theme;
+        stopMagiBlink();
+      } else {
+        root.dataset.theme = 'nerv';
+        renderMagi();
+      }
+      try {
+        if (root.dataset.theme === 'nerv') window.sessionStorage.setItem('nerv-theme', 'enabled');
+        else window.sessionStorage.removeItem('nerv-theme');
+      } catch (error) { /* optional storage */ }
+    });
+    document.addEventListener('keyup', function (event) {
+      if (!event.shiftKey) matched = 0;
+    });
+    window.addEventListener('blur', function () { matched = 0; });
+  }
+
   function boot() {
     cacheDom();
     bindEvents();
+    bindNervShortcut();
+    magiReducedMotion.addEventListener('change', function () {
+      if (document.documentElement.dataset.theme === 'nerv') syncMagiBlink($('#nerv-magi'));
+    });
     syncWorkbenchToggle();
     renderAllWorkbench();
     loadIdentity();

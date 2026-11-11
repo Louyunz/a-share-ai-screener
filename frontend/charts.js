@@ -9,17 +9,17 @@
   var NS = 'http://www.w3.org/2000/svg';
   var uid = 0;
   var COLORS = {
-    blue: '#2563EB',
-    cyan: '#2563EB',
-    orange: '#B45309',
-    green: '#16A34A',
-    red: '#DC2626',
-    violet: '#1E3A5F',
-    slate: '#64748B',
-    text: '#475569',
-    muted: '#94A3B8',
-    grid: '#E2E8F0',
-    axis: '#CBD5E1'
+    blue: 'var(--chart-primary, #2563EB)',
+    cyan: 'var(--chart-primary, #2563EB)',
+    orange: 'var(--chart-accent, #B45309)',
+    green: 'var(--chart-success, #16A34A)',
+    red: 'var(--chart-danger, #DC2626)',
+    violet: 'var(--chart-accent, #1E3A5F)',
+    slate: 'var(--chart-muted, #64748B)',
+    text: 'var(--chart-text, #475569)',
+    muted: 'var(--chart-muted, #94A3B8)',
+    grid: 'var(--chart-grid, #E2E8F0)',
+    axis: 'var(--chart-grid, #CBD5E1)'
   };
 
   /* ------------------------------------------------------------- 基础工具 */
@@ -38,7 +38,7 @@
   }
 
   function textEl(x, y, content, attrs) {
-    var node = svgEl('text', Object.assign({ x: x, y: y }, attrs || {}));
+    var node = svgEl('text', Object.assign({ x: x, y: y, fill: COLORS.text }, attrs || {}));
     node.textContent = content === null || content === undefined ? '' : String(content);
     return node;
   }
@@ -130,7 +130,7 @@
       var label = document.createElement('span');
       label.textContent = row.label;
       var value = document.createElement('b');
-      value.style.color = row.color || '#0F172A';
+      value.style.color = row.color || 'var(--chart-text, #0F172A)';
       value.textContent = row.value;
       line.appendChild(label);
       line.appendChild(value);
