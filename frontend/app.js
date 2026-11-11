@@ -112,6 +112,7 @@
   var composing = false;
   var taskPollTimer = null;
   var taskPollGeneration = 0;
+  var historyRows = [];
   var activeSetting = null;
 
   /* ============================== 工具函数 ============================== */
@@ -416,36 +417,36 @@
     if (state.streaming || ((!state.task || !state.task.running) && !force)) return;
     var sessionId = state.sessionId;
     var generation = taskPollGeneration;
-    var previousHistory = '';
-    setChatRunStatus(state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
+    setChatRunStatus(state.task && state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
     async function poll() {
       if (generation !== taskPollGeneration || sessionId !== state.sessionId || state.streaming) return;
       try {
         var data = await apiGet('/api/sessions/' + encodeURIComponent(sessionId) + '/state', 1);
         var fetched = await fetchMessages(sessionId);
         if (generation !== taskPollGeneration || sessionId !== state.sessionId || state.streaming) return;
+        var previousProfile = JSON.stringify(state.profile);
+        var previousModel = workbenchModelSnapshot();
+        var previousResult = JSON.stringify(state.lastSelection);
         applySessionState(data);
         if (fetched.ok) {
-          var snapshot = JSON.stringify(fetched.messages);
-          if (snapshot !== previousHistory) {
-            var follow = state.following;
-            var scrollTop = dom.scroll.scrollTop;
-            clearChat();
-            renderHistory(fetched.messages);
-            state.following = follow;
-            if (follow) scrollToBottom(true);
-            else dom.scroll.scrollTop = scrollTop;
-            previousHistory = snapshot;
-          }
+          syncHistory(fetched.messages);
+          setWorkbenchAlert('');
+        } else {
+          setWorkbenchAlert('历史消息暂时无法同步，正在重试。');
         }
-        renderAllWorkbench();
+        if (JSON.stringify(state.profile) !== previousProfile) renderProfileSection();
+        if (workbenchModelSnapshot() !== previousModel) {
+          renderModelSection();
+          renderChatModelChip();
+        }
+        if (JSON.stringify(state.lastSelection) !== previousResult) renderResultSection();
         updateComposerState();
-        if (!state.task || !state.task.running) {
+        if ((!state.task || !state.task.running) && fetched.ok) {
           setChatRunStatus(state.task && state.task.status === 'error' ? '执行失败' : '就绪');
           if (state.task && state.task.error) setWorkbenchAlert(state.task.error);
           return;
         }
-        setChatRunStatus(state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
+        setChatRunStatus(state.task && state.task.status === 'cancelling' ? '正在停止…' : '后台执行中…');
       } catch (error) {
         if (generation !== taskPollGeneration || sessionId !== state.sessionId) return;
         setWorkbenchAlert('任务状态暂时无法同步，正在重试：' + error.message);
@@ -702,6 +703,7 @@
 
   /* ============================== 聊天区渲染 ============================== */
   function clearChat() {
+    historyRows = [];
     dom.stream.innerHTML = '';
     dom.stream.classList.remove('is-welcome');
     state.cardNodes.clear();
@@ -741,35 +743,109 @@
     return wrap;
   }
 
-  function renderHistoryBlocks(wrap, blocks) {
-    if (!wrap || !Array.isArray(blocks) || !blocks.length) return;
-    var main = wrap.querySelector('.msg-main');
-    if (!main) return;
-    var cards = document.createElement('div');
-    cards.className = 'cards history-cards';
-    blocks.forEach(function (block) {
-      if (!block || !block.id || !block.type) return;
-      if (block.type === 'profile') return;  // 当前画像由右侧工作台常驻展示
-      var slot = document.createElement('div');
-      slot.className = 'card-slot';
-      slot.setAttribute('data-card-id', 'history-' + block.id);
-      slot.innerHTML = renderCard(block);
-      cards.appendChild(slot);
-      mountCardCharts(slot, block);
+  function syncHistoryCards(row, blocks) {
+    var cards = row.node.querySelector('.history-cards');
+    var visible = (blocks || []).filter(function (block) {
+      return block && block.id && block.type && block.type !== 'profile';
     });
-    if (cards.children.length) main.appendChild(cards);
+    if (!visible.length) {
+      if (cards) cards.remove();
+      row.cards.clear();
+      return;
+    }
+    if (!cards) {
+      cards = document.createElement('div');
+      cards.className = 'cards history-cards';
+      row.node.querySelector('.msg-main').appendChild(cards);
+    }
+    var next = new Map();
+    visible.forEach(function (block, index) {
+      var entry = row.cards.get(block.id);
+      var snapshot = JSON.stringify(block);
+      if (!entry) {
+        var slot = document.createElement('div');
+        slot.className = 'card-slot';
+        slot.setAttribute('data-card-id', 'history-' + block.id);
+        entry = { node: slot, snapshot: '' };
+      }
+      if (cards.children[index] !== entry.node) {
+        cards.insertBefore(entry.node, cards.children[index] || null);
+      }
+      if (entry.snapshot !== snapshot) {
+        var details = Array.from(entry.node.querySelectorAll('details'), function (item) {
+          return item.open;
+        });
+        var code = entry.node.querySelector('.code-box');
+        var codeTop = code && code.scrollTop;
+        entry.node.innerHTML = renderCard(block);
+        entry.node.querySelectorAll('details').forEach(function (item, i) {
+          if (i < details.length) item.open = details[i];
+        });
+        code = entry.node.querySelector('.code-box');
+        if (code && codeTop !== null) code.scrollTop = codeTop;
+        mountCardCharts(entry.node, block);
+        entry.snapshot = snapshot;
+      }
+      next.set(block.id, entry);
+    });
+    row.cards.forEach(function (entry, id) {
+      if (!next.has(id)) entry.node.remove();
+    });
+    row.cards = next;
+  }
+
+  function visibleHistory(messages) {
+    return messages.filter(function (message) {
+      return message && (String(message.content || '').trim() || (message.blocks && message.blocks.length));
+    });
   }
 
   function renderHistory(messages) {
-    messages.forEach(function (message) {
-      if (!message) return;
+    visibleHistory(messages).forEach(function (message) {
       var role = message.role === 'user' ? 'user' : 'assistant';
-      var content = message.content === null || message.content === undefined ? '' : String(message.content);
-      if (!content.trim() && !(message.blocks && message.blocks.length)) return;
-      var wrap = appendTextMessage(role, content, message.created_at);
-      if (role === 'assistant') renderHistoryBlocks(wrap, message.blocks);
-      if (role === 'user') state.lastUserMessage = content;
+      var content = String(message.content || '');
+      var node = appendTextMessage(role, content, message.created_at);
+      node.classList.add('msg-history');
+      var row = { node: node, role: role, createdAt: message.created_at, content: content, cards: new Map() };
+      historyRows.push(row);
+      if (role === 'assistant') syncHistoryCards(row, message.blocks);
+      else state.lastUserMessage = content;
     });
+  }
+
+  function syncHistory(messages) {
+    var visible = visibleHistory(messages);
+    var follow = state.following;
+    var scrollTop = dom.scroll.scrollTop;
+    var previousHeight = dom.scroll.scrollHeight;
+    var tracked = new Set(historyRows.map(function (row) { return row.node; }));
+    if (visible.length) {
+      Array.from(dom.stream.children).forEach(function (node) {
+        if (!tracked.has(node)) node.remove();
+      });
+      state.cardNodes.clear();
+      state.activeTurn = null;
+    }
+    var matching = 0;
+    while (matching < historyRows.length && matching < visible.length) {
+      var row = historyRows[matching];
+      var message = visible[matching];
+      var role = message.role === 'user' ? 'user' : 'assistant';
+      if (row.role !== role || row.createdAt !== message.created_at) break;
+      var content = String(message.content || '');
+      if (row.content !== content) {
+        row.node.querySelector('.bubble').textContent = content;
+        row.content = content;
+      }
+      if (role === 'assistant') syncHistoryCards(row, message.blocks);
+      else state.lastUserMessage = content;
+      matching += 1;
+    }
+    historyRows.splice(matching).forEach(function (row) { row.node.remove(); });
+    renderHistory(visible.slice(matching));
+    state.following = follow;
+    if (follow && previousHeight !== dom.scroll.scrollHeight) scrollToBottom(true);
+    else if (!follow && dom.scroll.scrollTop !== scrollTop) dom.scroll.scrollTop = scrollTop;
   }
 
   function beginAssistantTurn() {
@@ -1866,6 +1942,12 @@
   }
 
   /* ============================== 工作台 ============================== */
+  function workbenchModelSnapshot() {
+    return JSON.stringify([state.activeModel, state.versions, state.pendingCandidates,
+      state.pendingProposal, state.pendingDismissed,
+      state.task && state.task.running ? state.task.status : null]);
+  }
+
   function renderAllWorkbench() {
     renderProfileSection();
     renderModelSection();
